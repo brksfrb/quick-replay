@@ -30,6 +30,10 @@ saves the last moments of your screen the second you press a key.
    `%LOCALAPPDATA%\Programs\QuickReplay`, adds a Start menu entry, starts with Windows and goes to
    the tray. Running a newer download later updates it in place.
 
+QuickReplay keeps itself up to date: it checks GitHub Releases every few hours, verifies the
+download's SHA-256 against the checksum GitHub publishes, and swaps in the new version (never
+during a recording). You can turn that off in Settings.
+
 Windows SmartScreen may warn about a new unsigned app: choose *More info → Run anyway*, or check the
 SHA-256 from the release page first.
 
@@ -60,6 +64,7 @@ QuickReplay.exe --save-replay 30
 | `--save-replay [seconds]` | Save a replay (default: the first shortcut's length) |
 | `--toggle-recording` | Start or stop recording |
 | `--toggle-buffer` | Turn the replay buffer on or off |
+| `--check-updates` | Check GitHub for a new version now |
 | `--quit` | Close QuickReplay |
 | `--uninstall` | Remove QuickReplay (your videos are kept) |
 

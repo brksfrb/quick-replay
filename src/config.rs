@@ -34,11 +34,22 @@ pub struct General {
     pub copy_to_clipboard: bool,
     /// Name files after the app in the foreground, e.g. "VALORANT 2026-10-14 21-03-55.mp4".
     pub name_after_app: bool,
+    /// Download and install new versions from GitHub on its own.
+    pub auto_update: bool,
+    /// Open the window maximized instead of centered.
+    pub open_maximized: bool,
 }
 
 impl Default for General {
     fn default() -> Self {
-        Self { start_with_windows: true, video_dir: None, copy_to_clipboard: false, name_after_app: true }
+        Self {
+            start_with_windows: true,
+            video_dir: None,
+            copy_to_clipboard: false,
+            name_after_app: true,
+            auto_update: true,
+            open_maximized: false,
+        }
     }
 }
 

@@ -32,6 +32,7 @@ pub enum SettingsAction {
     None,
     Quit,
     Uninstall,
+    CheckUpdates,
 }
 
 #[derive(Default)]
@@ -458,6 +459,20 @@ fn general_section(ui: &mut Ui, config: &mut Config) -> SettingsAction {
         setting_row(ui, "Start with Windows", "Runs quietly in the tray after you sign in.", |ui| {
             toggle(ui, &mut config.general.start_with_windows)
         });
+        setting_row(ui, "Open the window maximized", "Otherwise it opens centered on the screen.", |ui| {
+            toggle(ui, &mut config.general.open_maximized)
+        });
+        setting_row(
+            ui,
+            "Update automatically",
+            "New versions are downloaded, checked and installed in the background (never during a recording).",
+            |ui| {
+                if theme::secondary_button(ui, None, "Check now").clicked() {
+                    action = SettingsAction::CheckUpdates;
+                }
+                toggle(ui, &mut config.general.auto_update)
+            },
+        );
         let location = if paths::is_portable() {
             format!("Portable mode · data in {}", paths::data_dir().display())
         } else if install::is_installed_copy() {

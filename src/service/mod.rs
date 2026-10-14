@@ -12,7 +12,7 @@ use crate::win::{clipboard, monitors, wide, ComGuard};
 use crate::{install, paths};
 use overlay::{Glyph, Overlay, Placement, Toast};
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
 use tray::{MenuItem, Tray, WM_TRAY};
@@ -29,6 +29,14 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 pub struct StartMode {
     pub open_window: bool,
     pub first_run: bool,
+    /// Started by the updater: the previous version may still be shutting down.
+    pub updated: bool,
+}
+
+/// What clicking the visible notification does.
+enum ToastAction {
+    OpenVideo(PathBuf),
+    InstallUpdate { version: String, path: PathBuf },
 }
 
 const HOTKEY_RECORD: i32 = 100;
@@ -37,6 +45,12 @@ const TIMER_BADGE: usize = 2;
 const TIMER_RESTART: usize = 3;
 const TIMER_CLEANUP: usize = 4;
 const TIMER_TRIM: usize = 5;
+const TIMER_UPDATE: usize = 6;
+/// First update check a minute after start (not during login rush), then every 6 hours.
+const FIRST_UPDATE_MS: u32 = 60_000;
+const UPDATE_INTERVAL_MS: u32 = 6 * 60 * 60 * 1000;
+/// How long a freshly updated copy waits for the previous version to shut down.
+const UPDATE_HANDOVER: Duration = Duration::from_secs(20);
 /// Shortly after the pipeline starts, hand back the memory only driver setup touched. Only once:
 /// trimming later would push the replay buffer out to the page file (disk writes).
 const FIRST_TRIM_MS: u32 = 5_000;
@@ -68,7 +82,10 @@ struct Service {
     tray: Tray,
     toast: Option<Overlay>,
     /// The video the visible notification is about; clicking it opens the player.
-    toast_video: Option<std::path::PathBuf>,
+    toast_action: Option<ToastAction>,
+    /// An update that waits for the current recording to end.
+    pending_update: Option<(String, PathBuf)>,
+    update_running: bool,
     badge: Option<Overlay>,
     replay_hotkeys: Vec<(i32, u32)>,
     recording_since: Option<Instant>,
@@ -107,11 +124,76 @@ impl Service {
     /// A notification that opens `video` in the player when clicked.
     fn notify_video(&mut self, title: &str, subtitle: &str, video: &Path) {
         self.notify(Glyph::Check, title, &format!("{subtitle} · click to watch"));
-        self.toast_video = Some(video.to_path_buf());
+        self.toast_action = Some(ToastAction::OpenVideo(video.to_path_buf()));
+    }
+
+    /// Checks GitHub on a worker thread; the result comes back as an event.
+    fn check_updates(&mut self, manual: bool) {
+        if self.update_running {
+            return;
+        }
+        if paths::is_dev_build() {
+            if manual {
+                self.notify(Glyph::Warning, "Updates are off", "This is a development build");
+            }
+            return;
+        }
+        // With automatic updates off, scheduled checks still run but only offer the update.
+        self.update_running = true;
+        let events = self.events.clone();
+        let spawned = std::thread::Builder::new().name("update".into()).spawn(move || {
+            let event = match crate::update::check() {
+                Ok(Some(release)) => match crate::update::download(&release) {
+                    Ok(path) => Event::UpdateReady { version: release.version, path, manual },
+                    Err(message) => Event::UpdateFailed { message, manual },
+                },
+                Ok(None) => Event::UpdateNotFound { manual },
+                Err(message) => Event::UpdateFailed { message, manual },
+            };
+            events.send(event);
+        });
+        if spawned.is_err() {
+            self.update_running = false;
+        }
+    }
+
+    fn update_ready(&mut self, version: String, path: PathBuf, manual: bool) {
+        if !manual && !self.config.general.auto_update {
+            self.notify(Glyph::Check, &format!("QuickReplay {version} is available"), "Click to update");
+            self.toast_action = Some(ToastAction::InstallUpdate { version, path });
+            return;
+        }
+        self.install_update(version, path);
+    }
+
+    /// Swaps in the new exe and restarts into it, unless a recording is running.
+    fn install_update(&mut self, version: String, path: PathBuf) {
+        if self.recording_since.is_some() {
+            self.notify(
+                Glyph::Check,
+                &format!("QuickReplay {version} is ready"),
+                "It installs when the recording ends",
+            );
+            self.pending_update = Some((version, path));
+            return;
+        }
+        log::info!("installing QuickReplay {version}");
+        // Finish anything still being written before the exe is swapped.
+        self.stop_pipeline();
+        match crate::update::apply(&path) {
+            Ok(()) => self.quit(),
+            Err(message) => {
+                log::error!("update failed: {message}");
+                self.notify(Glyph::Warning, "Update failed", &message);
+                if self.buffer_enabled {
+                    self.start_pipeline();
+                }
+            }
+        }
     }
 
     fn notify(&mut self, glyph: Glyph, title: &str, subtitle: &str) {
-        self.toast_video = None;
+        self.toast_action = None;
         let n = &self.config.notifications;
         if !n.enabled {
             return;
@@ -257,6 +339,10 @@ impl Service {
                     self.start_pipeline();
                 }
             }
+            if let Some((version, path)) = self.pending_update.take() {
+                self.install_update(version, path);
+                return;
+            }
         } else {
             if !self.start_pipeline() {
                 return;
@@ -399,6 +485,7 @@ impl Service {
             Command::ToggleRecording => self.toggle_recording(),
             Command::ToggleBuffer => self.toggle_buffer(),
             Command::Quit => self.quit(),
+            Command::CheckUpdates => self.check_updates(true),
         }
     }
 
@@ -421,6 +508,27 @@ impl Service {
                     self.saved(&path, "Recording saved", format_duration(seconds));
                 }
                 Event::SaveFailed(message) => self.notify(Glyph::Warning, "Couldn't save", &message),
+                Event::UpdateReady { version, path, manual } => {
+                    self.update_running = false;
+                    self.update_ready(version, path, manual);
+                }
+                Event::UpdateNotFound { manual } => {
+                    self.update_running = false;
+                    if manual {
+                        self.notify(
+                            Glyph::Check,
+                            "QuickReplay is up to date",
+                            &format!("Version {}", env!("CARGO_PKG_VERSION")),
+                        );
+                    }
+                }
+                Event::UpdateFailed { message, manual } => {
+                    self.update_running = false;
+                    log::warn!("update check failed: {message}");
+                    if manual {
+                        self.notify(Glyph::Warning, "Couldn't check for updates", &message);
+                    }
+                }
                 Event::PipelineFailed { generation, message } => {
                     if generation == self.pipeline_generation && self.pipeline.is_some() {
                         self.pipeline_failed(message);
@@ -450,6 +558,10 @@ impl Service {
                     self.start_pipeline();
                 }
                 self.update_tray();
+            }
+            TIMER_UPDATE => {
+                unsafe { SetTimer(Some(self.hwnd), TIMER_UPDATE, UPDATE_INTERVAL_MS, None) };
+                self.check_updates(false);
             }
             TIMER_CLEANUP => {
                 files::enforce_limits(&paths::video_dir(&self.config), &self.config.storage);
@@ -496,8 +608,10 @@ impl Service {
                 if let Some(toast) = &mut self.toast {
                     toast.hide();
                 }
-                if let Some(video) = self.toast_video.take() {
-                    ipc::open_gui_on(&video);
+                match self.toast_action.take() {
+                    Some(ToastAction::OpenVideo(video)) => ipc::open_gui_on(&video),
+                    Some(ToastAction::InstallUpdate { version, path }) => self.install_update(version, path),
+                    None => {}
                 }
             }
             WM_TIMER => self.timer(wparam.0),
@@ -629,11 +743,20 @@ fn load_config() -> Config {
 }
 
 pub fn run(mode: StartMode) {
-    let Some(_lock) = ipc::InstanceLock::service() else {
+    let mut lock = ipc::InstanceLock::service();
+    if mode.updated {
+        let since = Instant::now();
+        while lock.is_none() && since.elapsed() < UPDATE_HANDOVER {
+            std::thread::sleep(Duration::from_millis(200));
+            lock = ipc::InstanceLock::service();
+        }
+    }
+    let Some(_lock) = lock else {
         // Already running: starting the exe again just opens the window.
         ipc::open_gui();
         return;
     };
+    crate::update::cleanup();
     let _com = ComGuard::sta();
     log::info!("QuickReplay {} starting ({})", env!("CARGO_PKG_VERSION"), paths::current_exe().display());
     let config = load_config();
@@ -679,7 +802,9 @@ pub fn run(mode: StartMode) {
         events: EventSink::new(tx, hwnd.0 as isize),
         tray,
         toast: Overlay::new(instance, true),
-        toast_video: None,
+        toast_action: None,
+        pending_update: None,
+        update_running: false,
         badge: Overlay::new(instance, false),
         replay_hotkeys: Vec::new(),
         recording_since: None,
@@ -707,6 +832,10 @@ pub fn run(mode: StartMode) {
             }
             files::enforce_limits(&paths::video_dir(&s.config), &s.config.storage);
             unsafe { SetTimer(Some(hwnd), TIMER_CLEANUP, CLEANUP_MS, None) };
+            unsafe { SetTimer(Some(hwnd), TIMER_UPDATE, FIRST_UPDATE_MS, None) };
+            if mode.updated {
+                s.notify(Glyph::Check, "QuickReplay updated", &format!("Now on version {}", env!("CARGO_PKG_VERSION")));
+            }
             if mode.first_run {
                 let key = s.config.replay.hotkeys.first().map(|h| (h.hotkey.to_string(), h.seconds));
                 let hint = key.map_or("Running in the tray".to_string(), |(k, secs)| {

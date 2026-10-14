@@ -62,6 +62,19 @@ pub enum Event {
         seconds: f64,
     },
     SaveFailed(String),
+    /// A newer version was downloaded and verified. `manual`: the user asked for the check.
+    UpdateReady {
+        version: String,
+        path: PathBuf,
+        manual: bool,
+    },
+    UpdateNotFound {
+        manual: bool,
+    },
+    UpdateFailed {
+        message: String,
+        manual: bool,
+    },
     /// `generation` tells which pipeline failed, so a stale report can't stop its replacement.
     PipelineFailed {
         generation: u64,

@@ -54,6 +54,7 @@ pub enum Command {
     ToggleRecording,
     ToggleBuffer,
     Quit,
+    CheckUpdates,
 }
 
 impl Command {
@@ -64,6 +65,7 @@ impl Command {
             Command::ToggleRecording => (3, 0),
             Command::ToggleBuffer => (4, 0),
             Command::Quit => (5, 0),
+            Command::CheckUpdates => (6, 0),
         }
     }
 
@@ -74,6 +76,7 @@ impl Command {
             3 => Command::ToggleRecording,
             4 => Command::ToggleBuffer,
             5 => Command::Quit,
+            6 => Command::CheckUpdates,
             _ => return None,
         })
     }

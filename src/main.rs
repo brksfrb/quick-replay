@@ -20,6 +20,8 @@ mod ipc;
 #[cfg(windows)]
 mod service;
 #[cfg(windows)]
+mod update;
+#[cfg(windows)]
 mod win;
 
 #[cfg(windows)]
@@ -49,10 +51,14 @@ fn main() {
         // The installed copy has been started; this one is done.
         return;
     }
-    service::run(service::StartMode { open_window: !autostart, first_run: has("--installed") });
+    service::run(service::StartMode {
+        open_window: !autostart,
+        first_run: has("--installed"),
+        updated: has("--updated"),
+    });
 }
 
-/// `--save-replay [seconds]`, `--toggle-recording`, `--toggle-buffer`, `--quit`.
+/// `--save-replay [seconds]`, `--toggle-recording`, `--toggle-buffer`, `--check-updates`, `--quit`.
 #[cfg(windows)]
 fn remote_command(args: &[String]) -> Option<ipc::Command> {
     let position = |flag: &str| args.iter().position(|a| a == flag);
@@ -63,6 +69,7 @@ fn remote_command(args: &[String]) -> Option<ipc::Command> {
     [
         ("--toggle-recording", ipc::Command::ToggleRecording),
         ("--toggle-buffer", ipc::Command::ToggleBuffer),
+        ("--check-updates", ipc::Command::CheckUpdates),
         ("--quit", ipc::Command::Quit),
     ]
     .into_iter()

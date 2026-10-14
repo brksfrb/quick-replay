@@ -67,14 +67,17 @@ pub fn run() {
     let _com = ComGuard::mta();
     let size = 64;
     let icon = egui::IconData { rgba: crate::icon::render_icon(size, false), width: size, height: size };
+    let maximized = Config::load(&paths::config_path()).general.open_maximized;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("QuickReplay")
             .with_inner_size([1120.0, 720.0])
             .with_min_inner_size([820.0, 560.0])
+            .with_maximized(maximized)
             .with_icon(Arc::new(icon))
             // No OLE drag-and-drop: it would force this thread into a COM mode the player can't use.
             .with_drag_and_drop(false),
+        centered: true,
         ..Default::default()
     };
     let result = eframe::run_native(
@@ -312,6 +315,14 @@ impl App {
                     self.flush_config();
                     let _ = std::process::Command::new(paths::current_exe()).arg("--uninstall").spawn();
                     ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+                }
+                SettingsAction::CheckUpdates => {
+                    self.flush_config();
+                    if ipc::send_to_service(Command::CheckUpdates) {
+                        self.show_flash("Checking for updates…");
+                    } else {
+                        self.show_flash("Start QuickReplay first (it runs the updates)");
+                    }
                 }
                 SettingsAction::None => {}
             },
