@@ -19,6 +19,7 @@ use library::{Library, LibraryAction};
 use player::{Player, PlayerAction};
 use settings::{SettingsAction, SettingsPage};
 use std::os::windows::process::CommandExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use theme::icon;
@@ -50,6 +51,8 @@ struct App {
     flash: Option<(String, Instant)>,
     monitors: Vec<monitors::Monitor>,
     logo: TextureHandle,
+    /// Set when another start (or a clicked notification) asked the window to come forward.
+    focus_requested: Arc<AtomicBool>,
     #[cfg(debug_assertions)]
     devshot: Option<devshot::DevShot>,
 }
@@ -79,10 +82,11 @@ pub fn run() {
         options,
         Box::new(|cc| {
             theme::apply(&cc.egui_ctx);
+            let focus_requested = Arc::new(AtomicBool::new(false));
             if let Some(event) = focus_event {
-                watch_focus_requests(cc.egui_ctx.clone(), event);
+                watch_focus_requests(cc.egui_ctx.clone(), event, focus_requested.clone());
             }
-            Ok(Box::new(App::new(cc.egui_ctx.clone())))
+            Ok(Box::new(App::new(cc.egui_ctx.clone(), focus_requested)))
         }),
     );
     if let Err(err) = result {
@@ -91,9 +95,10 @@ pub fn run() {
 }
 
 /// Another start of the window (tray click, second launch) signals this event: come to the front.
-fn watch_focus_requests(ctx: egui::Context, raw: isize) {
+fn watch_focus_requests(ctx: egui::Context, raw: isize, requested: Arc<AtomicBool>) {
     let _ = std::thread::Builder::new().name("focus".into()).spawn(move || loop {
         unsafe { WaitForSingleObject(HANDLE(raw as *mut _), INFINITE) };
+        requested.store(true, Ordering::Relaxed);
         ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
         ctx.request_repaint();
@@ -101,21 +106,23 @@ fn watch_focus_requests(ctx: egui::Context, raw: isize) {
 }
 
 impl App {
-    fn new(ctx: egui::Context) -> App {
+    fn new(ctx: egui::Context, focus_requested: Arc<AtomicBool>) -> App {
         let config = Config::load(&paths::config_path());
         let library = Library::new(ctx.clone(), paths::video_dir(&config));
         let size = 64;
         let logo_image =
             egui::ColorImage::from_rgba_unmultiplied([size, size], &crate::icon::render_icon(size as u32, false));
         let logo = ctx.load_texture("logo", logo_image, egui::TextureOptions::LINEAR);
+        // Opened from a clicked notification: go straight to that video.
+        let requested = ipc::take_open_request().map(|video| Page::Player(Box::new(Player::open(video))));
         #[cfg(debug_assertions)]
         let page = match devshot::DevShot::page().as_deref() {
             Some("settings") => Page::Settings,
             Some(p) if p.starts_with("player:") => Page::Player(Box::new(Player::open(p["player:".len()..].into()))),
-            _ => Page::Library,
+            _ => requested.unwrap_or(Page::Library),
         };
         #[cfg(not(debug_assertions))]
-        let page = Page::Library;
+        let page = requested.unwrap_or(Page::Library);
         App {
             saved: config.clone(),
             last_seen: config.clone(),
@@ -129,6 +136,7 @@ impl App {
             flash: None,
             monitors: monitors::list(),
             logo,
+            focus_requested,
             #[cfg(debug_assertions)]
             devshot: devshot::DevShot::from_env(),
         }
@@ -383,6 +391,12 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.poll_status(&ctx);
         self.autosave(&ctx);
+        if self.focus_requested.swap(false, Ordering::Relaxed) {
+            if let Some(video) = ipc::take_open_request() {
+                self.library.mark_dirty();
+                self.page = Page::Player(Box::new(Player::open(video)));
+            }
+        }
         self.library.refresh(&ctx);
         egui::Panel::left("sidebar")
             .exact_size(SIDEBAR_WIDTH)

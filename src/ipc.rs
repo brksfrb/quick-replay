@@ -12,15 +12,39 @@ use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, PostMessageW, SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_APP,
 };
 
-pub const SERVICE_CLASS: &str = "QuickReplay.Service";
 pub const WM_QR_COMMAND: u32 = WM_APP + 1;
 pub const WM_QR_STATUS: u32 = WM_APP + 2;
 /// Internal: the service's worker threads poke the window with this when events are queued.
 pub const WM_QR_EVENT: u32 = WM_APP + 3;
+/// Internal: the notification card was clicked.
+pub const WM_QR_TOAST_CLICK: u32 = WM_APP + 4;
 
+const SERVICE_CLASS: &str = "QuickReplay.Service";
 const SERVICE_MUTEX: &str = r"Local\QuickReplay.Service";
 const GUI_MUTEX: &str = r"Local\QuickReplay.Gui";
 const GUI_FOCUS_EVENT: &str = r"Local\QuickReplay.GuiFocus";
+
+/// Copies started with their own data folder (`QUICKREPLAY_DATA_DIR`, used for testing and
+/// development) get their own window/mutex names, so they never talk to the installed app.
+fn scoped(base: &str) -> String {
+    static SUFFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let suffix = SUFFIX.get_or_init(|| match std::env::var("QUICKREPLAY_DATA_DIR") {
+        Ok(dir) => {
+            // FNV-1a: stable across builds, unlike std's hasher.
+            let hash = dir
+                .to_lowercase()
+                .bytes()
+                .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+            format!(".{hash:016x}")
+        }
+        Err(_) => String::new(),
+    });
+    format!("{base}{suffix}")
+}
+
+pub fn service_class() -> String {
+    scoped(SERVICE_CLASS)
+}
 const STATUS_TIMEOUT_MS: u32 = 300;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,8 +106,8 @@ impl Status {
     }
 }
 
-fn service_window() -> Option<HWND> {
-    let class = wide(SERVICE_CLASS);
+pub fn service_window() -> Option<HWND> {
+    let class = wide(service_class());
     unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) }.ok()
 }
 
@@ -128,11 +152,11 @@ impl InstanceLock {
     }
 
     pub fn service() -> Option<InstanceLock> {
-        Self::acquire(SERVICE_MUTEX)
+        Self::acquire(&scoped(SERVICE_MUTEX))
     }
 
     pub fn gui() -> Option<InstanceLock> {
-        Self::acquire(GUI_MUTEX)
+        Self::acquire(&scoped(GUI_MUTEX))
     }
 }
 
@@ -154,17 +178,17 @@ fn mutex_exists(name: &str) -> bool {
 }
 
 pub fn service_running() -> bool {
-    mutex_exists(SERVICE_MUTEX)
+    mutex_exists(&scoped(SERVICE_MUTEX))
 }
 
 /// The window process waits on this event; signalling it brings the window to the front.
 pub fn gui_focus_event() -> Option<HANDLE> {
-    let name = wide(GUI_FOCUS_EVENT);
+    let name = wide(scoped(GUI_FOCUS_EVENT));
     unsafe { CreateEventW(None, false, false, PCWSTR(name.as_ptr())) }.ok()
 }
 
 fn focus_existing_gui() -> bool {
-    let name = wide(GUI_FOCUS_EVENT);
+    let name = wide(scoped(GUI_FOCUS_EVENT));
     match unsafe { OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(name.as_ptr())) } {
         Ok(event) => {
             let _ = unsafe { SetEvent(event) };
@@ -175,11 +199,35 @@ fn focus_existing_gui() -> bool {
     }
 }
 
+fn open_request_path() -> std::path::PathBuf {
+    crate::paths::data_dir().join("open-request.txt")
+}
+
+/// Opens the window on a video's player page (used when a "saved" notification is clicked).
+pub fn open_gui_on(video: &std::path::Path) {
+    let path = open_request_path();
+    let tmp = path.with_extension("tmp");
+    let written = std::fs::write(&tmp, video.to_string_lossy().as_bytes()).and_then(|()| std::fs::rename(&tmp, &path));
+    if let Err(err) = written {
+        log::warn!("could not hand the video to the window: {err}");
+    }
+    open_gui();
+}
+
+/// The video the window was asked to open, if any (consumed).
+pub fn take_open_request() -> Option<std::path::PathBuf> {
+    let path = open_request_path();
+    let text = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    let video = std::path::PathBuf::from(text.trim());
+    video.is_file().then_some(video)
+}
+
 /// Focuses the window if it's open, otherwise starts the window process.
 pub fn open_gui() {
     // A window that's still starting up has the mutex but maybe not the event yet; it will show
     // itself anyway, so never start a second one.
-    if mutex_exists(GUI_MUTEX) {
+    if mutex_exists(&scoped(GUI_MUTEX)) {
         focus_existing_gui();
         return;
     }

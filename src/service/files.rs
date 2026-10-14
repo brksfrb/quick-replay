@@ -80,6 +80,10 @@ fn foreground_app_name() -> Option<String> {
     if SHELL_PROCESSES.iter().any(|s| stem.eq_ignore_ascii_case(s)) {
         return Some("Desktop".into());
     }
+    // Our own window in front (e.g. the Record button): use the plain "Replay"/"Recording" name.
+    if stem.eq_ignore_ascii_case(paths::APP_NAME) {
+        return None;
+    }
     // Games running inside Java, Python, Node... are better named by their window ("Minecraft 1.21").
     let hosted = SCRIPT_HOSTS.iter().any(|h| stem.eq_ignore_ascii_case(h));
     let title = hosted.then(foreground_title).flatten();

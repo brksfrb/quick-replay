@@ -57,6 +57,8 @@ pub struct Placement {
     pub monitor: isize,
     pub corner: Corner,
     pub hide_from_capture: bool,
+    /// Use the whole monitor (over the taskbar) rather than the work area.
+    pub over_taskbar: bool,
 }
 
 /// A rendered image ready for `UpdateLayeredWindow`.
@@ -199,7 +201,7 @@ fn icon_font() -> &'static str {
     }
 }
 
-fn monitor_frame(monitor: isize) -> (RECT, f32) {
+fn monitor_frame(monitor: isize, over_taskbar: bool) -> (RECT, f32) {
     unsafe {
         let mut handle = HMONITOR(monitor as *mut _);
         let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
@@ -209,7 +211,8 @@ fn monitor_frame(monitor: isize) -> (RECT, f32) {
         }
         let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
         let _ = GetDpiForMonitor(handle, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
-        (info.rcWork, dpi_x as f32 / 96.0)
+        let area = if over_taskbar { info.rcMonitor } else { info.rcWork };
+        (area, dpi_x as f32 / 96.0)
     }
 }
 
@@ -243,11 +246,16 @@ pub struct Overlay {
 }
 
 impl Overlay {
-    pub fn new(instance: windows::Win32::Foundation::HINSTANCE) -> Option<Overlay> {
+    /// `clickable`: the notification card takes clicks; the REC badge lets them through.
+    pub fn new(instance: windows::Win32::Foundation::HINSTANCE, clickable: bool) -> Option<Overlay> {
         let class = wide(CLASS);
+        let mut style = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+        if !clickable {
+            style |= WS_EX_TRANSPARENT;
+        }
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+                style,
                 PCWSTR(class.as_ptr()),
                 PCWSTR::null(),
                 WS_POPUP,
@@ -322,7 +330,7 @@ impl Overlay {
 
     /// Shows a notification card that fades out after `hold`.
     pub fn show_toast(&mut self, toast: &Toast, place: &Placement, accent: [u8; 3], hold: Duration) {
-        let (work, scale) = monitor_frame(place.monitor);
+        let (work, scale) = monitor_frame(place.monitor, place.over_taskbar);
         let s = |v: f32| (v * scale).round() as i32;
         let (w, h) = (s(330.0), s(68.0));
         let Some(mut canvas) = Canvas::new(w, h) else {
@@ -351,7 +359,7 @@ impl Overlay {
 
     /// Shows or updates the "REC 0:12" badge; it stays until `hide`.
     pub fn show_badge(&mut self, elapsed: Duration, place: &Placement) {
-        let (work, scale) = monitor_frame(place.monitor);
+        let (work, scale) = monitor_frame(place.monitor, place.over_taskbar);
         let s = |v: f32| (v * scale).round() as i32;
         let (w, h) = (s(118.0), s(30.0));
         let Some(mut canvas) = Canvas::new(w, h) else {

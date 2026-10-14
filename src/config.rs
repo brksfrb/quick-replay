@@ -306,6 +306,9 @@ pub struct Notifications {
     pub sound: bool,
     /// Keep notifications out of recordings and replays.
     pub hide_from_capture: bool,
+    /// Place notifications and the REC badge at the real screen edge, over the taskbar,
+    /// instead of stopping above it.
+    pub over_taskbar: bool,
     /// Accent color as `#RRGGBB`.
     pub accent: String,
 }
@@ -318,6 +321,7 @@ impl Default for Notifications {
             duration_ms: 2500,
             sound: false,
             hide_from_capture: true,
+            over_taskbar: false,
             accent: "#FF4D5E".into(),
         }
     }

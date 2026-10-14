@@ -67,6 +67,8 @@ struct Service {
     events: EventSink,
     tray: Tray,
     toast: Option<Overlay>,
+    /// The video the visible notification is about; clicking it opens the player.
+    toast_video: Option<std::path::PathBuf>,
     badge: Option<Overlay>,
     replay_hotkeys: Vec<(i32, u32)>,
     recording_since: Option<Instant>,
@@ -99,10 +101,17 @@ fn format_duration(seconds: f64) -> String {
 impl Service {
     fn placement(&self, corner: crate::config::Corner, hide: bool) -> Placement {
         let monitor = monitors::find(&self.config.video.monitor).map_or(0, |m| m.handle);
-        Placement { monitor, corner, hide_from_capture: hide }
+        Placement { monitor, corner, hide_from_capture: hide, over_taskbar: self.config.notifications.over_taskbar }
+    }
+
+    /// A notification that opens `video` in the player when clicked.
+    fn notify_video(&mut self, title: &str, subtitle: &str, video: &Path) {
+        self.notify(Glyph::Check, title, &format!("{subtitle} · click to watch"));
+        self.toast_video = Some(video.to_path_buf());
     }
 
     fn notify(&mut self, glyph: Glyph, title: &str, subtitle: &str) {
+        self.toast_video = None;
         let n = &self.config.notifications;
         if !n.enabled {
             return;
@@ -396,7 +405,7 @@ impl Service {
     fn saved(&mut self, path: &Path, title: &str, subtitle: String) {
         let copied = self.config.general.copy_to_clipboard && clipboard::copy_file(Some(self.hwnd), path);
         let subtitle = if copied { format!("{subtitle} · copied to clipboard") } else { subtitle };
-        self.notify(Glyph::Check, title, &subtitle);
+        self.notify_video(title, &subtitle, path);
         files::enforce_limits(&paths::video_dir(&self.config), &self.config.storage);
     }
 
@@ -483,6 +492,14 @@ impl Service {
             }
             ipc::WM_QR_STATUS => return Some(LRESULT(self.status().encode())),
             ipc::WM_QR_EVENT => self.drain_events(),
+            ipc::WM_QR_TOAST_CLICK => {
+                if let Some(toast) = &mut self.toast {
+                    toast.hide();
+                }
+                if let Some(video) = self.toast_video.take() {
+                    ipc::open_gui_on(&video);
+                }
+            }
             WM_TIMER => self.timer(wparam.0),
             WM_POWERBROADCAST if wparam.0 == PBT_APMRESUMEAUTOMATIC => {
                 // Capture and encoder sessions often don't survive sleep.
@@ -525,7 +542,7 @@ fn trim_working_set() {
 
 /// Messages that can wait if they arrive while the service is busy (e.g. a menu is open).
 fn can_defer(msg: u32) -> bool {
-    matches!(msg, WM_HOTKEY | ipc::WM_QR_COMMAND | ipc::WM_QR_EVENT)
+    matches!(msg, WM_HOTKEY | ipc::WM_QR_COMMAND | ipc::WM_QR_EVENT | ipc::WM_QR_TOAST_CLICK)
 }
 
 fn show_tray_menu(hwnd: HWND) {
@@ -575,8 +592,24 @@ fn register_class(instance: HINSTANCE, name: &str, proc: WNDPROC) {
 }
 
 unsafe extern "system" fn overlay_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if msg == WM_NCHITTEST {
-        return LRESULT(-1); // HTTRANSPARENT: clicks go through
+    let click_through = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TRANSPARENT.0 as isize != 0;
+    match msg {
+        WM_NCHITTEST if click_through => return LRESULT(-1), // HTTRANSPARENT: clicks go through
+        // Clicking the card must not pull focus away from a game.
+        WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
+        WM_SETCURSOR => {
+            if let Ok(cursor) = LoadCursorW(None, IDC_HAND) {
+                SetCursor(Some(cursor));
+            }
+            return LRESULT(1);
+        }
+        WM_LBUTTONUP => {
+            if let Some(service) = ipc::service_window() {
+                let _ = PostMessageW(Some(service), ipc::WM_QR_TOAST_CLICK, WPARAM(0), LPARAM(0));
+            }
+            return LRESULT(0);
+        }
+        _ => {}
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
@@ -607,9 +640,9 @@ pub fn run(mode: StartMode) {
     install::sync_autostart(config.general.start_with_windows);
 
     let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.map(|m| HINSTANCE(m.0)).unwrap_or_default();
-    register_class(instance, ipc::SERVICE_CLASS, Some(wndproc));
+    register_class(instance, &ipc::service_class(), Some(wndproc));
     register_class(instance, overlay::CLASS, Some(overlay_proc));
-    let class = wide(ipc::SERVICE_CLASS);
+    let class = wide(ipc::service_class());
     let title = wide(paths::APP_NAME);
     let Ok(hwnd) = (unsafe {
         CreateWindowExW(
@@ -645,8 +678,9 @@ pub fn run(mode: StartMode) {
         events_rx,
         events: EventSink::new(tx, hwnd.0 as isize),
         tray,
-        toast: Overlay::new(instance),
-        badge: Overlay::new(instance),
+        toast: Overlay::new(instance, true),
+        toast_video: None,
+        badge: Overlay::new(instance, false),
         replay_hotkeys: Vec::new(),
         recording_since: None,
         buffer_enabled,
@@ -668,7 +702,8 @@ pub fn run(mode: StartMode) {
                 let name = path.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                 let more =
                     if recovered.len() > 1 { format!(" (+{} more)", recovered.len() - 1) } else { String::new() };
-                s.notify(Glyph::Check, "Recording recovered", &format!("{name} · {}{more}", format_duration(*seconds)));
+                let subtitle = format!("{name} · {}{more}", format_duration(*seconds));
+                s.notify_video("Recording recovered", &subtitle, path);
             }
             files::enforce_limits(&paths::video_dir(&s.config), &s.config.storage);
             unsafe { SetTimer(Some(hwnd), TIMER_CLEANUP, CLEANUP_MS, None) };

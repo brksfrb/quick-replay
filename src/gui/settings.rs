@@ -379,6 +379,12 @@ fn notifications_section(ui: &mut Ui, config: &mut Config) {
                 toggle(ui, &mut n.hide_from_capture)
             });
         }
+        setting_row(
+            ui,
+            "Go over the taskbar",
+            "Notifications and the REC badge sit at the very edge of the screen instead of above the taskbar.",
+            |ui| toggle(ui, &mut n.over_taskbar),
+        );
     });
     ui.add_space(14.0);
 }
