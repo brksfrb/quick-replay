@@ -82,6 +82,7 @@ fn init(settings: &config::Video) -> Result<State, String> {
         height,
         fps,
         bitrate_kbps: settings.bitrate_kbps(width, height),
+        fast_preset: settings.quality != config::Quality::High,
     };
     let encoder = VideoEncoder::new(&gpu, &encoder_settings)?;
     Ok(State { gpu, capture, converter, encoder, width, height, fps })

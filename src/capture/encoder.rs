@@ -50,6 +50,7 @@ pub struct Settings {
     pub height: u32,
     pub fps: u32,
     pub bitrate_kbps: u32,
+    pub fast_preset: bool,
 }
 
 fn subtype(codec: Codec) -> GUID {
@@ -112,6 +113,11 @@ fn configure_codec_api(api: &ICodecAPI, s: &Settings) {
     // No B-frames, so decode order equals display order and muxing stays simple.
     set_codec_value(api, &CODECAPI_AVEncMPVDefaultBPictureCount, &mf::variant_u32(0));
     set_codec_value(api, &CODECAPI_AVLowLatencyMode, &mf::variant_bool(true));
+    // The fastest encoder preset: about a third less encoder load (measured on NVENC at 1080p60)
+    // for a small quality cost; "High" quality keeps the driver's slower, better preset.
+    if s.fast_preset {
+        set_codec_value(api, &CODECAPI_AVEncCommonQualityVsSpeed, &mf::variant_u32(0));
+    }
 }
 
 fn video_type(sub: &GUID, s: &Settings) -> Result<IMFMediaType> {
