@@ -23,6 +23,11 @@ use windows::Win32::System::Threading::{
 const MAX_LAG_FRAMES: i64 = 4;
 /// An encoder that takes no frames (or never sends its headers) for this long is treated as dead.
 const STALL_LIMIT: i64 = 5 * HNS_PER_SEC;
+/// Changes covering less of the screen than this (cursor, typing, clocks, small UI animations)
+/// are encoded at `SMALL_CHANGE_FPS`; bigger ones (games, video, scrolling) at the full rate.
+/// Each encoded frame costs the same on the hardware encoder, so this is where the GPU is saved.
+const SMALL_CHANGE: f32 = 0.02;
+const SMALL_CHANGE_FPS: i64 = 15;
 
 pub struct VideoInfo {
     pub width: u32,
@@ -137,8 +142,9 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
     let mut pending_key = false;
     let mut last_encoded = i64::MIN / 2;
     let mut last_key = i64::MIN / 2;
-    // A screen change the busy encoder couldn't take yet; sent on the next tick.
-    let mut dirty = false;
+    // Share of the screen changed since the last encoded frame (also covers changes the busy
+    // encoder couldn't take yet).
+    let mut pending_change = 0.0f32;
     let started = clock.now();
 
     while !stop.load(Ordering::Relaxed) {
@@ -155,7 +161,7 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
         }
 
         let (gpu, converter) = (&s.gpu, &mut s.converter);
-        let changed = s
+        let change = s
             .capture
             .with_latest_frame(gpu, |texture, w, h| {
                 current = Some(converter.convert(gpu, texture, w, h)?);
@@ -166,7 +172,10 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
         // Only encode when the screen changed, plus a refresh at least every second: an idle
         // desktop costs next to nothing, and replays can still start on any second.
         pending_key |= shared.take_keyframe_request();
-        dirty |= changed;
+        pending_change += change.unwrap_or(0.0);
+        let big_change = pending_change >= SMALL_CHANGE;
+        let small_change_due = pending_change > 0.0 && target - last_encoded >= HNS_PER_SEC / SMALL_CHANGE_FPS;
+        let dirty = big_change || small_change_due;
         let key_due = target - last_key >= HNS_PER_SEC - interval / 2;
         let refresh_due = target - last_encoded >= HNS_PER_SEC - interval / 2;
         if let (Some(frame), true) = (&current, dirty || refresh_due || pending_key) {
@@ -178,7 +187,7 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
             if accepted {
                 last_encoded = target;
                 pending_key = false;
-                dirty = false;
+                pending_change = 0.0;
             } else if target - last_encoded.max(started) > STALL_LIMIT {
                 return Err("the video encoder stopped responding".into());
             }

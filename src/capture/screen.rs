@@ -5,7 +5,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use windows::core::Interface;
 use windows::Foundation::{TimeSpan, TypedEventHandler};
-use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession};
+use windows::Graphics::Capture::{
+    Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureDirtyRegionMode, GraphicsCaptureItem,
+    GraphicsCaptureSession,
+};
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
@@ -44,6 +47,9 @@ impl ScreenCapture {
         let _ = session.SetIsBorderRequired(false);
         let interval = TimeSpan { Duration: super::clock::HNS_PER_SEC / i64::from(fps.max(1)) };
         let _ = session.SetMinUpdateInterval(interval);
+        // Report which parts of the screen changed (Windows 11 24H2+), so tiny changes can be
+        // encoded at a low frame rate.
+        let _ = session.SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportOnly);
 
         session.StartCapture()?;
         Ok(ScreenCapture { pool, session, pool_size: size, closed, _item: item })
@@ -58,21 +64,36 @@ impl ScreenCapture {
         self.closed.load(Ordering::Relaxed)
     }
 
+    /// Share of the screen (0..=1) that a frame's dirty regions cover; 1 when Windows can't say.
+    fn changed_share(&self, frame: &Direct3D11CaptureFrame) -> f32 {
+        let Ok(regions) = frame.DirtyRegions() else { return 1.0 };
+        let Ok(count) = regions.Size() else { return 1.0 };
+        let screen = (self.pool_size.Width.max(1) as f64) * (self.pool_size.Height.max(1) as f64);
+        let area: f64 = (0..count)
+            .filter_map(|i| regions.GetAt(i).ok())
+            .map(|r| f64::from(r.Width.max(0)) * f64::from(r.Height.max(0)))
+            .sum();
+        (area / screen).min(1.0) as f32
+    }
+
     /// Hands the newest frame (if a new one arrived) and its visible size to `use_frame`.
-    /// Older queued frames are skipped. Returns whether a frame was delivered.
+    /// Older queued frames are skipped. Returns the share of the screen that changed since the
+    /// previous call, or None when nothing changed.
     pub fn with_latest_frame(
         &mut self,
         gpu: &Gpu,
         use_frame: impl FnOnce(&ID3D11Texture2D, u32, u32) -> windows::core::Result<()>,
-    ) -> windows::core::Result<bool> {
+    ) -> windows::core::Result<Option<f32>> {
         let mut latest = None;
+        let mut changed = 0.0f32;
         while let Ok(frame) = self.pool.TryGetNextFrame() {
+            changed += self.changed_share(&frame);
             if let Some(old) = latest.replace(frame) {
                 let _ = old.Close();
             }
         }
         let Some(frame) = latest else {
-            return Ok(false);
+            return Ok(None);
         };
         let content = frame.ContentSize()?;
         let surface = frame.Surface()?;
@@ -86,8 +107,9 @@ impl ScreenCapture {
         if content.Width != self.pool_size.Width || content.Height != self.pool_size.Height {
             self.pool.Recreate(&gpu.winrt, FORMAT, POOL_BUFFERS, content)?;
             self.pool_size = content;
+            changed = 1.0;
         }
-        result.map(|()| true)
+        result.map(|()| Some(changed.min(1.0)))
     }
 }
 
