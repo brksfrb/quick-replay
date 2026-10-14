@@ -1,5 +1,5 @@
-//! MP4 writers: [`Mp4Writer`] streams samples to disk (moov at the end),
-//! [`write_faststart`] writes a complete clip with moov before mdat.
+//! MP4 writers: [`Mp4Writer`] streams samples to disk as crash-safe movie
+//! fragments, [`write_faststart`] writes a complete clip with moov before mdat.
 
 mod faststart;
 mod moov;

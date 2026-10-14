@@ -9,6 +9,9 @@ saves the last moments of your screen the second you press a key.
   *Ctrl+Alt+S = last 30 s* and *Ctrl+Alt+1 = last 2 min*.
 - **Normal recording**: start and stop with a shortcut, with an optional small `REC` badge that you
   can keep out of the video (it stays visible to you).
+- **Crash-safe recordings**: recordings are written in one-second pieces and pushed to the disk
+  every couple of seconds. If your PC crashes or loses power, the next start repairs the file and
+  you keep everything up to the last moments.
 - **Hardware encoding**: NVIDIA NVENC, AMD AMF or Intel Quick Sync through Windows' own encoders,
   H.264 or HEVC. Capture, color conversion and encoding all stay on the GPU.
 - **Sound**: system audio and/or microphone, each with its own volume, or no audio track at all.

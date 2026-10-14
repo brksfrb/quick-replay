@@ -83,13 +83,18 @@ pub(crate) fn sample_durations(dts: &[u64], default: u32) -> Vec<u32> {
     out
 }
 
-/// Builds the `ftyp` box.
-pub(crate) fn ftyp(tracks: &[TrackConfig]) -> Vec<u8> {
+/// Builds the `ftyp` box. Fragmented files add the `iso6` brand (movie
+/// fragments with `tfdt`).
+pub(crate) fn ftyp(tracks: &[TrackConfig], fragmented: bool) -> Vec<u8> {
     let mut b = BoxBuf::new();
     let start = b.begin(b"ftyp");
     b.bytes(b"isom");
     b.u32(512);
-    b.bytes(b"isomiso2avc1mp41");
+    b.bytes(b"isom");
+    if fragmented {
+        b.bytes(b"iso6");
+    }
+    b.bytes(b"iso2avc1mp41");
     let hevc = tracks.iter().any(|t| matches!(t.sample_entry.get(4..8), Some(b"hvc1") | Some(b"hev1")));
     if hevc {
         b.bytes(b"hvc1");
@@ -124,10 +129,16 @@ impl Timing {
 
 /// Builds the complete `moov` box. Chunk offsets are written as
 /// `chunk.offset + base_offset` into `co64`, so the box size does not depend on them.
+///
+/// With `fragmented`, an `mvex` box (`mehd` version 1 with a zero fragment
+/// duration plus one `trex` per track) is appended and the chunk offsets go into
+/// an empty `stco`. All duration fields are 64-bit (version 1), so durations can
+/// later be patched in place without changing the box size.
 pub(crate) fn build_moov(
     tracks: &[(&TrackConfig, &SampleTables)],
     base_offset: u64,
     creation_time: u64,
+    fragmented: bool,
 ) -> io::Result<Vec<u8>> {
     let durations: Vec<Vec<u32>> =
         tracks.iter().map(|(cfg, t)| sample_durations(&t.dts, default_duration(cfg))).collect();
@@ -140,11 +151,33 @@ pub(crate) fn build_moov(
     let moov = b.begin(b"moov");
     write_mvhd(&mut b, creation_time, movie_duration, next_track_id);
     for (i, ((cfg, tables), (d, timing))) in tracks.iter().zip(durations.iter().zip(&timings)).enumerate() {
-        let track = TrackOut { cfg, tables, durations: d, timing, id: i as u32 + 1 };
+        let track = TrackOut { cfg, tables, durations: d, timing, id: i as u32 + 1, fragmented };
         write_trak(&mut b, &track, base_offset, creation_time)?;
+    }
+    if fragmented {
+        write_mvex(&mut b, tracks.len());
     }
     b.end(moov);
     b.finish()
+}
+
+/// Writes `mvex` with a version-1 `mehd` (fragment duration 0, patched by the
+/// writer at the end) and default-free `trex` boxes for track IDs `1..=tracks`.
+fn write_mvex(b: &mut BoxBuf, tracks: usize) {
+    let mvex = b.begin(b"mvex");
+    let mehd = b.begin_full(b"mehd", 1, 0);
+    b.u64(0);
+    b.end(mehd);
+    for id in 1..=tracks {
+        let trex = b.begin_full(b"trex", 0, 0);
+        b.u32(id as u32);
+        b.u32(1); // default_sample_description_index
+        b.u32(0); // default_sample_duration
+        b.u32(0); // default_sample_size
+        b.u32(0); // default_sample_flags
+        b.end(trex);
+    }
+    b.end(mvex);
 }
 
 struct TrackOut<'a> {
@@ -153,6 +186,7 @@ struct TrackOut<'a> {
     durations: &'a [u32],
     timing: &'a Timing,
     id: u32,
+    fragmented: bool,
 }
 
 fn write_matrix(b: &mut BoxBuf) {
@@ -320,12 +354,19 @@ fn write_stbl(b: &mut BoxBuf, t: &TrackOut<'_>, base_offset: u64) -> io::Result<
     }
     b.end(stsz);
 
-    let co64 = b.begin_full(b"co64", 0, 0);
-    b.u32(count(tables.chunks.len())?);
-    for c in &tables.chunks {
-        b.u64(c.offset.saturating_add(base_offset));
+    if t.fragmented {
+        // Samples live in movie fragments; the moov tables stay empty.
+        let stco = b.begin_full(b"stco", 0, 0);
+        b.u32(0);
+        b.end(stco);
+    } else {
+        let co64 = b.begin_full(b"co64", 0, 0);
+        b.u32(count(tables.chunks.len())?);
+        for c in &tables.chunks {
+            b.u64(c.offset.saturating_add(base_offset));
+        }
+        b.end(co64);
     }
-    b.end(co64);
 
     b.end(stbl);
     Ok(())

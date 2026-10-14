@@ -42,6 +42,11 @@ impl BoxBuf {
         self.buf.resize(self.buf.len() + n, 0);
     }
 
+    /// Number of bytes written so far.
+    pub(crate) fn position(&self) -> usize {
+        self.buf.len()
+    }
+
     /// Starts a plain box; returns the token to pass to [`BoxBuf::end`].
     pub(crate) fn begin(&mut self, fourcc: &[u8; 4]) -> usize {
         let start = self.buf.len();

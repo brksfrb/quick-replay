@@ -41,11 +41,11 @@ pub fn write_faststart<W: Write>(
     let mdat_header_len: u64 = if payload + 8 > u64::from(u32::MAX) { 16 } else { 8 };
 
     let configs: Vec<TrackConfig> = tracks.iter().map(|(c, _)| c.clone()).collect();
-    let ftyp = ftyp(&configs);
+    let ftyp = ftyp(&configs, false);
     let now = mp4_time_now();
     let moov_len = {
         let refs: Vec<(&TrackConfig, &SampleTables)> = configs.iter().zip(tables.iter()).collect();
-        build_moov(&refs, 0, now)?.len() as u64
+        build_moov(&refs, 0, now, false)?.len() as u64
     };
     let base = ftyp.len() as u64 + moov_len + mdat_header_len;
     for t in &mut tables {
@@ -54,7 +54,7 @@ pub fn write_faststart<W: Write>(
         }
     }
     let refs: Vec<(&TrackConfig, &SampleTables)> = configs.iter().zip(tables.iter()).collect();
-    let moov = build_moov(&refs, 0, now)?;
+    let moov = build_moov(&refs, 0, now, false)?;
     if moov.len() as u64 != moov_len {
         return Err(io::Error::other("moov size changed between passes"));
     }

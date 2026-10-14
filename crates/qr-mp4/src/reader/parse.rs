@@ -63,6 +63,12 @@ impl<'a> Cursor<'a> {
         Ok(v)
     }
 
+    /// Reads a full-box header and returns (version, flags).
+    pub(crate) fn version_flags(&mut self) -> io::Result<(u8, u32)> {
+        let word = self.u32()?;
+        Ok(((word >> 24) as u8, word & 0x00FF_FFFF))
+    }
+
     /// Reads a 32-bit field (version 0) or a 64-bit field (version 1).
     pub(crate) fn uint_v(&mut self, version: u8) -> io::Result<u64> {
         if version == 1 {

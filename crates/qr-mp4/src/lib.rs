@@ -5,23 +5,29 @@
 //!
 //! * [`nal`]: Annex-B parsing, parameter-set handling and `avcC`/`hvcC` records.
 //! * [`boxes`]: complete sample-entry boxes for the `stsd` box.
-//! * [`writer`]: a streaming writer for long recordings and a fast-start
-//!   writer for complete clips.
-//! * [`reader`]: a moov-only parser that builds per-sample tables.
-//! * [`trim`]: lossless stream-copy trimming.
+//! * [`writer`]: a crash-safe fragmented writer for long recordings and a
+//!   fast-start writer for complete clips.
+//! * [`reader`]: a parser for regular and fragmented files that builds
+//!   per-sample tables.
+//! * [`trim`](mod@trim): lossless stream-copy trimming.
+//! * [`recover`]: repairs fragmented recordings that were interrupted.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod boxes;
+mod fmp4;
 pub mod nal;
+mod patch;
 pub mod reader;
+mod recovery;
 pub mod trim;
 pub mod writer;
 
 pub use boxes::{aac_lc_asc, avc1_sample_entry, hvc1_sample_entry, mp4a_sample_entry};
 pub use nal::{annexb_to_sample, split_annexb, ParamSets};
 pub use reader::{probe, read_mp4, Mp4File, Sample, Track};
+pub use recovery::{recover, RecoverResult};
 pub use trim::{trim, TrimResult};
 pub use writer::{write_faststart, Mp4Writer, SampleMeta, TrackConfig, TrackKind};
 

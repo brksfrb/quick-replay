@@ -12,10 +12,12 @@ use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId};
 
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 const GIB: u64 = 1024 * 1024 * 1024;
+/// Runtimes whose own name says nothing about the game or app running in them.
+const SCRIPT_HOSTS: [&str; 7] = ["java", "javaw", "python", "pythonw", "node", "electron", "mono"];
 /// Processes that mean "no particular app is in front".
 const SHELL_PROCESSES: [&str; 5] =
     ["explorer", "searchhost", "shellexperiencehost", "startmenuexperiencehost", "lockapp"];
@@ -65,14 +67,24 @@ fn file_description(exe: &Path) -> Option<String> {
     }
 }
 
+fn foreground_title() -> Option<String> {
+    let mut buf = [0u16; 256];
+    let len = unsafe { GetWindowTextW(GetForegroundWindow(), &mut buf) };
+    let title = String::from_utf16_lossy(&buf[..len.max(0) as usize]);
+    (!title.trim().is_empty()).then_some(title)
+}
+
 fn foreground_app_name() -> Option<String> {
     let exe = foreground_exe()?;
     let stem = exe.file_stem()?.to_string_lossy().to_string();
     if SHELL_PROCESSES.iter().any(|s| stem.eq_ignore_ascii_case(s)) {
         return Some("Desktop".into());
     }
+    // Games running inside Java, Python, Node... are better named by their window ("Minecraft 1.21").
+    let hosted = SCRIPT_HOSTS.iter().any(|h| stem.eq_ignore_ascii_case(h));
+    let title = hosted.then(foreground_title).flatten();
     let description = file_description(&exe).map(|d| d.trim().trim_end_matches(".exe").trim().to_string());
-    let name = description.filter(|d| !d.is_empty()).unwrap_or(stem);
+    let name = title.or(description.filter(|d| !d.is_empty())).unwrap_or(stem);
     let clean = paths::sanitize_file_stem(&name);
     (!clean.is_empty()).then_some(clean)
 }
@@ -97,6 +109,40 @@ fn is_own_video(stem: &str) -> bool {
     stem.as_bytes()
         .windows(PATTERN.len())
         .any(|w| w.iter().zip(PATTERN).all(|(c, p)| if *p == b'd' { c.is_ascii_digit() } else { c == p }))
+}
+
+/// After a crash or power loss: recordings left as `*.mp4.part` are repaired (cut at the last
+/// complete second) and renamed to `.mp4`. Unfinished replay saves can't be repaired and are
+/// removed. Returns the recovered files and their lengths in seconds.
+pub fn recover_interrupted(dir: &Path) -> Vec<(PathBuf, f64)> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut recovered = Vec::new();
+    for entry in entries.flatten() {
+        let part = entry.path();
+        let name = part.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let Some(stem) = name.strip_suffix(".mp4.part") else { continue };
+        if !is_own_video(stem) {
+            continue;
+        }
+        match qr_mp4::recover(&part) {
+            Ok(result) => {
+                let plain = dir.join(format!("{stem}.mp4"));
+                let target = if plain.exists() { paths::unique_path(dir, stem) } else { plain };
+                match std::fs::rename(&part, &target) {
+                    Ok(()) => {
+                        log::info!("recovered {} ({:.1}s)", target.display(), result.duration_secs);
+                        recovered.push((target, result.duration_secs));
+                    }
+                    Err(err) => log::warn!("could not rename recovered {}: {err}", part.display()),
+                }
+            }
+            Err(err) => {
+                log::warn!("removing unrecoverable {}: {err}", part.display());
+                let _ = std::fs::remove_file(&part);
+            }
+        }
+    }
+    recovered
 }
 
 /// Deletes the oldest videos past the configured age or folder size. Returns how many were removed.

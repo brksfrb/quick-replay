@@ -5,14 +5,16 @@ use super::clock::HNS_PER_SEC;
 use super::{aac, Event, EventSink, Packet, VideoFormat};
 use qr_mp4::{SampleMeta, TrackConfig, TrackKind};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 const VIDEO_TIMESCALE: u32 = 90_000;
 const WRITE_BUFFER: usize = 1 << 20;
+const DISK_SYNC_INTERVAL: Duration = Duration::from_secs(2);
 /// If no audio arrives this long after a recording starts, the audio thread is gone.
 const AUDIO_WAIT_HNS: i64 = 2 * HNS_PER_SEC;
 
@@ -117,7 +119,45 @@ pub enum RecordMessage {
     Finish,
 }
 
-type Mp4Out = qr_mp4::Mp4Writer<BufWriter<File>>;
+/// A recording file that also pushes its data to the disk itself (not just the Windows cache)
+/// every couple of seconds, so a power loss or blue screen only loses the last moments.
+struct DurableFile {
+    inner: BufWriter<File>,
+    last_sync: Instant,
+}
+
+impl DurableFile {
+    fn create(path: &Path) -> std::io::Result<DurableFile> {
+        Ok(DurableFile {
+            inner: BufWriter::with_capacity(WRITE_BUFFER, File::create(path)?),
+            last_sync: Instant::now(),
+        })
+    }
+}
+
+impl Write for DurableFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    /// The MP4 writer flushes after every fragment (about once a second).
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()?;
+        if self.last_sync.elapsed() >= DISK_SYNC_INTERVAL {
+            self.inner.get_ref().sync_data()?;
+            self.last_sync = Instant::now();
+        }
+        Ok(())
+    }
+}
+
+impl Seek for DurableFile {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+type Mp4Out = qr_mp4::Mp4Writer<DurableFile>;
 
 struct Recording {
     path: PathBuf,
@@ -143,7 +183,7 @@ impl Recording {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let file = BufWriter::with_capacity(WRITE_BUFFER, File::create(part_path(&self.path))?);
+        let file = DurableFile::create(&part_path(&self.path))?;
         let mut writer = qr_mp4::Mp4Writer::new(file, tracks)?;
         for packet in self.pending.drain(..) {
             writer.write_sample(0, &packet.data, to_video_ticks(packet.time - self.start), packet.key)?;
@@ -186,7 +226,9 @@ impl Recording {
             self.open(None)?;
         }
         let writer = self.writer.take().ok_or_else(|| std::io::Error::other("recording never started"))?;
-        writer.finish()?.flush()?;
+        let mut file = writer.finish()?;
+        file.flush()?;
+        file.inner.get_ref().sync_data()?;
         std::fs::rename(part_path(&self.path), &self.path)?;
         Ok((self.last_video - self.start) as f64 / HNS_PER_SEC as f64)
     }

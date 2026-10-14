@@ -7,7 +7,7 @@ use super::Sample;
 
 /// Upper bound on samples per track (over 180 hours of 30 fps video), so a
 /// corrupt sample count cannot trigger a huge allocation.
-const MAX_SAMPLES_PER_TRACK: usize = 20_000_000;
+pub(crate) const MAX_SAMPLES_PER_TRACK: usize = 20_000_000;
 
 /// Sample sizes from `stsz`.
 enum Sizes {

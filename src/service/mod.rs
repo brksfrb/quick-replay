@@ -663,6 +663,13 @@ pub fn run(mode: StartMode) {
                 s.start_pipeline();
             }
             s.update_tray();
+            let recovered = files::recover_interrupted(&paths::video_dir(&s.config));
+            if let Some((path, seconds)) = recovered.first() {
+                let name = path.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                let more =
+                    if recovered.len() > 1 { format!(" (+{} more)", recovered.len() - 1) } else { String::new() };
+                s.notify(Glyph::Check, "Recording recovered", &format!("{name} · {}{more}", format_duration(*seconds)));
+            }
             files::enforce_limits(&paths::video_dir(&s.config), &s.config.storage);
             unsafe { SetTimer(Some(hwnd), TIMER_CLEANUP, CLEANUP_MS, None) };
             if mode.first_run {

@@ -178,10 +178,12 @@ pub fn access_units(codec: VideoCodec, data: &[u8]) -> Vec<Vec<u8>> {
 /// One `[SECTION]` of ffprobe's default output.
 pub type Section = HashMap<String, String>;
 
-/// Runs `ffprobe -v warning -show_streams -show_format`, asserting success and an
-/// empty stderr (no warnings or errors). Returns (streams, format).
+/// Runs `ffprobe -v warning -count_packets -show_streams -show_format`, asserting
+/// success and an empty stderr (no warnings or errors). Returns (streams, format);
+/// streams carry `nb_read_packets` (`nb_frames` is N/A for fragmented files).
 pub fn ffprobe(file: &Path) -> (Vec<Section>, Section) {
-    let (ok, out, err) = run("ffprobe", &["-v", "warning", "-show_streams", "-show_format", s(file)]);
+    let args = ["-v", "warning", "-count_packets", "-show_streams", "-show_format", s(file)];
+    let (ok, out, err) = run("ffprobe", &args);
     assert!(ok, "ffprobe failed on {}: {err}", file.display());
     assert!(err.trim().is_empty(), "ffprobe reported errors on {}: {err}", file.display());
     let mut streams = Vec::new();
