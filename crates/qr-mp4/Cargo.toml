@@ -1,0 +1,9 @@
+[package]
+name = "qr-mp4"
+description = "Minimal pure-Rust MP4 muxer/demuxer for H.264, HEVC and AAC"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

@@ -1,0 +1,35 @@
+# Build output
+/target/
+**/*.rs.bk
+
+# Portable-mode data and marker (created by users next to the exe)
+/data/
+portable.txt
+portable.txt.txt
+
+# Recordings made while testing
+*.mp4
+*.mkv
+
+# Secrets and signing material
+.env
+.env.*
+*.secret
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Local tooling / assistant files
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+AGENTS.md
+.idea/
+.vscode/
+*.iml
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
