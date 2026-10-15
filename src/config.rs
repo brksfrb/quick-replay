@@ -38,6 +38,8 @@ pub struct General {
     pub auto_update: bool,
     /// Open the window maximized instead of centered.
     pub open_maximized: bool,
+    /// One folder per game or app inside the video folder.
+    pub organize_by_app: bool,
 }
 
 impl Default for General {
@@ -49,6 +51,7 @@ impl Default for General {
             name_after_app: true,
             auto_update: true,
             open_maximized: false,
+            organize_by_app: true,
         }
     }
 }

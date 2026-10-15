@@ -7,6 +7,7 @@ mod devpng;
 mod hotkey;
 mod icon;
 mod logger;
+mod organize;
 mod paths;
 
 #[cfg(windows)]

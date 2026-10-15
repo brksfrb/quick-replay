@@ -316,6 +316,15 @@ impl App {
                     let _ = std::process::Command::new(paths::current_exe()).arg("--uninstall").spawn();
                     ui.ctx().send_viewport_cmd(ViewportCommand::Close);
                 }
+                SettingsAction::SortExisting => {
+                    let moved = crate::organize::sort_into_folders(&paths::video_dir(&self.config));
+                    self.library.mark_dirty();
+                    self.show_flash(match moved {
+                        0 => "Nothing to sort".to_string(),
+                        1 => "Sorted 1 video".to_string(),
+                        n => format!("Sorted {n} videos"),
+                    });
+                }
                 SettingsAction::CheckUpdates => {
                     self.flush_config();
                     if ipc::send_to_service(Command::CheckUpdates) {

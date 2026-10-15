@@ -68,8 +68,10 @@ QuickReplay.exe --save-replay 30
 | `--quit` | Close QuickReplay |
 | `--uninstall` | Remove QuickReplay (your videos are kept) |
 
-Videos go to `Videos\QuickReplay` by default and are named after the game or app in front,
-like `VALORANT 2026-10-14 21-03-55.mp4`. Settings are in `%LOCALAPPDATA%\QuickReplay\config.toml`.
+Videos go to `Videos\QuickReplay` by default, in one folder per game or app, and are named after
+the game or app in front, like `VALORANT\VALORANT 2026-10-14 21-03-55.mp4`. The library shows them
+all together with a chip per folder to filter. Both are options in Settings, and "Sort now" files
+videos you already have. Settings are in `%LOCALAPPDATA%\QuickReplay\config.toml`.
 
 ## Resource use
 

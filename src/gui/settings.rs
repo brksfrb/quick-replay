@@ -33,6 +33,7 @@ pub enum SettingsAction {
     Quit,
     Uninstall,
     CheckUpdates,
+    SortExisting,
 }
 
 #[derive(Default)]
@@ -122,8 +123,11 @@ impl SettingsPage {
             video_section(ui, &mut config.video, monitors);
             audio_section(ui, &mut config.audio);
             notifications_section(ui, config);
-            storage_section(ui, config);
+            let sort = storage_section(ui, config);
             action = general_section(ui, config);
+            if matches!(action, SettingsAction::None) {
+                action = sort;
+            }
             ui.add_space(24.0);
         });
         action
@@ -415,7 +419,8 @@ fn limit_label(gb: u32) -> String {
     }
 }
 
-fn storage_section(ui: &mut Ui, config: &mut Config) {
+fn storage_section(ui: &mut Ui, config: &mut Config) -> SettingsAction {
+    let mut sort = false;
     theme::card().show(ui, |ui| {
         ui.set_width(ui.available_width());
         theme::section_title(ui, icon::DRIVE, "Files & storage");
@@ -441,6 +446,19 @@ fn storage_section(ui: &mut Ui, config: &mut Config) {
         setting_row(ui, "Name files after the game or app", "Like “VALORANT 2026-10-14 21-03-55”.", |ui| {
             toggle(ui, &mut config.general.name_after_app)
         });
+        setting_row(ui, "Sort videos into folders", "One folder per game or app inside the video folder.", |ui| {
+            toggle(ui, &mut config.general.organize_by_app)
+        });
+        setting_row(
+            ui,
+            "Sort existing videos",
+            "Moves videos already in the folder into their game or app folder.",
+            |ui| {
+                if theme::secondary_button(ui, None, "Sort now").clicked() {
+                    sort = true;
+                }
+            },
+        );
         let s = &mut config.storage;
         setting_row(ui, "Delete old videos", "Oldest first. Off by default.", |ui| {
             ComboBox::from_id_salt("delete-after").selected_text(days_label(s.delete_after_days)).show_ui(ui, |ui| {
@@ -458,6 +476,11 @@ fn storage_section(ui: &mut Ui, config: &mut Config) {
         });
     });
     ui.add_space(14.0);
+    if sort {
+        SettingsAction::SortExisting
+    } else {
+        SettingsAction::None
+    }
 }
 
 fn general_section(ui: &mut Ui, config: &mut Config) -> SettingsAction {

@@ -27,6 +27,8 @@ const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Au
 
 pub struct Video {
     pub path: PathBuf,
+    /// The per-app folder it sits in; empty for videos directly in the video folder.
+    pub folder: String,
     pub name: String,
     pub size: u64,
     pub modified: SystemTime,
@@ -44,6 +46,8 @@ pub struct Library {
     dirty: Arc<AtomicBool>,
     watch_generation: Arc<AtomicU64>,
     search: String,
+    /// Show only this per-app folder ("" is the video folder itself); None shows everything.
+    folder: Option<String>,
     pub thumbs: Thumbnails,
     ctx: egui::Context,
 }
@@ -94,17 +98,26 @@ pub fn date_label(time: SystemTime) -> String {
 }
 
 fn scan(dir: &Path) -> Vec<Video> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
-    let mut videos: Vec<Video> = entries
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("mp4")))
-        .filter_map(|e| {
-            let meta = e.metadata().ok()?;
-            let path = e.path();
-            let name = path.file_stem()?.to_string_lossy().to_string();
-            Some(Video { name, size: meta.len(), modified: meta.modified().ok()?, path })
-        })
-        .collect();
+    let mut videos: Vec<Video> = Vec::new();
+    for folder in crate::organize::video_folders(dir) {
+        let label = if folder == dir {
+            String::new()
+        } else {
+            folder.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+        };
+        let Ok(entries) = std::fs::read_dir(&folder) else { continue };
+        videos.extend(
+            entries
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("mp4")))
+                .filter_map(|e| {
+                    let meta = e.metadata().ok()?;
+                    let path = e.path();
+                    let name = path.file_stem()?.to_string_lossy().to_string();
+                    Some(Video { name, folder: label.clone(), size: meta.len(), modified: meta.modified().ok()?, path })
+                }),
+        );
+    }
     videos.sort_by_key(|v| std::cmp::Reverse(v.modified));
     videos
 }
@@ -115,7 +128,7 @@ fn watch(dir: PathBuf, ctx: egui::Context, dirty: Arc<AtomicBool>, generation: A
     let path = wide(dir.as_os_str());
     let spawned = std::thread::Builder::new().name("folder-watch".into()).spawn(move || unsafe {
         let filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE;
-        let Ok(handle) = FindFirstChangeNotificationW(PCWSTR(path.as_ptr()), false, filter) else { return };
+        let Ok(handle) = FindFirstChangeNotificationW(PCWSTR(path.as_ptr()), true, filter) else { return };
         while generation.load(Ordering::Relaxed) == mine {
             WaitForSingleObject(handle, INFINITE);
             dirty.store(true, Ordering::Relaxed);
@@ -139,6 +152,7 @@ impl Library {
             dirty: Arc::new(AtomicBool::new(true)),
             watch_generation: Arc::new(AtomicU64::new(0)),
             search: String::new(),
+            folder: None,
             thumbs: Thumbnails::new(ctx.clone()),
             ctx,
         };
@@ -202,8 +216,39 @@ impl Library {
         });
         ui.add_space(16.0);
 
+        // One chip per app folder, once there is more than one group of videos.
+        let mut groups: Vec<(String, usize)> = Vec::new();
+        for video in &self.videos {
+            match groups.iter_mut().find(|(f, _)| *f == video.folder) {
+                Some(group) => group.1 += 1,
+                None => groups.push((video.folder.clone(), 1)),
+            }
+        }
+        groups.sort_by_key(|(f, _)| f.to_lowercase());
+        if self.folder.as_ref().is_some_and(|sel| !groups.iter().any(|(f, _)| f == sel)) {
+            self.folder = None;
+        }
+        if groups.len() > 1 {
+            ui.horizontal_wrapped(|ui| {
+                let all = format!("All  {}", self.videos.len());
+                if ui.add(egui::Button::selectable(self.folder.is_none(), all)).clicked() {
+                    self.folder = None;
+                }
+                for (name, count) in &groups {
+                    let label = if name.is_empty() { "Unsorted" } else { name.as_str() };
+                    let selected = self.folder.as_deref() == Some(name.as_str());
+                    if ui.add(egui::Button::selectable(selected, format!("{label}  {count}"))).clicked() {
+                        self.folder = Some(name.clone());
+                    }
+                }
+            });
+            ui.add_space(12.0);
+        }
+
         let query = self.search.to_lowercase();
+        let folder = self.folder.clone();
         let visible: Vec<usize> = (0..self.videos.len())
+            .filter(|&i| folder.as_ref().is_none_or(|f| *f == self.videos[i].folder))
             .filter(|&i| query.is_empty() || self.videos[i].name.to_lowercase().contains(&query))
             .collect();
         if visible.is_empty() {

@@ -1,6 +1,7 @@
 //! Naming new videos and keeping the video folder within the user's storage limits.
 
 use crate::config::{Config, Storage};
+use crate::organize::{self, is_own_video};
 use crate::paths;
 use crate::win::wide;
 use std::path::{Path, PathBuf};
@@ -98,30 +99,28 @@ fn timestamp() -> String {
     format!("{:04}-{:02}-{:02} {:02}-{:02}-{:02}", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond)
 }
 
-/// e.g. `Videos\QuickReplay\VALORANT 2026-10-14 21-03-55.mp4`, or "Replay ..." / "Recording ...".
+/// e.g. `Videos\QuickReplay\VALORANT\VALORANT 2026-10-14 21-03-55.mp4`. With per-app folders off,
+/// the video goes straight into the video folder. "Replay ..." / "Recording ..." when the app is unknown.
 pub fn new_video_path(config: &Config, fallback: &str) -> PathBuf {
-    let dir = paths::video_dir(config);
-    let prefix =
-        config.general.name_after_app.then(foreground_app_name).flatten().unwrap_or_else(|| fallback.to_string());
+    let root = paths::video_dir(config);
+    let app = foreground_app_name();
+    let prefix = config.general.name_after_app.then(|| app.clone()).flatten().unwrap_or_else(|| fallback.to_string());
+    let dir = if config.general.organize_by_app {
+        root.join(app.as_deref().unwrap_or(organize::UNKNOWN_APP_FOLDER))
+    } else {
+        root
+    };
     paths::unique_path(&dir, &format!("{prefix} {}", timestamp()))
-}
-
-/// Videos QuickReplay named itself: they contain a "YYYY-MM-DD HH-MM-SS" timestamp. Cleanup
-/// only ever touches these, never other files that happen to be in the folder.
-fn is_own_video(stem: &str) -> bool {
-    const PATTERN: &[u8] = b"dddd-dd-dd dd-dd-dd";
-    stem.as_bytes()
-        .windows(PATTERN.len())
-        .any(|w| w.iter().zip(PATTERN).all(|(c, p)| if *p == b'd' { c.is_ascii_digit() } else { c == p }))
 }
 
 /// After a crash or power loss: recordings left as `*.mp4.part` are repaired (cut at the last
 /// complete second) and renamed to `.mp4`. Unfinished replay saves can't be repaired and are
 /// removed. Returns the recovered files and their lengths in seconds.
 pub fn recover_interrupted(dir: &Path) -> Vec<(PathBuf, f64)> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut recovered = Vec::new();
-    for entry in entries.flatten() {
+    let entries =
+        organize::video_folders(dir).into_iter().filter_map(|d| std::fs::read_dir(d).ok()).flat_map(|r| r.flatten());
+    for entry in entries {
         let part = entry.path();
         let name = part.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let Some(stem) = name.strip_suffix(".mp4.part") else { continue };
@@ -130,8 +129,9 @@ pub fn recover_interrupted(dir: &Path) -> Vec<(PathBuf, f64)> {
         }
         match qr_mp4::recover(&part) {
             Ok(result) => {
-                let plain = dir.join(format!("{stem}.mp4"));
-                let target = if plain.exists() { paths::unique_path(dir, stem) } else { plain };
+                let folder = part.parent().unwrap_or(dir);
+                let plain = folder.join(format!("{stem}.mp4"));
+                let target = if plain.exists() { paths::unique_path(folder, stem) } else { plain };
                 match std::fs::rename(&part, &target) {
                     Ok(()) => {
                         log::info!("recovered {} ({:.1}s)", target.display(), result.duration_secs);
@@ -154,11 +154,11 @@ pub fn enforce_limits(dir: &Path, storage: &Storage) -> usize {
     if storage.delete_after_days == 0 && storage.max_folder_gb == 0 {
         return 0;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    let mut files: Vec<(PathBuf, SystemTime, u64)> = entries
-        .flatten()
+    let folders = organize::video_folders(dir);
+    let mut files: Vec<(PathBuf, SystemTime, u64)> = folders
+        .iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flat_map(|r| r.flatten())
         .filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("mp4")))
         .filter(|e| e.path().file_stem().is_some_and(|s| is_own_video(&s.to_string_lossy())))
         .filter_map(|e| {
@@ -184,6 +184,12 @@ pub fn enforce_limits(dir: &Path, storage: &Storage) -> usize {
             log::info!("storage limit: removed {}", path.display());
             total = total.saturating_sub(size);
             removed += 1;
+        }
+    }
+    if removed > 0 {
+        // Per-app folders that became empty go too (remove_dir fails unless empty; never the root).
+        for folder in folders.iter().skip(1) {
+            let _ = std::fs::remove_dir(folder);
         }
     }
     removed
