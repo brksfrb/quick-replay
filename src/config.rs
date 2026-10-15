@@ -220,6 +220,9 @@ pub struct Video {
     pub quality: Quality,
     pub custom_bitrate_kbps: u32,
     pub capture_cursor: bool,
+    /// Opt-in GPU saver: games and fullscreen video keep the full frame rate, everything else is
+    /// capped at 30 fps. Off by default (desktop apps get the full frame rate too).
+    pub full_rate_only_fullscreen: bool,
 }
 
 impl Default for Video {
@@ -232,6 +235,7 @@ impl Default for Video {
             quality: Quality::Medium,
             custom_bitrate_kbps: 15_000,
             capture_cursor: true,
+            full_rate_only_fullscreen: false,
         }
     }
 }

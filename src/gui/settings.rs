@@ -311,6 +311,15 @@ fn video_section(ui: &mut Ui, video: &mut Video, monitors: &[Monitor]) {
                 .small()
                 .color(theme::TEXT_WEAK),
         );
+        if video.fps > 30 {
+            setting_row(
+                ui,
+                "Save GPU outside fullscreen apps",
+                "Off: everything gets the full frame rate. On: only games and fullscreen video do, the rest is \
+                 recorded at 30 fps, which halves the GPU work on the desktop.",
+                |ui| toggle(ui, &mut video.full_rate_only_fullscreen),
+            );
+        }
         setting_row(ui, "Show the mouse cursor", "", |ui| toggle(ui, &mut video.capture_cursor));
     });
     ui.add_space(14.0);

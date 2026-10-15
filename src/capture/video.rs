@@ -28,6 +28,10 @@ const STALL_LIMIT: i64 = 5 * HNS_PER_SEC;
 /// Each encoded frame costs the same on the hardware encoder, so this is where the GPU is saved.
 const SMALL_CHANGE: f32 = 0.02;
 const SMALL_CHANGE_FPS: i64 = 15;
+/// Frame rate for everything that isn't a fullscreen app, when that option is on.
+const WINDOWED_FPS: i64 = 30;
+/// How often to look at which app is in front.
+const FULLSCREEN_CHECK: i64 = HNS_PER_SEC;
 
 pub struct VideoInfo {
     pub width: u32,
@@ -69,6 +73,9 @@ struct State {
     width: u32,
     height: u32,
     fps: u32,
+    monitor: isize,
+    /// Cap non-fullscreen content at WINDOWED_FPS.
+    windowed_cap: bool,
 }
 
 fn init(settings: &config::Video) -> Result<State, String> {
@@ -90,7 +97,8 @@ fn init(settings: &config::Video) -> Result<State, String> {
         fast_preset: settings.quality != config::Quality::High,
     };
     let encoder = VideoEncoder::new(&gpu, &encoder_settings)?;
-    Ok(State { gpu, capture, converter, encoder, width, height, fps })
+    let windowed_cap = settings.full_rate_only_fullscreen && i64::from(fps) > WINDOWED_FPS;
+    Ok(State { gpu, capture, converter, encoder, width, height, fps, monitor: monitor.handle, windowed_cap })
 }
 
 pub fn spawn(
@@ -145,6 +153,8 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
     // Share of the screen changed since the last encoded frame (also covers changes the busy
     // encoder couldn't take yet).
     let mut pending_change = 0.0f32;
+    let mut full_rate = !s.windowed_cap;
+    let mut last_fullscreen_check = i64::MIN / 2;
     let started = clock.now();
 
     while !stop.load(Ordering::Relaxed) {
@@ -160,25 +170,35 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
             return Err("the captured monitor was disconnected".into());
         }
 
-        let (gpu, converter) = (&s.gpu, &mut s.converter);
-        let change = s
-            .capture
-            .with_latest_frame(gpu, |texture, w, h| {
-                current = Some(converter.convert(gpu, texture, w, h)?);
-                Ok(())
-            })
-            .map_err(|e| format!("capture failed: {e}"))?;
+        let change = s.capture.poll(&s.gpu).map_err(|e| format!("capture failed: {e}"))?;
+        if s.windowed_cap && target - last_fullscreen_check >= FULLSCREEN_CHECK {
+            last_fullscreen_check = target;
+            full_rate = crate::win::monitors::fullscreen_app_on(s.monitor);
+        }
+        // Outside fullscreen apps, even big changes are encoded at most WINDOWED_FPS times a second.
+        let min_gap = if full_rate { 0 } else { HNS_PER_SEC / WINDOWED_FPS - interval / 2 };
 
         // Only encode when the screen changed, plus a refresh at least every second: an idle
         // desktop costs next to nothing, and replays can still start on any second.
         pending_key |= shared.take_keyframe_request();
         pending_change += change.unwrap_or(0.0);
-        let big_change = pending_change >= SMALL_CHANGE;
+        let big_change = pending_change >= SMALL_CHANGE && target - last_encoded >= min_gap;
         let small_change_due = pending_change > 0.0 && target - last_encoded >= HNS_PER_SEC / SMALL_CHANGE_FPS;
         let dirty = big_change || small_change_due;
         let key_due = target - last_key >= HNS_PER_SEC - interval / 2;
         let refresh_due = target - last_encoded >= HNS_PER_SEC - interval / 2;
-        if let (Some(frame), true) = (&current, dirty || refresh_due || pending_key) {
+        let wanted = dirty || refresh_due || pending_key;
+        if wanted && s.capture.has_frame() {
+            // Convert only frames that will actually be encoded.
+            let (gpu, converter) = (&s.gpu, &mut s.converter);
+            s.capture
+                .take_frame(|texture, w, h| {
+                    current = Some(converter.convert(gpu, texture, w, h)?);
+                    Ok(())
+                })
+                .map_err(|e| format!("capture failed: {e}"))?;
+        }
+        if let (Some(frame), true) = (&current, wanted) {
             let force_key = pending_key || key_due;
             let accepted = s
                 .encoder

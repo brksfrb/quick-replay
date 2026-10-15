@@ -24,6 +24,8 @@ pub struct ScreenCapture {
     session: GraphicsCaptureSession,
     pool_size: SizeInt32,
     closed: Arc<AtomicBool>,
+    /// The newest frame, kept unconverted until the encoder actually needs it.
+    held: Option<Direct3D11CaptureFrame>,
     _item: GraphicsCaptureItem,
 }
 
@@ -52,7 +54,7 @@ impl ScreenCapture {
         let _ = session.SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportOnly);
 
         session.StartCapture()?;
-        Ok(ScreenCapture { pool, session, pool_size: size, closed, _item: item })
+        Ok(ScreenCapture { pool, session, pool_size: size, closed, held: None, _item: item })
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -76,45 +78,59 @@ impl ScreenCapture {
         (area / screen).min(1.0) as f32
     }
 
-    /// Hands the newest frame (if a new one arrived) and its visible size to `use_frame`.
-    /// Older queued frames are skipped. Returns the share of the screen that changed since the
-    /// previous call, or None when nothing changed.
-    pub fn with_latest_frame(
-        &mut self,
-        gpu: &Gpu,
-        use_frame: impl FnOnce(&ID3D11Texture2D, u32, u32) -> windows::core::Result<()>,
-    ) -> windows::core::Result<Option<f32>> {
-        let mut latest = None;
-        let mut changed = 0.0f32;
+    /// Picks up new frames, keeping only the newest one (unconverted) until `take_frame`.
+    /// Returns the share of the screen that changed, or None when nothing new arrived.
+    pub fn poll(&mut self, gpu: &Gpu) -> windows::core::Result<Option<f32>> {
+        let mut changed = None::<f32>;
         while let Ok(frame) = self.pool.TryGetNextFrame() {
-            changed += self.changed_share(&frame);
-            if let Some(old) = latest.replace(frame) {
+            *changed.get_or_insert(0.0) += self.changed_share(&frame);
+            let content = frame.ContentSize()?;
+            if let Some(old) = self.held.replace(frame) {
                 let _ = old.Close();
             }
+            // Resolution changed (e.g. a game switched modes): resize the pool for the next frames.
+            if content.Width != self.pool_size.Width || content.Height != self.pool_size.Height {
+                self.pool.Recreate(&gpu.winrt, FORMAT, POOL_BUFFERS, content)?;
+                self.pool_size = content;
+                changed = Some(1.0);
+            }
         }
-        let Some(frame) = latest else {
-            return Ok(None);
-        };
-        let content = frame.ContentSize()?;
-        let surface = frame.Surface()?;
-        let texture: ID3D11Texture2D = unsafe { surface.cast::<IDirect3DDxgiInterfaceAccess>()?.GetInterface()? };
-        let width = content.Width.clamp(1, self.pool_size.Width) as u32;
-        let height = content.Height.clamp(1, self.pool_size.Height) as u32;
-        let result = use_frame(&texture, width, height);
-        let _ = frame.Close();
+        Ok(changed.map(|c| c.min(1.0)))
+    }
 
-        // Resolution changed (e.g. a game switched modes): resize the pool for the next frames.
-        if content.Width != self.pool_size.Width || content.Height != self.pool_size.Height {
-            self.pool.Recreate(&gpu.winrt, FORMAT, POOL_BUFFERS, content)?;
-            self.pool_size = content;
-            changed = 1.0;
-        }
-        result.map(|()| Some(changed.min(1.0)))
+    pub fn has_frame(&self) -> bool {
+        self.held.is_some()
+    }
+
+    /// Hands the held frame and its visible size to `use_frame`, then releases it.
+    pub fn take_frame(
+        &mut self,
+        use_frame: impl FnOnce(&ID3D11Texture2D, u32, u32) -> windows::core::Result<()>,
+    ) -> windows::core::Result<bool> {
+        let Some(frame) = self.held.take() else { return Ok(false) };
+        let result = (|| {
+            let content = frame.ContentSize()?;
+            let surface = frame.Surface()?;
+            let texture: ID3D11Texture2D = unsafe { surface.cast::<IDirect3DDxgiInterfaceAccess>()?.GetInterface()? };
+            let desc_size = {
+                let mut desc = Default::default();
+                unsafe { texture.GetDesc(&mut desc) };
+                (desc.Width as i32, desc.Height as i32)
+            };
+            let width = content.Width.clamp(1, desc_size.0) as u32;
+            let height = content.Height.clamp(1, desc_size.1) as u32;
+            use_frame(&texture, width, height)
+        })();
+        let _ = frame.Close();
+        result.map(|()| true)
     }
 }
 
 impl Drop for ScreenCapture {
     fn drop(&mut self) {
+        if let Some(frame) = self.held.take() {
+            let _ = frame.Close();
+        }
         let _ = self.session.Close();
         let _ = self.pool.Close();
     }

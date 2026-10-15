@@ -47,6 +47,36 @@ pub fn list() -> Vec<Monitor> {
     monitors
 }
 
+/// True when the app in front covers the whole of `monitor` (fullscreen or borderless games,
+/// fullscreen video). The desktop and taskbar don't count.
+pub fn fullscreen_app_on(monitor: isize) -> bool {
+    use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONULL};
+    use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetForegroundWindow, GetWindowRect};
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_invalid() {
+            return false;
+        }
+        let mut class = [0u16; 64];
+        let len = GetClassNameW(hwnd, &mut class).max(0) as usize;
+        let class = String::from_utf16_lossy(&class[..len]);
+        if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
+            return false;
+        }
+        let on = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+        if on.0 as isize != monitor {
+            return false;
+        }
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let mut rect = RECT::default();
+        if !GetMonitorInfoW(on, &mut info).as_bool() || GetWindowRect(hwnd, &mut rect).is_err() {
+            return false;
+        }
+        let m = info.rcMonitor;
+        rect.left <= m.left && rect.top <= m.top && rect.right >= m.right && rect.bottom >= m.bottom
+    }
+}
+
 /// The configured monitor, falling back to the primary one when it's gone or not set.
 pub fn find(name: &str) -> Option<Monitor> {
     let all = list();
