@@ -10,7 +10,7 @@ use super::{Packet, Shared, VideoFormat};
 use crate::config::{self, Codec};
 use crate::win::ComGuard;
 use qr_mp4::{ParamSets, VideoCodec};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -30,6 +30,17 @@ const SMALL_CHANGE: f32 = 0.02;
 const SMALL_CHANGE_FPS: i64 = 15;
 /// Frame rate for everything that isn't a fullscreen app, when that option is on.
 const WINDOWED_FPS: i64 = 30;
+/// Health checks while the user is active: no new pictures at all, or nothing but black.
+const STALE_FRAMES: i64 = 6 * HNS_PER_SEC;
+const BLACK_LIMIT: i64 = 15 * HNS_PER_SEC;
+const PROBE_EVERY: i64 = HNS_PER_SEC;
+const ACTIVE_WITHIN_MS: u32 = 3_000;
+/// Restarts for a stale capture are rare events; this keeps a legitimately black screen (a
+/// loading screen, say) from wiping the replay buffer over and over.
+const STALE_COOLDOWN_MS: u64 = 5 * 60 * 1000;
+static LAST_STALE_RESTART_MS: AtomicU64 = AtomicU64::new(0);
+/// Returned by the video thread when the capture went stale (restart quietly, not an error).
+pub const STALE: &str = "screen capture went stale";
 /// How often to look at which app is in front.
 const FULLSCREEN_CHECK: i64 = HNS_PER_SEC;
 
@@ -126,14 +137,31 @@ pub fn spawn(
                 encoder: state.encoder.name.clone(),
             };
             let _ = ready_tx.send(Ok(info));
-            if let Err(err) = run(state, clock, &shared, &stop) {
-                log::error!("video capture stopped: {err}");
-                shared.fail(err);
+            match run(state, clock, &shared, &stop) {
+                Ok(()) => {}
+                Err(err) if err == STALE => {
+                    log::warn!("screen capture stopped delivering real pictures, restarting it");
+                    shared.stale();
+                }
+                Err(err) => {
+                    log::error!("video capture stopped: {err}");
+                    shared.fail(err);
+                }
             }
         })
         .map_err(|e| e.to_string())?;
     let info = ready_rx.recv().map_err(|e| e.to_string())??;
     Ok((handle, info))
+}
+
+fn stale_restart_allowed() -> bool {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    let last = LAST_STALE_RESTART_MS.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < STALE_COOLDOWN_MS {
+        return false;
+    }
+    LAST_STALE_RESTART_MS.store(now, Ordering::Relaxed);
+    true
 }
 
 fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result<(), String> {
@@ -156,6 +184,9 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
     let mut full_rate = !s.windowed_cap;
     let mut last_fullscreen_check = i64::MIN / 2;
     let started = clock.now();
+    let mut last_frame_at = started;
+    let mut last_probe = started;
+    let mut black_since: Option<i64> = None;
 
     while !stop.load(Ordering::Relaxed) {
         let target = tick * interval;
@@ -171,6 +202,9 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
         }
 
         let change = s.capture.poll(&s.gpu).map_err(|e| format!("capture failed: {e}"))?;
+        if change.is_some() {
+            last_frame_at = target;
+        }
         if s.windowed_cap && target - last_fullscreen_check >= FULLSCREEN_CHECK {
             last_fullscreen_check = target;
             full_rate = crate::win::monitors::fullscreen_app_on(s.monitor);
@@ -197,6 +231,21 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
                     Ok(())
                 })
                 .map_err(|e| format!("capture failed: {e}"))?;
+            if target - last_probe >= PROBE_EVERY {
+                last_probe = target;
+                if s.converter.looks_black(&s.gpu) {
+                    black_since.get_or_insert(target);
+                } else {
+                    black_since = None;
+                }
+            }
+        }
+        // A capture session that came back broken after sleep shows black or stops updating while
+        // the user is clearly working: start over with a fresh one.
+        let silent = target - last_frame_at > STALE_FRAMES;
+        let black = black_since.is_some_and(|since| target - since > BLACK_LIMIT);
+        if (silent || black) && crate::win::input_idle_ms() < ACTIVE_WITHIN_MS && stale_restart_allowed() {
+            return Err(STALE.into());
         }
         if let (Some(frame), true) = (&current, wanted) {
             let force_key = pending_key || key_due;

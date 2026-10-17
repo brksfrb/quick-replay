@@ -32,6 +32,12 @@ pub fn is_dev_build() -> bool {
     current_exe().components().any(|c| c.as_os_str().eq_ignore_ascii_case("target"))
 }
 
+/// Started with its own data folder (`QUICKREPLAY_DATA_DIR`, used for testing): such copies must
+/// never touch shared system state like the Windows startup entry or the installed exe.
+pub fn is_isolated() -> bool {
+    std::env::var_os(DATA_DIR_ENV).is_some()
+}
+
 fn local_app_data() -> PathBuf {
     std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
 }

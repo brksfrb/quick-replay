@@ -34,7 +34,7 @@ pub fn is_installed_copy() -> bool {
 /// Installs or updates when started from anywhere else. Returns true if the installed copy was
 /// launched and this process should exit.
 pub fn install_if_needed() -> bool {
-    if paths::is_dev_build() || paths::is_portable() {
+    if paths::is_dev_build() || paths::is_isolated() || paths::is_portable() {
         return false;
     }
     if is_installed_copy() {
@@ -128,7 +128,7 @@ fn register() {
 
 /// Adds or removes the "start with Windows" entry, pointing at the running exe.
 pub fn sync_autostart(enabled: bool) {
-    if paths::is_dev_build() {
+    if paths::is_dev_build() || paths::is_isolated() {
         return;
     }
     let wanted = format!("\"{}\" --autostart", paths::current_exe().display());

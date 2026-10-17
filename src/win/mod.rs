@@ -45,3 +45,15 @@ pub fn from_wide(buf: &[u16]) -> String {
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..len])
 }
+
+/// Milliseconds since the last keyboard or mouse input in this session.
+pub fn input_idle_ms() -> u32 {
+    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    let mut info = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+    if unsafe { GetLastInputInfo(&mut info) }.as_bool() {
+        unsafe { GetTickCount() }.wrapping_sub(info.dwTime)
+    } else {
+        u32::MAX
+    }
+}

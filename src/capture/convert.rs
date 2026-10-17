@@ -8,12 +8,12 @@ use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor,
     ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView,
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIDEO_COLOR, D3D11_VIDEO_COLOR_0, D3D11_VIDEO_COLOR_RGBA,
-    D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_OPTIMAL_SPEED,
-    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_MAP_READ, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+    D3D11_VIDEO_COLOR, D3D11_VIDEO_COLOR_0, D3D11_VIDEO_COLOR_RGBA, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
+    D3D11_VIDEO_USAGE_OPTIMAL_SPEED, D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, DXGI_FORMAT,
@@ -41,6 +41,19 @@ pub struct Converter {
     out_h: u32,
     fps: u32,
     next: usize,
+    /// Tiny CPU-readable texture for `looks_black`.
+    probe: Option<ID3D11Texture2D>,
+}
+
+/// An 8x8 grid of pixels, read back from the GPU about once a second.
+const PROBE_GRID: u32 = 8;
+const PROBE_POINTS: u32 = PROBE_GRID * PROBE_GRID;
+
+/// True when (nearly) every sampled pixel is black. A few may be lit: the mouse cursor is part of
+/// the captured picture.
+fn mostly_black(bgra: &[u8]) -> bool {
+    let dark = bgra.as_chunks::<4>().0.iter().filter(|c| c[0] < 6 && c[1] < 6 && c[2] < 6).count();
+    dark * 100 >= PROBE_POINTS as usize * 94
 }
 
 fn texture(gpu: &Gpu, width: u32, height: u32, format: DXGI_FORMAT, bind: u32) -> Result<ID3D11Texture2D> {
@@ -78,7 +91,7 @@ impl Converter {
         let outputs = (0..OUTPUT_TEXTURES)
             .map(|_| texture(gpu, out_w, out_h, DXGI_FORMAT_NV12, D3D11_BIND_RENDER_TARGET.0 as u32).map(|t| (t, None)))
             .collect::<Result<Vec<_>>>()?;
-        Ok(Converter { video_device, video_context, processor: None, outputs, out_w, out_h, fps, next: 0 })
+        Ok(Converter { video_device, video_context, processor: None, outputs, out_w, out_h, fps, next: 0, probe: None })
     }
 
     fn build_processor(&mut self, gpu: &Gpu, in_w: u32, in_h: u32) -> Result<()> {
@@ -164,6 +177,52 @@ impl Converter {
         Ok(view)
     }
 
+    /// Whether the last converted frame is entirely black (apart from the cursor): the sign of a
+    /// capture session that came back broken after sleep.
+    pub fn looks_black(&mut self, gpu: &Gpu) -> bool {
+        let Some(processor) = &self.processor else { return false };
+        // Debug builds only: pretend the screen is black, to test the recovery.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("QUICKREPLAY_FAKE_BLACK").is_some() {
+            return true;
+        }
+        if self.probe.is_none() {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: PROBE_POINTS,
+                Height: 1,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut texture = None;
+            if unsafe { gpu.device.CreateTexture2D(&desc, None, Some(&mut texture)) }.is_err() {
+                return false;
+            }
+            self.probe = texture;
+        }
+        let Some(probe) = &self.probe else { return false };
+        for i in 0..PROBE_POINTS {
+            let (gx, gy) = (i % PROBE_GRID, i / PROBE_GRID);
+            let x = (gx * 2 + 1) * processor.in_w / (PROBE_GRID * 2);
+            let y = (gy * 2 + 1) * processor.in_h / (PROBE_GRID * 2);
+            let region = D3D11_BOX { left: x, top: y, front: 0, right: x + 1, bottom: y + 1, back: 1 };
+            unsafe { gpu.context.CopySubresourceRegion(probe, 0, i, 0, 0, &processor.input, 0, Some(&region)) };
+        }
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        if unsafe { gpu.context.Map(probe, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }.is_err() {
+            return false;
+        }
+        let pixels = unsafe { std::slice::from_raw_parts(mapped.pData as *const u8, PROBE_POINTS as usize * 4) };
+        let black = mostly_black(pixels);
+        unsafe { gpu.context.Unmap(probe, 0) };
+        black
+    }
+
     /// Converts the visible `width`x`height` area of `source` into the next NV12 texture and returns it.
     pub fn convert(&mut self, gpu: &Gpu, source: &ID3D11Texture2D, width: u32, height: u32) -> Result<ID3D11Texture2D> {
         let size_changed = self.processor.as_ref().is_none_or(|p| p.in_w != width || p.in_h != height);
@@ -193,7 +252,21 @@ impl Converter {
 
 #[cfg(test)]
 mod tests {
-    use super::fit_rect;
+    use super::{fit_rect, mostly_black, PROBE_POINTS};
+
+    #[test]
+    fn black_detection_tolerates_a_cursor() {
+        let mut px = vec![0u8; PROBE_POINTS as usize * 4];
+        assert!(mostly_black(&px));
+        for i in 0..3 {
+            px[i * 4..i * 4 + 3].copy_from_slice(&[255, 255, 255]);
+        }
+        assert!(mostly_black(&px), "3 lit samples out of 64 are the cursor");
+        for i in 3..6 {
+            px[i * 4..i * 4 + 3].copy_from_slice(&[200, 200, 200]);
+        }
+        assert!(!mostly_black(&px), "6 lit samples are real content");
+    }
 
     #[test]
     fn letterboxes_wider_sources() {

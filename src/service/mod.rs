@@ -46,6 +46,9 @@ const TIMER_RESTART: usize = 3;
 const TIMER_CLEANUP: usize = 4;
 const TIMER_TRIM: usize = 5;
 const TIMER_UPDATE: usize = 6;
+const TIMER_RESUME: usize = 7;
+/// After waking from sleep, give the display and GPU time to come back before capturing again.
+const RESUME_DELAY_MS: u32 = 5_000;
 /// First update check a minute after start (not during login rush), then every 6 hours.
 const FIRST_UPDATE_MS: u32 = 60_000;
 const UPDATE_INTERVAL_MS: u32 = 6 * 60 * 60 * 1000;
@@ -60,6 +63,7 @@ const MAX_RESTART_DELAY_SECS: u32 = 60;
 /// A pipeline that ran this long counts as healthy, resetting the retry backoff.
 const HEALTHY_RUN: Duration = Duration::from_secs(30);
 const PBT_APMRESUMEAUTOMATIC: usize = 0x12;
+const PBT_APMRESUMESUSPEND: usize = 0x7;
 const MENU_OPEN: u32 = 1;
 const MENU_RECORD: u32 = 2;
 const MENU_BUFFER: u32 = 3;
@@ -132,7 +136,7 @@ impl Service {
         if self.update_running {
             return;
         }
-        if paths::is_dev_build() {
+        if paths::is_dev_build() || paths::is_isolated() {
             if manual {
                 self.notify(Glyph::Warning, "Updates are off", "This is a development build");
             }
@@ -529,6 +533,24 @@ impl Service {
                         self.notify(Glyph::Warning, "Couldn't check for updates", &message);
                     }
                 }
+                Event::PipelineStale { generation } => {
+                    if generation == self.pipeline_generation && self.pipeline.is_some() {
+                        log::warn!("screen capture went stale, restarting it");
+                        if self.recording_since.take().is_some() {
+                            self.hide_badge();
+                            self.notify(
+                                Glyph::Warning,
+                                "Recording stopped",
+                                "The screen capture was lost; what was recorded is saved",
+                            );
+                        }
+                        self.stop_pipeline();
+                        if self.buffer_enabled {
+                            self.start_pipeline();
+                        }
+                        self.update_tray();
+                    }
+                }
                 Event::PipelineFailed { generation, message } => {
                     if generation == self.pipeline_generation && self.pipeline.is_some() {
                         self.pipeline_failed(message);
@@ -558,6 +580,14 @@ impl Service {
                     self.start_pipeline();
                 }
                 self.update_tray();
+            }
+            TIMER_RESUME => {
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_RESUME);
+                }
+                if self.recording_since.is_none() {
+                    self.restart_pipeline();
+                }
             }
             TIMER_UPDATE => {
                 unsafe { SetTimer(Some(self.hwnd), TIMER_UPDATE, UPDATE_INTERVAL_MS, None) };
@@ -615,11 +645,10 @@ impl Service {
                 }
             }
             WM_TIMER => self.timer(wparam.0),
-            WM_POWERBROADCAST if wparam.0 == PBT_APMRESUMEAUTOMATIC => {
-                // Capture and encoder sessions often don't survive sleep.
-                if self.recording_since.is_none() {
-                    self.restart_pipeline();
-                }
+            WM_POWERBROADCAST if matches!(wparam.0, PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND) => {
+                // Capture sessions often come back black or dead after sleep. Start a fresh one,
+                // but only once the display has had a moment to wake up.
+                unsafe { SetTimer(Some(self.hwnd), TIMER_RESUME, RESUME_DELAY_MS, None) };
             }
             WM_ENDSESSION if wparam.0 != 0 => self.quit(),
             m if m == self.taskbar_created && m != 0 => self.tray.add(),

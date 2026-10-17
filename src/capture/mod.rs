@@ -80,6 +80,11 @@ pub enum Event {
         generation: u64,
         message: String,
     },
+    /// The screen capture stopped delivering real pictures (dead or all black, e.g. after sleep);
+    /// restart it quietly.
+    PipelineStale {
+        generation: u64,
+    },
 }
 
 /// Sends events to the service thread and wakes its message loop.
@@ -148,6 +153,12 @@ impl Shared {
     fn fail(&self, message: String) {
         if !self.failed.swap(true, Ordering::Relaxed) {
             self.events.send(Event::PipelineFailed { generation: self.generation, message });
+        }
+    }
+
+    fn stale(&self) {
+        if !self.failed.swap(true, Ordering::Relaxed) {
+            self.events.send(Event::PipelineStale { generation: self.generation });
         }
     }
 
