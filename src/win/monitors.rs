@@ -77,6 +77,48 @@ pub fn fullscreen_app_on(monitor: isize) -> bool {
     }
 }
 
+/// True when the app in front draws with OpenGL (it has opengl32.dll loaded), or when that can't be
+/// found out (protected games refuse the check). Windows' "hide this window from recordings" makes
+/// the screen capture of such fullscreen apps stop updating (measured with a fullscreen OpenGL
+/// test window; Direct3D fullscreen apps are unaffected).
+pub fn foreground_uses_opengl() -> bool {
+    use windows::Win32::System::ProcessStatus::{EnumProcessModulesEx, GetModuleBaseNameW, LIST_MODULES_ALL};
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    unsafe {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid));
+        if pid == 0 {
+            return false;
+        }
+        let Ok(process) = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) else { return true };
+        let mut modules = [windows::Win32::Foundation::HMODULE::default(); 1024];
+        let mut needed = 0u32;
+        let listed = EnumProcessModulesEx(
+            process,
+            modules.as_mut_ptr(),
+            std::mem::size_of_val(&modules) as u32,
+            &mut needed,
+            LIST_MODULES_ALL,
+        );
+        let mut found = listed.is_err();
+        if listed.is_ok() {
+            let count =
+                (needed as usize / std::mem::size_of::<windows::Win32::Foundation::HMODULE>()).min(modules.len());
+            for module in &modules[..count] {
+                let mut name = [0u16; 64];
+                let len = GetModuleBaseNameW(process, Some(*module), &mut name) as usize;
+                if String::from_utf16_lossy(&name[..len.min(name.len())]).eq_ignore_ascii_case("opengl32.dll") {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        let _ = windows::Win32::Foundation::CloseHandle(process);
+        found
+    }
+}
+
 /// The configured monitor, falling back to the primary one when it's gone or not set.
 pub fn find(name: &str) -> Option<Monitor> {
     let all = list();

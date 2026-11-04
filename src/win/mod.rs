@@ -57,3 +57,14 @@ pub fn input_idle_ms() -> u32 {
         u32::MAX
     }
 }
+
+static DISPLAY_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the monitor is powered on (kept up to date by the tray app from Windows' notifications).
+pub fn display_on() -> bool {
+    DISPLAY_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_display_on(on: bool) {
+    DISPLAY_ON.store(on, std::sync::atomic::Ordering::Relaxed);
+}

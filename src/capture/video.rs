@@ -10,7 +10,7 @@ use super::{Packet, Shared, VideoFormat};
 use crate::config::{self, Codec};
 use crate::win::ComGuard;
 use qr_mp4::{ParamSets, VideoCodec};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -30,15 +30,19 @@ const SMALL_CHANGE: f32 = 0.02;
 const SMALL_CHANGE_FPS: i64 = 15;
 /// Frame rate for everything that isn't a fullscreen app, when that option is on.
 const WINDOWED_FPS: i64 = 30;
-/// Health checks while the user is active: no new pictures at all, or nothing but black.
-const STALE_FRAMES: i64 = 6 * HNS_PER_SEC;
-const BLACK_LIMIT: i64 = 15 * HNS_PER_SEC;
+/// Health check: nothing but black on the monitor while the user is around. (A still screen is
+/// normal and delivers no new pictures, so "no pictures" says nothing about a broken capture.)
+const BLACK_LIMIT: i64 = 20 * HNS_PER_SEC;
 const PROBE_EVERY: i64 = HNS_PER_SEC;
-const ACTIVE_WITHIN_MS: u32 = 3_000;
-/// Restarts for a stale capture are rare events; this keeps a legitimately black screen (a
-/// loading screen, say) from wiping the replay buffer over and over.
+/// A black picture only counts while the user is around (some input in the last 5 minutes).
+const PRESENT_WITHIN_MS: u32 = 5 * 60 * 1000;
+/// A restart for a black capture is a rare event; this keeps a legitimately black screen (a loading
+/// screen, say) from wiping the replay buffer over and over. A restart that didn't help shows up as
+/// another one soon after, and then the wait doubles (up to an hour).
 const STALE_COOLDOWN_MS: u64 = 5 * 60 * 1000;
+const STALE_MAX_COOLDOWN_MS: u64 = 60 * 60 * 1000;
 static LAST_STALE_RESTART_MS: AtomicU64 = AtomicU64::new(0);
+static STALE_STREAK: AtomicU32 = AtomicU32::new(0);
 /// Returned by the video thread when the capture went stale (restart quietly, not an error).
 pub const STALE: &str = "screen capture went stale";
 /// How often to look at which app is in front.
@@ -85,6 +89,7 @@ struct State {
     height: u32,
     fps: u32,
     monitor: isize,
+    cursor: bool,
     /// Cap non-fullscreen content at WINDOWED_FPS.
     windowed_cap: bool,
 }
@@ -109,7 +114,18 @@ fn init(settings: &config::Video) -> Result<State, String> {
     };
     let encoder = VideoEncoder::new(&gpu, &encoder_settings)?;
     let windowed_cap = settings.full_rate_only_fullscreen && i64::from(fps) > WINDOWED_FPS;
-    Ok(State { gpu, capture, converter, encoder, width, height, fps, monitor: monitor.handle, windowed_cap })
+    Ok(State {
+        gpu,
+        capture,
+        converter,
+        encoder,
+        width,
+        height,
+        fps,
+        monitor: monitor.handle,
+        cursor: settings.capture_cursor,
+        windowed_cap,
+    })
 }
 
 pub fn spawn(
@@ -157,9 +173,13 @@ pub fn spawn(
 fn stale_restart_allowed() -> bool {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
     let last = LAST_STALE_RESTART_MS.load(Ordering::Relaxed);
-    if last != 0 && now.saturating_sub(last) < STALE_COOLDOWN_MS {
+    let streak = STALE_STREAK.load(Ordering::Relaxed);
+    let cooldown = (STALE_COOLDOWN_MS << streak.min(4)).min(STALE_MAX_COOLDOWN_MS);
+    let since = now.saturating_sub(last);
+    if last != 0 && since < cooldown {
         return false;
     }
+    STALE_STREAK.store(if last != 0 && since < 2 * cooldown { streak + 1 } else { 0 }, Ordering::Relaxed);
     LAST_STALE_RESTART_MS.store(now, Ordering::Relaxed);
     true
 }
@@ -184,7 +204,6 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
     let mut full_rate = !s.windowed_cap;
     let mut last_fullscreen_check = i64::MIN / 2;
     let started = clock.now();
-    let mut last_frame_at = started;
     let mut last_probe = started;
     let mut black_since: Option<i64> = None;
 
@@ -200,11 +219,19 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
         if s.capture.is_closed() {
             return Err("the captured monitor was disconnected".into());
         }
+        if shared.take_capture_refresh() {
+            match ScreenCapture::new(&s.gpu, s.monitor, s.cursor, s.fps) {
+                Ok(fresh) if fresh.size() == s.capture.size() => {
+                    s.capture = fresh;
+                    black_since = None;
+                    log::info!("screen capture session refreshed");
+                }
+                Ok(_) => return Err(STALE.into()),
+                Err(err) => log::warn!("couldn't refresh the screen capture: {err}"),
+            }
+        }
 
         let change = s.capture.poll(&s.gpu).map_err(|e| format!("capture failed: {e}"))?;
-        if change.is_some() {
-            last_frame_at = target;
-        }
         if s.windowed_cap && target - last_fullscreen_check >= FULLSCREEN_CHECK {
             last_fullscreen_check = target;
             full_rate = crate::win::monitors::fullscreen_app_on(s.monitor);
@@ -242,9 +269,13 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
         }
         // A capture session that came back broken after sleep shows black or stops updating while
         // the user is clearly working: start over with a fresh one.
-        let silent = target - last_frame_at > STALE_FRAMES;
         let black = black_since.is_some_and(|since| target - since > BLACK_LIMIT);
-        if (silent || black) && crate::win::input_idle_ms() < ACTIVE_WITHIN_MS && stale_restart_allowed() {
+        // While the monitor is off, black is expected.
+        if black
+            && crate::win::display_on()
+            && crate::win::input_idle_ms() < PRESENT_WITHIN_MS
+            && stale_restart_allowed()
+        {
             return Err(STALE.into());
         }
         if let (Some(frame), true) = (&current, wanted) {

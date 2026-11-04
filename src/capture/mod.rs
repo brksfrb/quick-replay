@@ -124,6 +124,8 @@ pub struct Shared {
     audio_entry: Option<Arc<Vec<u8>>>,
     recorder: Mutex<Recorder>,
     keyframe_request: AtomicBool,
+    /// Ask the video thread for a fresh screen capture session (the encoder and buffer stay).
+    refresh_capture: AtomicBool,
     failed: AtomicBool,
     events: EventSink,
     generation: u64,
@@ -138,6 +140,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Shared {
     fn set_video_format(&self, format: VideoFormat) {
         *lock(&self.video_format) = Some(Arc::new(format));
+    }
+
+    fn take_capture_refresh(&self) -> bool {
+        self.refresh_capture.swap(false, Ordering::Relaxed)
     }
 
     fn take_keyframe_request(&self) -> bool {
@@ -243,6 +249,7 @@ impl Pipeline {
             audio_entry,
             recorder: Mutex::new(Recorder::Idle),
             keyframe_request: AtomicBool::new(false),
+            refresh_capture: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             events,
             generation,
@@ -280,6 +287,11 @@ impl Pipeline {
             (None, Some(s)) => *buffer = Some(ReplayBuffer::new(s)),
             (_, None) => *buffer = None,
         }
+    }
+
+    /// Replaces the screen capture session with a new one, without touching the replay buffer.
+    pub fn refresh_capture(&self) {
+        self.shared.refresh_capture.store(true, Ordering::Relaxed);
     }
 
     pub fn has_buffer(&self) -> bool {

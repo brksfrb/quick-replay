@@ -64,6 +64,14 @@ const MAX_RESTART_DELAY_SECS: u32 = 60;
 const HEALTHY_RUN: Duration = Duration::from_secs(30);
 const PBT_APMRESUMEAUTOMATIC: usize = 0x12;
 const PBT_APMRESUMESUSPEND: usize = 0x7;
+/// A monitor that was off at least this long may bring back a broken capture session.
+const DISPLAY_OFF_MIN: Duration = Duration::from_secs(5);
+/// Capture failures this soon after a wake-up are expected (the display and GPU are still coming
+/// back) and are retried without a notification.
+const QUIET_AFTER_WAKE: Duration = Duration::from_secs(60);
+const WTS_SESSION_UNLOCK: usize = 0x8;
+/// GUID_CONSOLE_DISPLAY_STATE: the monitor turned off (0), on (1) or dimmed (2).
+const DISPLAY_STATE_GUID: windows::core::GUID = windows::core::GUID::from_u128(0x6fe69556_704a_47a0_8f24_c28d936fda47);
 const MENU_OPEN: u32 = 1;
 const MENU_RECORD: u32 = 2;
 const MENU_BUFFER: u32 = 3;
@@ -87,6 +95,11 @@ struct Service {
     toast: Option<Overlay>,
     /// The video the visible notification is about; clicking it opens the player.
     toast_action: Option<ToastAction>,
+    opengl_front: bool,
+    display_off_since: Option<Instant>,
+    /// When the PC last woke up (sleep, monitor or unlock): capture may need a few tries then.
+    woke_at: Option<Instant>,
+    failure_notified: bool,
     /// An update that waits for the current recording to end.
     pending_update: Option<(String, PathBuf)>,
     update_running: bool,
@@ -120,8 +133,35 @@ fn format_duration(seconds: f64) -> String {
 }
 
 impl Service {
+    /// An OpenGL game fills the screen. Hiding our windows from the recording would freeze the
+    /// capture of such a game, so in that case nothing may be hidden that way.
+    fn opengl_fullscreen(&self) -> bool {
+        let monitor = monitors::find(&self.config.video.monitor).map_or(0, |m| m.handle);
+        monitors::fullscreen_app_on(monitor) && monitors::foreground_uses_opengl()
+    }
+
+    /// Notices an OpenGL fullscreen app taking over (or leaving). Windows hidden from the recording
+    /// that were on screen when such an app started leave its capture frozen even after they are
+    /// gone, so the capture session is replaced by a fresh one (the replay buffer is kept).
+    fn check_opengl(&mut self) {
+        let now = self.opengl_fullscreen();
+        if now != self.opengl_front {
+            log::info!(
+                "OpenGL fullscreen app {}",
+                if now { "in front: nothing is hidden from the recording" } else { "gone" }
+            );
+            if now {
+                if let Some(pipeline) = &self.pipeline {
+                    pipeline.refresh_capture();
+                }
+            }
+        }
+        self.opengl_front = now;
+    }
+
     fn placement(&self, corner: crate::config::Corner, hide: bool) -> Placement {
         let monitor = monitors::find(&self.config.video.monitor).map_or(0, |m| m.handle);
+        let hide = hide && !self.opengl_fullscreen();
         Placement { monitor, corner, hide_from_capture: hide, over_taskbar: self.config.notifications.over_taskbar }
     }
 
@@ -271,6 +311,7 @@ impl Service {
                 self.pipeline_started = Some(Instant::now());
                 unsafe { SetTimer(Some(self.hwnd), TIMER_TRIM, FIRST_TRIM_MS, None) };
                 self.failure = None;
+                self.failure_notified = false;
                 true
             }
             Err(err) => {
@@ -296,6 +337,13 @@ impl Service {
         }
     }
 
+    /// After the PC woke up (sleep, monitor or unlock): start a fresh capture once the display is back.
+    fn schedule_wake_restart(&mut self) {
+        log::info!("the PC woke up: restarting the screen capture in {} s", RESUME_DELAY_MS / 1000);
+        self.woke_at = Some(Instant::now());
+        unsafe { SetTimer(Some(self.hwnd), TIMER_RESUME, RESUME_DELAY_MS, None) };
+    }
+
     fn pipeline_failed(&mut self, message: String) {
         log::error!("capture failed: {message}");
         let healthy = self.pipeline_started.is_some_and(|t| t.elapsed() > HEALTHY_RUN);
@@ -306,7 +354,9 @@ impl Service {
             self.hide_badge();
         }
         self.stop_pipeline();
-        if self.failure.is_none() {
+        let waking = self.woke_at.is_some_and(|t| t.elapsed() < QUIET_AFTER_WAKE);
+        if !self.failure_notified && !waking {
+            self.failure_notified = true;
             self.notify(Glyph::Warning, "Capture stopped", &format!("{message} · retrying"));
         }
         self.failure = Some(message);
@@ -379,6 +429,7 @@ impl Service {
     }
 
     fn update_badge(&mut self) {
+        self.check_opengl();
         let Some(since) = self.recording_since else {
             return;
         };
@@ -386,6 +437,14 @@ impl Service {
             return;
         }
         let r = &self.config.recording;
+        // The badge was asked to stay out of the video, which isn't possible over an OpenGL game
+        // without freezing it: leave it away until that game is closed or left.
+        if r.hide_indicator_from_capture && self.opengl_fullscreen() {
+            if let Some(badge) = &mut self.badge {
+                badge.hide();
+            }
+            return;
+        }
         let place = self.placement(r.indicator_position, r.hide_indicator_from_capture);
         if let Some(badge) = &mut self.badge {
             badge.show_badge(since.elapsed(), &place);
@@ -569,6 +628,7 @@ impl Service {
                     unsafe {
                         let _ = KillTimer(Some(self.hwnd), TIMER_ANIMATE);
                     }
+                    self.check_opengl();
                 }
             }
             TIMER_BADGE => self.update_badge(),
@@ -601,6 +661,40 @@ impl Service {
                     let _ = KillTimer(Some(self.hwnd), TIMER_TRIM);
                 }
                 trim_working_set();
+            }
+            _ => {}
+        }
+    }
+
+    /// A POWERBROADCAST_SETTING for GUID_CONSOLE_DISPLAY_STATE: GUID (16 bytes), data length (4),
+    /// then the data. After the monitor has been off, a capture session can come back black.
+    fn display_state_changed(&mut self, lparam: LPARAM) {
+        let base = lparam.0 as *const u8;
+        if base.is_null() {
+            return;
+        }
+        let (guid, len, state) = unsafe {
+            (
+                std::ptr::read_unaligned(base as *const windows::core::GUID),
+                std::ptr::read_unaligned(base.add(16) as *const u32),
+                std::ptr::read_unaligned(base.add(20) as *const u32),
+            )
+        };
+        if guid != DISPLAY_STATE_GUID || len < 4 {
+            return;
+        }
+        match state {
+            0 => {
+                crate::win::set_display_on(false);
+                self.display_off_since.get_or_insert_with(Instant::now);
+            }
+            1 => {
+                crate::win::set_display_on(true);
+                let was_off_long = self.display_off_since.take().is_some_and(|t| t.elapsed() >= DISPLAY_OFF_MIN);
+                if was_off_long {
+                    log::info!("monitor turned back on, restarting the screen capture shortly");
+                    self.schedule_wake_restart();
+                }
             }
             _ => {}
         }
@@ -648,7 +742,12 @@ impl Service {
             WM_POWERBROADCAST if matches!(wparam.0, PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND) => {
                 // Capture sessions often come back black or dead after sleep. Start a fresh one,
                 // but only once the display has had a moment to wake up.
-                unsafe { SetTimer(Some(self.hwnd), TIMER_RESUME, RESUME_DELAY_MS, None) };
+                self.schedule_wake_restart();
+            }
+            WM_POWERBROADCAST if wparam.0 == PBT_POWERSETTINGCHANGE as usize => self.display_state_changed(lparam),
+            WM_WTSSESSION_CHANGE if wparam.0 == WTS_SESSION_UNLOCK => {
+                // The lock screen is a separate desktop that can't be captured; start fresh after it.
+                self.schedule_wake_restart();
             }
             WM_ENDSESSION if wparam.0 != 0 => self.quit(),
             m if m == self.taskbar_created && m != 0 => self.tray.add(),
@@ -818,6 +917,17 @@ pub fn run(mode: StartMode) {
 
     let (tx, events_rx) = channel();
     let taskbar_created = unsafe { RegisterWindowMessageW(windows::core::w!("TaskbarCreated")) };
+    unsafe {
+        use windows::Win32::System::Power::RegisterPowerSettingNotification;
+        use windows::Win32::System::RemoteDesktop::{WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION};
+        let handle = windows::Win32::Foundation::HANDLE(hwnd.0);
+        if let Err(err) = RegisterPowerSettingNotification(handle, &DISPLAY_STATE_GUID, DEVICE_NOTIFY_WINDOW_HANDLE) {
+            log::warn!("can't watch the monitor's power state: {err}");
+        }
+        if let Err(err) = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) {
+            log::warn!("can't watch session lock/unlock: {err}");
+        }
+    }
     let tray = Tray::new(hwnd, unsafe { GetDpiForSystem() });
     tray.add();
     let buffer_enabled = config.replay.enabled;
@@ -832,6 +942,10 @@ pub fn run(mode: StartMode) {
         tray,
         toast: Overlay::new(instance, true),
         toast_action: None,
+        opengl_front: false,
+        display_off_since: None,
+        woke_at: None,
+        failure_notified: false,
         pending_update: None,
         update_running: false,
         badge: Overlay::new(instance, false),
