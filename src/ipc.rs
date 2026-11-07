@@ -161,6 +161,10 @@ impl InstanceLock {
     pub fn gui() -> Option<InstanceLock> {
         Self::acquire(&scoped(GUI_MUTEX))
     }
+
+    pub fn supervisor() -> Option<InstanceLock> {
+        Self::acquire(&scoped(r"Local\QuickReplay.Supervisor"))
+    }
 }
 
 impl Drop for InstanceLock {

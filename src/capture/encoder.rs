@@ -1,14 +1,24 @@
 //! Hardware video encoding (NVENC / AMF / Quick Sync) through Media Foundation transforms.
 //! Falls back to the Windows software H.264 encoder when no hardware encoder is usable.
+//!
+//! Hardware encoders are asynchronous: they encode on their own thread. That thread has to be
+//! idle, and every interface into the encoder released, before the encoder is shut down.
+//! Shutting it down earlier frees a critical section the worker is still inside and the process
+//! dies in ntdll (access violation 0xc0000005) with no Rust panic.
 
 use super::gpu::Gpu;
 use super::mf;
 use crate::config::Codec;
+use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::sync::Once;
+use std::time::{Duration, Instant};
 use windows::core::{Interface, Result, GUID};
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_STAGING,
+    ID3D11Device, ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::MediaFoundation::*;
@@ -27,7 +37,7 @@ enum Input {
 }
 
 pub struct VideoEncoder {
-    transform: IMFTransform,
+    transform: Option<IMFTransform>,
     activate: Option<IMFActivate>,
     codec_api: Option<ICodecAPI>,
     events: Option<IMFMediaEventGenerator>,
@@ -40,10 +50,104 @@ pub struct VideoEncoder {
     width: u32,
     height: u32,
     output: Vec<EncodedFrame>,
+    /// The encoder was given the DXGI device manager and must be told to drop it.
+    uses_d3d: bool,
+    hardware: bool,
+    /// A fatal encoder error: do not put this session back in the reuse pool.
+    broken: bool,
+    fps: u32,
+    bitrate_kbps: u32,
+    fast_preset: bool,
+    /// Held so a parked or buried MFT outlives the pipeline's `Gpu` clone.
+    device: Option<ID3D11Device>,
+    manager: Option<IMFDXGIDeviceManager>,
+    device_ptr: usize,
+    /// `shutdown` has already handed the native objects off. Drop is then a no-op.
+    released: bool,
+    /// A driver call missed its deadline. The native objects and their thread are leaked.
+    poisoned: bool,
+    /// How many times this MFT has been started, including the first.
+    sessions: u32,
+    born: Instant,
+    /// Hardware driver calls run here. Empty for the software encoder and for the copy that lives on the worker.
+    remote: Option<Remote>,
+    /// Frames accepted by the driver since the last output it handed back.
+    /// Kept on the caller side so a stalled worker can be replaced without losing them.
+    inflight: VecDeque<HeldInput>,
     pub codec: Codec,
     pub name: String,
 }
 
+/// One submitted picture. The texture is a private copy, not the converter's ring buffer.
+pub struct HeldInput {
+    pub texture: Option<ID3D11Texture2D>,
+    pub time: i64,
+    pub duration: i64,
+}
+
+/// AddRef'd texture that may cross threads. The caller keeps using its own reference.
+struct SharedTexture(ID3D11Texture2D);
+unsafe impl Send for SharedTexture {}
+
+/// The windows crate does not mark COM pointers `Send`. One hardware encoder is owned by its
+/// driver thread; the capture thread only sends it commands.
+unsafe impl Send for VideoEncoder {}
+
+#[derive(Debug)]
+pub enum EncoderFault {
+    Native(windows::core::Error),
+    /// `ProcessInput` or `ProcessOutput` did not return within [`crate::safety::NATIVE_CALL_LIMIT`].
+    Stalled,
+}
+
+impl std::fmt::Display for EncoderFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EncoderFault::Native(err) => write!(f, "{}", hresult_text(err)),
+            EncoderFault::Stalled => {
+                write!(f, "driver call exceeded {}s", crate::safety::NATIVE_CALL_LIMIT.as_secs())
+            }
+        }
+    }
+}
+
+enum Request {
+    Submit {
+        frame: SharedTexture,
+        time: i64,
+        duration: i64,
+        force_key: bool,
+        reply: Sender<std::result::Result<bool, windows::core::Error>>,
+    },
+    Poll {
+        reply: Sender<std::result::Result<(), windows::core::Error>>,
+    },
+    TakeOutput {
+        reply: Sender<Vec<EncodedFrame>>,
+    },
+    MarkBroken,
+    /// Last command. The worker shuts down and leaves the loop; it does not recv again.
+    Shutdown {
+        reply: Sender<Vec<EncodedFrame>>,
+    },
+    /// Test-only. Park the worker so the caller can observe a deadline miss.
+    #[cfg(test)]
+    Stall,
+    /// Test-only. Put one encoded frame where `take_output` will find it.
+    #[cfg(test)]
+    SeedOutput {
+        time: i64,
+    },
+}
+
+struct Remote {
+    tx: Sender<Request>,
+    join: Option<std::thread::JoinHandle<()>>,
+    /// Disconnects when `driver_loop` returns.
+    done: mpsc::Receiver<()>,
+}
+
+#[derive(Clone, Copy)]
 pub struct Settings {
     pub codec: Codec,
     pub width: u32,
@@ -51,6 +155,40 @@ pub struct Settings {
     pub fps: u32,
     pub bitrate_kbps: u32,
     pub fast_preset: bool,
+    /// When false, skip NVENC/AMF/Quick Sync and use the software H.264 encoder.
+    pub allow_hardware: bool,
+}
+
+/// Runtime hardware-encoder failures in this process. After this many, later captures skip
+/// hardware and use the software H.264 encoder instead of constructing another NVENC session.
+const HW_FAILURES_BEFORE_SOFTWARE: u32 = 2;
+static HW_FAILURES: AtomicU32 = AtomicU32::new(0);
+
+fn fallback_after(failures: u32) -> bool {
+    failures >= HW_FAILURES_BEFORE_SOFTWARE
+}
+
+/// True once hardware encoding has failed repeatedly and should not be tried again.
+pub fn prefer_software() -> bool {
+    fallback_after(HW_FAILURES.load(Ordering::Relaxed))
+}
+
+pub fn note_hardware_failure() {
+    let count = HW_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    if fallback_after(count) {
+        log::warn!("hardware encoder has failed {count} times; the next capture will use the software H.264 encoder");
+    } else {
+        log::warn!("hardware encoder failed ({count} of {HW_FAILURES_BEFORE_SOFTWARE} before software fallback)");
+    }
+}
+
+/// A hardware encoder that has been producing pictures is healthy again. A streak that already
+/// crossed the fallback threshold stays there: don't go back to an encoder that kept dying.
+pub fn note_hardware_recovered() {
+    let current = HW_FAILURES.load(Ordering::Relaxed);
+    if current > 0 && !fallback_after(current) {
+        HW_FAILURES.store(0, Ordering::Relaxed);
+    }
 }
 
 fn subtype(codec: Codec) -> GUID {
@@ -60,16 +198,21 @@ fn subtype(codec: Codec) -> GUID {
     }
 }
 
+fn hresult_text(err: &windows::core::Error) -> String {
+    let raw = err.code().0 as u32;
+    format!("{err} (HRESULT 0x{raw:08X})")
+}
+
 fn hardware_encoders(gpu: &Gpu, codec: Codec) -> Vec<IMFActivate> {
     let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_NV12 };
     let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: subtype(codec) };
     let mut attributes = None;
-    unsafe {
-        if MFCreateAttributes(&mut attributes, 1).is_err() {
-            return Vec::new();
-        }
+    if let Err(err) = unsafe { MFCreateAttributes(&mut attributes, 1) } {
+        log::warn!("MFCreateAttributes failed: {}", hresult_text(&err));
+        return Vec::new();
     }
     let Some(attributes) = attributes else {
+        log::warn!("MFCreateAttributes returned no attribute store");
         return Vec::new();
     };
     let luid = gpu.luid;
@@ -88,8 +231,12 @@ fn hardware_encoders(gpu: &Gpu, codec: Codec) -> Vec<IMFActivate> {
             &mut count,
         )
     };
-    if result.is_err() {
+    if let Err(err) = result {
+        log::warn!("MFTEnum2 for a hardware {codec:?} encoder failed: {}", hresult_text(&err));
         return Vec::new();
+    }
+    if count == 0 {
+        log::warn!("MFTEnum2 returned no hardware {codec:?} encoder (HRESULT 0x00000000)");
     }
     mf::collect_activates(array, count)
 }
@@ -133,19 +280,78 @@ fn video_type(sub: &GUID, s: &Settings) -> Result<IMFMediaType> {
 
 impl VideoEncoder {
     pub fn new(gpu: &Gpu, settings: &Settings) -> std::result::Result<VideoEncoder, String> {
-        for activate in hardware_encoders(gpu, settings.codec) {
-            let name = activate.cast::<IMFAttributes>().map(|a| mf::friendly_name(&a)).unwrap_or_default();
-            match Self::from_activate(gpu, &activate, settings, name.clone()) {
-                Ok(encoder) => return Ok(encoder),
-                Err(err) => {
-                    log::warn!("hardware encoder '{name}' failed: {err}");
-                    let _ = unsafe { activate.ShutdownObject() };
+        start_graveyard();
+        if settings.allow_hardware {
+            if let Some(encoder) = reclaim_hardware(gpu, settings) {
+                HW_REUSED.fetch_add(1, Ordering::Relaxed);
+                log::info!("reusing hardware encoder {} ({}x{})", encoder.name, encoder.width, encoder.height);
+                return Ok(encoder);
+            }
+            if !acquire_hardware_slot() {
+                log::warn!("hardware session budget is full of sessions that cannot be released; using software");
+            } else {
+                wait_for_hardware_create_gap();
+                let mut activated = false;
+                for activate in hardware_encoders(gpu, settings.codec) {
+                    let name = activate.cast::<IMFAttributes>().map(|a| mf::friendly_name(&a)).unwrap_or_default();
+                    match Self::from_activate(gpu, &activate, settings, name.clone()) {
+                        Ok(encoder) => {
+                            HW_LIVE.fetch_add(1, Ordering::Relaxed);
+                            HW_CREATED.fetch_add(1, Ordering::Relaxed);
+                            return Ok(host_on_worker(encoder));
+                        }
+                        Err(err) => {
+                            activated = true;
+                            log::warn!("hardware encoder '{name}' failed: {}", hresult_text(&err));
+                            // ActivateObject failed or configure released the transform already.
+                            // ShutdownObject drops the activation object's own reference.
+                            if let Err(shutdown_err) = unsafe { activate.ShutdownObject() } {
+                                log::warn!(
+                                    "ShutdownObject after '{name}' failed to activate: {}",
+                                    hresult_text(&shutdown_err)
+                                );
+                            }
+                        }
+                    }
+                }
+                if activated {
+                    log::warn!(
+                        "no usable hardware encoder for {:?}; using software after an activation failure",
+                        settings.codec
+                    );
+                } else {
+                    log::warn!("no hardware encoder for {:?} was enumerated; using software", settings.codec);
                 }
             }
+        } else {
+            log::warn!("using the software H.264 encoder after repeated hardware-encoder failures");
         }
-        log::warn!("no usable hardware encoder for {:?}, using the software H.264 encoder", settings.codec);
-        let software = Settings { codec: Codec::H264, ..*settings };
+        let software = Settings { codec: Codec::H264, allow_hardware: false, ..*settings };
         Self::software(gpu, &software).map_err(|err| format!("no video encoder available: {err}"))
+    }
+
+    pub fn is_hardware(&self) -> bool {
+        self.hardware
+    }
+
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// The next drop must not return this session to the reuse pool.
+    pub fn mark_broken(&mut self) {
+        self.broken = true;
+        if let Some(remote) = &self.remote {
+            let _ = remote.tx.send(Request::MarkBroken);
+        }
+    }
+
+    /// The session is already shut down. A later recovery pass has to open a replacement
+    /// instead of submitting to this one.
+    pub fn abandon_for_recovery(&mut self) {
+        self.broken = true;
+        self.released = true;
+        self.poisoned = true;
     }
 
     fn from_activate(gpu: &Gpu, activate: &IMFActivate, s: &Settings, name: String) -> Result<VideoEncoder> {
@@ -219,7 +425,12 @@ impl VideoEncoder {
         let provides_samples = info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0;
         let events = if is_async { Some(transform.cast::<IMFMediaEventGenerator>()?) } else { None };
         unsafe {
-            transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)?;
+            // The Microsoft software H.264 MFT returns E_FAIL (0x80004005) for FLUSH before
+            // streaming has started. Types are already set; a failed pre-start flush must not
+            // reject the encoder. Hardware encoders usually accept it.
+            if let Err(err) = transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0) {
+                log::info!("{name}: pre-start flush was rejected ({err}); starting the stream anyway");
+            }
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
         }
@@ -232,7 +443,7 @@ impl VideoEncoder {
             s.bitrate_kbps
         );
         Ok(VideoEncoder {
-            transform,
+            transform: Some(transform),
             activate: None,
             codec_api,
             events,
@@ -245,13 +456,73 @@ impl VideoEncoder {
             width: s.width,
             height: s.height,
             output: Vec::new(),
+            uses_d3d: d3d_aware,
+            hardware,
+            broken: false,
+            fps: s.fps,
+            bitrate_kbps: s.bitrate_kbps,
+            fast_preset: s.fast_preset,
+            device: d3d_aware.then(|| gpu.device.clone()),
+            manager: d3d_aware.then(|| gpu.manager.clone()),
+            device_ptr: gpu.device.as_raw() as usize,
+            released: false,
+            poisoned: false,
+            sessions: 1,
+            born: Instant::now(),
+            remote: None,
+            inflight: VecDeque::new(),
             codec: s.codec,
             name,
         })
     }
 
+    fn transform(&self) -> Result<IMFTransform> {
+        self.transform.clone().ok_or_else(|| windows::core::Error::from(MF_E_SHUTDOWN))
+    }
+
     /// Feeds one frame. Returns false when the encoder is busy and the frame was dropped.
+    /// Hardware driver calls run on this encoder's worker thread and give up after
+    /// [`crate::safety::NATIVE_CALL_LIMIT`]. A miss abandons the session instead of stalling capture.
     pub fn submit(
+        &mut self,
+        gpu: &Gpu,
+        frame: &ID3D11Texture2D,
+        time: i64,
+        duration: i64,
+        force_key: bool,
+    ) -> std::result::Result<bool, EncoderFault> {
+        if self.poisoned {
+            return Err(EncoderFault::Stalled);
+        }
+        let driver = self.remote.as_ref().map(|remote| remote.tx.clone());
+        if let Some(driver) = driver {
+            let owned = match snapshot_texture(gpu, frame) {
+                Ok(texture) => texture,
+                Err(err) => return Err(EncoderFault::Native(err)),
+            };
+            let result = remote_call(&driver, |reply| Request::Submit {
+                frame: SharedTexture(owned.clone()),
+                time,
+                duration,
+                force_key,
+                reply,
+            });
+            self.keep_if_outstanding(&result, owned, time, duration);
+            if matches!(result, Err(EncoderFault::Stalled)) {
+                self.abandon_after_stall(StallPhase::Submit);
+            }
+            return result;
+        }
+        let accepted = self.submit_local(gpu, frame, time, duration, force_key).map_err(EncoderFault::Native)?;
+        if accepted {
+            if let Ok(texture) = snapshot_texture(gpu, frame) {
+                self.inflight.push_back(HeldInput { texture: Some(texture), time, duration });
+            }
+        }
+        Ok(accepted)
+    }
+
+    fn submit_local(
         &mut self,
         gpu: &Gpu,
         frame: &ID3D11Texture2D,
@@ -269,7 +540,8 @@ impl VideoEncoder {
                 set_codec_value(api, &CODECAPI_AVEncVideoForceKeyFrame, &mf::variant_u32(1));
             }
         }
-        match unsafe { self.transform.ProcessInput(self.input_id, &sample, 0) } {
+        let input = unsafe { self.transform()?.ProcessInput(self.input_id, &sample, 0) };
+        match input {
             Ok(()) => {}
             Err(err) if err.code() == MF_E_NOTACCEPTING => return Ok(false),
             Err(err) => return Err(err),
@@ -284,32 +556,135 @@ impl VideoEncoder {
     }
 
     /// Collects finished frames without feeding a new one.
-    pub fn poll(&mut self) -> Result<()> {
+    pub fn poll(&mut self) -> std::result::Result<(), EncoderFault> {
+        if self.poisoned {
+            return Err(EncoderFault::Stalled);
+        }
+        let driver = self.remote.as_ref().map(|remote| remote.tx.clone());
+        if let Some(driver) = driver {
+            let result = remote_call(&driver, |reply| Request::Poll { reply });
+            if matches!(result, Err(EncoderFault::Stalled)) {
+                self.abandon_after_stall(StallPhase::ProcessOutput);
+            }
+            return result;
+        }
+        self.poll_local().map_err(EncoderFault::Native)
+    }
+
+    fn poll_local(&mut self) -> Result<()> {
         self.pump()
     }
 
     /// Encoded frames that have come out since the last call.
-    pub fn take_output(&mut self) -> Vec<EncodedFrame> {
-        std::mem::take(&mut self.output)
+    /// Each frame the worker produced acknowledges the oldest submitted input still in flight.
+    /// Samples carried from the previous stream are delivered too, and they do not acknowledge a new input.
+    pub fn take_output(&mut self) -> std::result::Result<Vec<EncodedFrame>, EncoderFault> {
+        if self.poisoned {
+            return Err(EncoderFault::Stalled);
+        }
+        let mut carried = std::mem::take(&mut self.output);
+        let Some(remote) = &self.remote else {
+            self.acknowledge(carried.len());
+            return Ok(carried);
+        };
+        let driver = remote.tx.clone();
+        let (tx, rx) = mpsc::channel();
+        if driver.send(Request::TakeOutput { reply: tx }).is_err() {
+            self.output = carried;
+            self.abandon_after_stall(StallPhase::ProcessOutput);
+            return Err(EncoderFault::Stalled);
+        }
+        let produced = match rx.recv_timeout(native_call_limit()) {
+            Ok(frames) => frames,
+            Err(_) => {
+                self.output = carried;
+                self.abandon_after_stall(StallPhase::ProcessOutput);
+                return Err(EncoderFault::Stalled);
+            }
+        };
+        self.acknowledge(produced.len());
+        carried.extend(produced);
+        Ok(carried)
+    }
+
+    /// Inputs accepted since the last delivered output, including a submit that stalled.
+    /// The caller re-encodes these on the replacement session.
+    pub fn take_unacknowledged(&mut self) -> Vec<HeldInput> {
+        self.inflight.drain(..).collect()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn has_unacknowledged(&self) -> bool {
+        !self.inflight.is_empty()
+    }
+
+    fn keep_if_outstanding(
+        &mut self,
+        result: &std::result::Result<bool, EncoderFault>,
+        texture: ID3D11Texture2D,
+        time: i64,
+        duration: i64,
+    ) {
+        let keep = matches!(result, Ok(true) | Err(EncoderFault::Stalled));
+        if keep {
+            self.inflight.push_back(HeldInput { texture: Some(texture), time, duration });
+        }
     }
 
     fn make_sample(&self, gpu: &Gpu, frame: &ID3D11Texture2D, time: i64, duration: i64) -> Result<IMFSample> {
         match &self.input {
-            Input::Gpu => unsafe {
-                let buffer = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, frame, 0, false)?;
-                let length = buffer.cast::<IMF2DBuffer>()?.GetContiguousLength()?;
-                buffer.SetCurrentLength(length)?;
-                let sample = MFCreateSample()?;
-                sample.AddBuffer(&buffer)?;
-                sample.SetSampleTime(time)?;
-                sample.SetSampleDuration(duration)?;
-                Ok(sample)
-            },
+            Input::Gpu => self.make_gpu_sample(frame, time, duration),
             Input::System { staging } => {
                 let bytes = read_nv12(gpu, staging, frame, self.width, self.height)?;
                 mf::sample_from_bytes(&bytes, time, duration)
             }
         }
+    }
+
+    fn make_gpu_sample(&self, frame: &ID3D11Texture2D, time: i64, duration: i64) -> Result<IMFSample> {
+        unsafe {
+            let buffer = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, frame, 0, false)?;
+            let length = buffer.cast::<IMF2DBuffer>()?.GetContiguousLength()?;
+            buffer.SetCurrentLength(length)?;
+            let sample = MFCreateSample()?;
+            sample.AddBuffer(&buffer)?;
+            sample.SetSampleTime(time)?;
+            sample.SetSampleDuration(duration)?;
+            Ok(sample)
+        }
+    }
+
+    /// Hardware worker entry. The texture is the request's private copy.
+    fn submit_local_texture(
+        &mut self,
+        frame: &ID3D11Texture2D,
+        time: i64,
+        duration: i64,
+        force_key: bool,
+    ) -> Result<bool> {
+        self.pump()?;
+        if self.events.is_some() && self.need_input == 0 {
+            return Ok(false);
+        }
+        let sample = self.make_gpu_sample(frame, time, duration)?;
+        if force_key {
+            if let Some(api) = &self.codec_api {
+                set_codec_value(api, &CODECAPI_AVEncVideoForceKeyFrame, &mf::variant_u32(1));
+            }
+        }
+        let input = unsafe { self.transform()?.ProcessInput(self.input_id, &sample, 0) };
+        match input {
+            Ok(()) => {}
+            Err(err) if err.code() == MF_E_NOTACCEPTING => return Ok(false),
+            Err(err) => return Err(err),
+        }
+        if self.events.is_some() {
+            self.need_input -= 1;
+            self.pump()?;
+        } else {
+            while self.pull_output()? {}
+        }
+        Ok(true)
     }
 
     /// Handles queued events of an asynchronous (hardware) encoder.
@@ -330,6 +705,7 @@ impl VideoEncoder {
                 self.pull_output()?;
             } else if kind == MEError.0 as u32 {
                 // e.g. the GPU was reset: surface it so the pipeline restarts.
+                self.broken = true;
                 let status = unsafe { event.GetStatus()? };
                 return Err(windows::core::Error::from(status));
             }
@@ -346,7 +722,7 @@ impl VideoEncoder {
             pEvents: ManuallyDrop::new(None),
         };
         let mut status = 0u32;
-        let result = unsafe { self.transform.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status) };
+        let result = unsafe { self.transform()?.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status) };
         let sample = ManuallyDrop::into_inner(buffer.pSample);
         drop(ManuallyDrop::into_inner(buffer.pEvents));
         match result {
@@ -361,11 +737,11 @@ impl VideoEncoder {
                 Ok(true)
             }
             Err(err) if err.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
-                unsafe {
-                    let new_type = self.transform.GetOutputAvailableType(self.output_id, 0)?;
-                    self.transform.SetOutputType(self.output_id, &new_type, 0)?;
-                    self.output_size = self.transform.GetOutputStreamInfo(self.output_id)?.cbSize.max(self.output_size);
-                }
+                let transform = self.transform()?;
+                let new_type = unsafe { transform.GetOutputAvailableType(self.output_id, 0)? };
+                unsafe { transform.SetOutputType(self.output_id, &new_type, 0)? };
+                let info = unsafe { transform.GetOutputStreamInfo(self.output_id)? };
+                self.output_size = info.cbSize.max(self.output_size);
                 Ok(true)
             }
             Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(false),
@@ -374,15 +750,1198 @@ impl VideoEncoder {
     }
 }
 
-impl Drop for VideoEncoder {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-            let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
-            if let Some(activate) = &self.activate {
-                let _ = activate.ShutdownObject();
+/// How long a synchronous software drain waits for `MF_E_TRANSFORM_NEED_MORE_INPUT`.
+const SHUTDOWN_LIMIT: Duration = Duration::from_millis(400);
+/// How long a reuse drain waits for `METransformDrainComplete` before the session is retired
+/// instead of parked. A reused NVIDIA MFT that did not finish draining rejects the next input.
+const REUSE_DRAIN: Duration = Duration::from_secs(2);
+
+impl VideoEncoder {
+    /// Stops using this encoder.
+    ///
+    /// A healthy hardware encoder is drained, flushed, and parked, one per format and D3D
+    /// device. The next `new` with the same key sends `BEGIN_STREAMING` and `START_OF_STREAM`
+    /// and accepts input only after a fresh `METransformNeedInput`. NeedInput events left
+    /// over from the previous stream are discarded, not counted. Destroying NVIDIA's MFT
+    /// (`nvEncMFTH264x`) while an `RTWorkQ` item is still queued faults in ntdll
+    /// (`RtlEnterCriticalSection` on NULL+0x24, offset `0x1a12d`). `METransformDrainComplete`
+    /// does **not** mean those driver work items have finished.
+    ///
+    /// When a session really has to go (broken, or a duplicate of one already parked):
+    ///
+    /// * This thread does not release the transform, the event generator, or the DXGI device.
+    /// * Those references move to a graveyard thread, which waits [`crate::safety::GRAVEYARD_DELAY`]
+    ///   and only then calls [`IMFShutdown::Shutdown`] — the final method on the MFT — followed
+    ///   by `IMFActivate::ShutdownObject`, and only after that drops the device manager and device.
+    /// * We pull events with `GetEvent`, never `BeginGetEvent`, so this process has no outstanding
+    ///   event callback of its own. The delay is for NVIDIA's callbacks, which we cannot observe.
+    ///
+    /// The synchronous software encoder has no `RTWorkQ` thread. It is drained until
+    /// `MF_E_TRANSFORM_NEED_MORE_INPUT` and released on this thread.
+    pub fn shutdown(&mut self) -> Vec<EncodedFrame> {
+        if self.released || self.poisoned {
+            return std::mem::take(&mut self.output);
+        }
+        // Take the only long-lived sender. A cloned sender kept across `join` is what
+        // deadlocks: the worker finishes Shutdown, blocks in `recv`, and `join` waits for it.
+        let Some(remote) = self.remote.take() else {
+            let frames = self.shutdown_local();
+            return self.finish_shutdown(frames);
+        };
+        // Samples carried on the shell are not sitting in the worker, and they are not new inputs.
+        let carried = std::mem::take(&mut self.output);
+        let (ack_tx, ack_rx) = mpsc::channel();
+        if remote.tx.send(Request::Shutdown { reply: ack_tx }).is_err() {
+            drop(remote.tx);
+            self.leak_worker(remote.join, StallPhase::Shutdown);
+            return carried;
+        }
+        drop(remote.tx);
+        let frames = match ack_rx.recv_timeout(native_call_limit()) {
+            Ok(frames) => frames,
+            Err(_) => {
+                self.leak_worker(remote.join, StallPhase::Drain);
+                return carried;
+            }
+        };
+        // The ack means shutdown_local returned. The worker must then leave the loop.
+        // `done` disconnects when that function returns. A timeout means it is stuck
+        // after the ack; leak the thread instead of joining it.
+        match remote.done.recv_timeout(native_call_limit()) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.leak_worker(remote.join, StallPhase::Shutdown);
+                let mut all = carried;
+                all.extend(self.finish_shutdown(frames));
+                return all;
             }
         }
+        if let Some(join) = remote.join {
+            if !join_within(join, Duration::from_secs(1)) {
+                self.poisoned = true;
+                self.released = true;
+                note_stall(StallPhase::Shutdown);
+                let mut all = carried;
+                all.extend(self.finish_shutdown(frames));
+                return all;
+            }
+        }
+        let mut all = carried;
+        all.extend(self.finish_shutdown(frames));
+        all
+    }
+
+    /// Counts delivered samples against in-flight inputs. Anything still in flight was accepted
+    /// and never came back, so the session is poisoned and the caller re-encodes those inputs.
+    fn finish_shutdown(&mut self, frames: Vec<EncodedFrame>) -> Vec<EncodedFrame> {
+        self.released = true;
+        self.acknowledge(frames.len());
+        if !self.inflight.is_empty() {
+            self.poisoned = true;
+            log::warn!(
+                "{} drain left {} input(s) without a sample; keeping them for recovery",
+                self.name,
+                self.inflight.len()
+            );
+        }
+        frames
+    }
+
+    fn leak_worker(&mut self, join: Option<std::thread::JoinHandle<()>>, phase: StallPhase) {
+        self.poisoned = true;
+        self.released = true;
+        self.broken = true;
+        std::mem::forget(join);
+        note_stall(phase);
+    }
+
+    fn shutdown_local(&mut self) -> Vec<EncodedFrame> {
+        if self.released {
+            return std::mem::take(&mut self.output);
+        }
+        self.released = true;
+        let mut frames = std::mem::take(&mut self.output);
+        let Some(mut parts) = self.detach() else {
+            return frames;
+        };
+        if parts.hardware {
+            match park_hardware(parts) {
+                Ok(tail) => {
+                    frames.extend(tail);
+                    return frames;
+                }
+                Err(mut returned) => {
+                    frames.extend(std::mem::take(&mut returned.tail));
+                    parts = returned;
+                }
+            }
+            frames.extend(bury(parts));
+        } else {
+            let (drained, tail) = end_stream(&mut parts);
+            frames.extend(tail);
+            if !drained {
+                log::warn!("{} software drain did not finish; keeping {} sample(s)", parts.name, frames.len());
+            }
+            release_software(parts);
+        }
+        frames
+    }
+
+    fn acknowledge(&mut self, count: usize) {
+        for _ in 0..count {
+            self.inflight.pop_front();
+        }
+    }
+
+    fn detach(&mut self) -> Option<NativeParts> {
+        let transform = self.transform.take()?;
+        // Drop the staging texture while the device is still certainly alive.
+        let _ = std::mem::replace(&mut self.input, Input::Gpu);
+        self.output.clear();
+        Some(NativeParts {
+            device: self.device.take(),
+            manager: self.manager.take(),
+            codec_api: self.codec_api.take(),
+            events: self.events.take(),
+            activate: self.activate.take(),
+            transform,
+            input_id: self.input_id,
+            output_id: self.output_id,
+            provides_samples: self.provides_samples,
+            output_size: self.output_size,
+            uses_d3d: self.uses_d3d,
+            hardware: self.hardware,
+            broken: self.broken,
+            width: self.width,
+            height: self.height,
+            fps: self.fps,
+            bitrate_kbps: self.bitrate_kbps,
+            fast_preset: self.fast_preset,
+            device_ptr: self.device_ptr,
+            sessions: self.sessions,
+            born: self.born,
+            codec: self.codec,
+            name: std::mem::take(&mut self.name),
+            tail: Vec::new(),
+        })
+    }
+
+    fn abandon_after_stall(&mut self, phase: StallPhase) {
+        if self.poisoned {
+            return;
+        }
+        self.poisoned = true;
+        self.released = true;
+        self.broken = true;
+        if let Some(remote) = self.remote.take() {
+            // Dropping the sender is how a late return learns we gave up. Forgetting the
+            // join handle is what keeps this thread from waiting inside the driver.
+            std::mem::forget(remote.join);
+            drop(remote.tx);
+        }
+        note_stall(phase);
+    }
+
+    fn leak_native(&mut self) {
+        self.released = true;
+        self.broken = true;
+        self.poisoned = true;
+        std::mem::forget(self.transform.take());
+        std::mem::forget(self.activate.take());
+        std::mem::forget(self.codec_api.take());
+        std::mem::forget(self.events.take());
+        std::mem::forget(self.device.take());
+        std::mem::forget(self.manager.take());
+        let _ = std::mem::replace(&mut self.input, Input::Gpu);
+    }
+}
+
+impl Drop for VideoEncoder {
+    fn drop(&mut self) {
+        let drained = self.shutdown();
+        if !drained.is_empty() {
+            log::error!(
+                "dropping {} with {} encoded frame(s) that were not published: {}",
+                self.name,
+                drained.len(),
+                drained.iter().map(|frame| frame.time.to_string()).collect::<Vec<_>>().join(", ")
+            );
+        }
+    }
+}
+
+fn remote_call<T: Send + 'static>(
+    driver: &Sender<Request>,
+    build: impl FnOnce(Sender<std::result::Result<T, windows::core::Error>>) -> Request,
+) -> std::result::Result<T, EncoderFault> {
+    let (tx, rx) = mpsc::channel();
+    if driver.send(build(tx)).is_err() {
+        return Err(EncoderFault::Stalled);
+    }
+    match rx.recv_timeout(native_call_limit()) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(EncoderFault::Native(err)),
+        Err(_) => Err(EncoderFault::Stalled),
+    }
+}
+
+/// Moves a hardware encoder onto the one thread that is allowed to call into the driver.
+fn host_on_worker(encoder: VideoEncoder) -> VideoEncoder {
+    let codec = encoder.codec;
+    let name = encoder.name.clone();
+    let (tx, rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new().name("encoder-driver".into()).spawn(move || {
+        driver_loop(encoder, rx);
+        drop(done_tx);
+    });
+    let join = match spawned {
+        Ok(join) => join,
+        Err(err) => {
+            log::error!("encoder driver thread failed to start: {err}");
+            return encoder_shell(codec, name, None);
+        }
+    };
+    encoder_shell(codec, name, Some(Remote { tx, join: Some(join), done: done_rx }))
+}
+
+fn encoder_shell(codec: Codec, name: String, remote: Option<Remote>) -> VideoEncoder {
+    VideoEncoder {
+        transform: None,
+        activate: None,
+        codec_api: None,
+        events: None,
+        need_input: 0,
+        provides_samples: false,
+        output_size: 0,
+        input: Input::Gpu,
+        input_id: 0,
+        output_id: 0,
+        width: 0,
+        height: 0,
+        output: Vec::new(),
+        uses_d3d: false,
+        hardware: true,
+        broken: false,
+        fps: 0,
+        bitrate_kbps: 0,
+        fast_preset: false,
+        device: None,
+        manager: None,
+        device_ptr: 0,
+        released: false,
+        poisoned: false,
+        sessions: 0,
+        born: Instant::now(),
+        remote,
+        inflight: VecDeque::new(),
+        codec,
+        name,
+    }
+}
+
+fn native_call_limit() -> Duration {
+    *CALL_LIMIT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+fn set_native_call_limit_for_tests(limit: Duration) {
+    *CALL_LIMIT.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = limit;
+}
+
+fn join_within(handle: std::thread::JoinHandle<()>, limit: Duration) -> bool {
+    let (tx, rx) = mpsc::channel();
+    let watcher = match std::thread::Builder::new().name("encoder-join".into()).spawn(move || {
+        let _ = handle.join();
+        let _ = tx.send(());
+    }) {
+        Ok(watcher) => watcher,
+        Err(_) => return false,
+    };
+    if rx.recv_timeout(limit).is_ok() {
+        let _ = watcher.join();
+        true
+    } else {
+        std::mem::forget(watcher);
+        false
+    }
+}
+
+pub(crate) fn snapshot_texture(gpu: &Gpu, source: &ID3D11Texture2D) -> Result<ID3D11Texture2D> {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { source.GetDesc(&mut desc) };
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = 0;
+    desc.MiscFlags = 0;
+    let mut copy = None;
+    unsafe { gpu.device.CreateTexture2D(&desc, None, Some(&mut copy))? };
+    let Some(copy) = copy else {
+        return Err(windows::core::Error::empty());
+    };
+    unsafe { gpu.context.CopyResource(&copy, source) };
+    Ok(copy)
+}
+
+fn driver_loop(mut encoder: VideoEncoder, rx: mpsc::Receiver<Request>) {
+    let _com = crate::win::ComGuard::mta();
+    while let Ok(request) = rx.recv() {
+        match request {
+            Request::Submit { frame, time, duration, force_key, reply } => {
+                // Hardware input is a GPU texture. The system-memory path does not use this thread.
+                let result = encoder.submit_local_texture(&frame.0, time, duration, force_key);
+                if reply.send(result).is_err() {
+                    log::error!(
+                        "driver call finished after the deadline; leaking {} instead of releasing it",
+                        encoder.name
+                    );
+                    encoder.leak_native();
+                    std::mem::forget(frame);
+                    return;
+                }
+            }
+            Request::Poll { reply } => {
+                let result = encoder.poll_local();
+                if reply.send(result).is_err() {
+                    log::error!(
+                        "driver poll finished after the deadline; leaking {} instead of releasing it",
+                        encoder.name
+                    );
+                    encoder.leak_native();
+                    return;
+                }
+            }
+            Request::TakeOutput { reply } => {
+                let frames = std::mem::take(&mut encoder.output);
+                if let Err(err) = reply.send(frames) {
+                    log::error!(
+                        "encoded output missed the caller; keeping {} frame(s) on {}",
+                        err.0.len(),
+                        encoder.name
+                    );
+                    encoder.output = err.0;
+                }
+            }
+            Request::MarkBroken => encoder.broken = true,
+            #[cfg(test)]
+            Request::SeedOutput { time } => {
+                encoder.output.push(EncodedFrame { time, data: vec![1] });
+            }
+            #[cfg(test)]
+            Request::Stall => loop {
+                std::thread::park();
+            },
+            Request::Shutdown { reply } => {
+                let frames = encoder.shutdown_local();
+                if let Err(err) = reply.send(frames) {
+                    log::error!(
+                        "shutdown drain missed the caller; {} sample(s) from {} were not published: {}",
+                        err.0.len(),
+                        encoder.name,
+                        err.0.iter().map(|frame| frame.time.to_string()).collect::<Vec<_>>().join(", ")
+                    );
+                }
+                break;
+            }
+        }
+    }
+    if !encoder.released {
+        let frames = encoder.shutdown_local();
+        if !frames.is_empty() {
+            log::error!(
+                "driver exit drained {} sample(s) from {} with no caller left: {}",
+                frames.len(),
+                encoder.name,
+                frames.iter().map(|frame| frame.time.to_string()).collect::<Vec<_>>().join(", ")
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SessionKey {
+    codec: Codec,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_kbps: u32,
+    fast_preset: bool,
+    device: usize,
+}
+
+/// COM objects for one encoder. `release_buried` drops the MFT before `manager` and `device`;
+/// do not rely on field order.
+///
+/// The windows crate does not mark these pointers `Send`. Each session is owned by one thread
+/// at a time (the capture thread, then only the graveyard thread) and the objects are MTA/free-threaded.
+unsafe impl Send for NativeParts {}
+
+struct NativeParts {
+    device: Option<ID3D11Device>,
+    manager: Option<IMFDXGIDeviceManager>,
+    codec_api: Option<ICodecAPI>,
+    events: Option<IMFMediaEventGenerator>,
+    activate: Option<IMFActivate>,
+    transform: IMFTransform,
+    input_id: u32,
+    output_id: u32,
+    provides_samples: bool,
+    output_size: u32,
+    uses_d3d: bool,
+    hardware: bool,
+    broken: bool,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_kbps: u32,
+    fast_preset: bool,
+    device_ptr: usize,
+    sessions: u32,
+    born: Instant,
+    codec: Codec,
+    name: String,
+    tail: Vec<EncodedFrame>,
+}
+
+impl NativeParts {
+    fn key(&self) -> SessionKey {
+        SessionKey {
+            codec: self.codec,
+            width: self.width,
+            height: self.height,
+            fps: self.fps,
+            bitrate_kbps: self.bitrate_kbps,
+            fast_preset: self.fast_preset,
+            device: self.device_ptr,
+        }
+    }
+
+    fn into_encoder(self) -> VideoEncoder {
+        VideoEncoder {
+            transform: Some(self.transform),
+            activate: self.activate,
+            codec_api: self.codec_api,
+            events: self.events,
+            need_input: 0,
+            provides_samples: self.provides_samples,
+            output_size: self.output_size,
+            input: Input::Gpu,
+            input_id: self.input_id,
+            output_id: self.output_id,
+            width: self.width,
+            height: self.height,
+            output: self.tail,
+            uses_d3d: self.uses_d3d,
+            hardware: self.hardware,
+            broken: false,
+            fps: self.fps,
+            bitrate_kbps: self.bitrate_kbps,
+            fast_preset: self.fast_preset,
+            device: self.device,
+            manager: self.manager,
+            device_ptr: self.device_ptr,
+            released: false,
+            poisoned: false,
+            sessions: self.sessions,
+            born: self.born,
+            remote: None,
+            inflight: VecDeque::new(),
+            codec: self.codec,
+            name: self.name,
+        }
+    }
+}
+
+fn session_key(gpu: &Gpu, settings: &Settings) -> SessionKey {
+    SessionKey {
+        codec: settings.codec,
+        width: settings.width,
+        height: settings.height,
+        fps: settings.fps,
+        bitrate_kbps: settings.bitrate_kbps,
+        fast_preset: settings.fast_preset,
+        device: gpu.device.as_raw() as usize,
+    }
+}
+
+const POOL_LIMIT: usize = 4;
+
+struct Pool {
+    sessions: Vec<NativeParts>,
+}
+
+/// Parked hardware encoders.
+///
+/// Rust does not drop `static` items when the process exits, so a `Drop` impl here would
+/// never run. [`shutdown_pooled_encoders`] moves them to the graveyard thread, and
+/// [`finish_pending_retirements`] waits out the delay before exit so a retirement that is
+/// still pending is released there. Releasing them inline on the quitting thread is the ntdll crash.
+static POOL: std::sync::Mutex<Pool> = std::sync::Mutex::new(Pool { sessions: Vec::new() });
+static LAST_HARDWARE_CREATE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+static CREATE_GAP: std::sync::Mutex<Duration> = std::sync::Mutex::new(crate::safety::HARDWARE_CREATE_GAP);
+static FORCE_RETIRE: AtomicBool = AtomicBool::new(false);
+static HW_LIVE: AtomicU64 = AtomicU64::new(0);
+static HW_CREATED: AtomicU64 = AtomicU64::new(0);
+static HW_REUSED: AtomicU64 = AtomicU64::new(0);
+static HW_RETIRED: AtomicU64 = AtomicU64::new(0);
+static HW_SHUTDOWN: AtomicU64 = AtomicU64::new(0);
+static STALLS: AtomicU64 = AtomicU64::new(0);
+static RECOVERIES: AtomicU64 = AtomicU64::new(0);
+static LAST_STALL_PHASE: AtomicU8 = AtomicU8::new(255);
+static CALL_LIMIT: std::sync::Mutex<Duration> = std::sync::Mutex::new(crate::safety::NATIVE_CALL_LIMIT);
+
+#[derive(Clone, Copy, Debug)]
+pub enum StallPhase {
+    Submit,
+    ProcessOutput,
+    Drain,
+    Shutdown,
+}
+
+impl std::fmt::Display for StallPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            StallPhase::Submit => "submit",
+            StallPhase::ProcessOutput => "ProcessOutput",
+            StallPhase::Drain => "drain",
+            StallPhase::Shutdown => "shutdown",
+        })
+    }
+}
+
+pub fn note_stall(phase: StallPhase) {
+    STALLS.fetch_add(1, Ordering::Relaxed);
+    LAST_STALL_PHASE.store(phase as u8, Ordering::Relaxed);
+    note_hardware_failure();
+    eprintln!(
+        "hardware encoder stalled during {phase} (driver call exceeded {}s); abandoning the session without releasing it",
+        crate::safety::NATIVE_CALL_LIMIT.as_secs()
+    );
+    log::error!(
+        "hardware encoder stalled during {phase} (driver call exceeded {}s); abandoning the session without releasing it",
+        crate::safety::NATIVE_CALL_LIMIT.as_secs()
+    );
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn last_stall_phase() -> &'static str {
+    match LAST_STALL_PHASE.load(Ordering::Relaxed) {
+        0 => "submit",
+        1 => "ProcessOutput",
+        2 => "drain",
+        3 => "shutdown",
+        _ => "none",
+    }
+}
+
+pub fn note_recovery() {
+    RECOVERIES.fetch_add(1, Ordering::Relaxed);
+    log::warn!("re-encoded on a fresh session after a driver stall");
+}
+
+#[cfg(test)]
+pub fn stall_counters() -> (u64, u64) {
+    (STALLS.load(Ordering::Relaxed), RECOVERIES.load(Ordering::Relaxed))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
+pub struct EncoderCounters {
+    pub created: u64,
+    pub reused: u64,
+    pub retired: u64,
+    pub shut_down: u64,
+}
+
+#[cfg(test)]
+pub fn encoder_counters() -> EncoderCounters {
+    EncoderCounters {
+        created: HW_CREATED.load(Ordering::Relaxed),
+        reused: HW_REUSED.load(Ordering::Relaxed),
+        retired: HW_RETIRED.load(Ordering::Relaxed),
+        shut_down: HW_SHUTDOWN.load(Ordering::Relaxed),
+    }
+}
+
+/// Test hook. Production keeps [`crate::safety::HARDWARE_CREATE_GAP`]. The soak uses a
+/// 2s gap so hardware creation stays near a real restart rate. Reuse does not wait.
+#[cfg(test)]
+pub fn set_hardware_create_gap_for_tests(gap: Duration) {
+    *CREATE_GAP.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = gap;
+}
+
+/// Test hook. When set, every hardware shutdown is buried instead of parked, so the
+/// graveyard path runs even when the format pool is not full.
+#[cfg(test)]
+pub fn set_force_retire_hardware_for_tests(enabled: bool) {
+    FORCE_RETIRE.store(enabled, Ordering::Relaxed);
+}
+
+/// Waits until every encoder handed to the graveyard has been released.
+/// Process exit calls this so a retirement still inside the delay is not abandoned.
+pub fn finish_pending_retirements() -> bool {
+    let timeout = crate::safety::GRAVEYARD_DELAY + Duration::from_secs(2);
+    let started = Instant::now();
+    loop {
+        let retired = HW_RETIRED.load(Ordering::Relaxed);
+        let shut_down = HW_SHUTDOWN.load(Ordering::Relaxed);
+        if shut_down >= retired {
+            return true;
+        }
+        if started.elapsed() >= timeout {
+            log::warn!(
+                "graveyard still holding {} hardware encoder(s) after {}s",
+                retired.saturating_sub(shut_down),
+                timeout.as_secs()
+            );
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Blocks until every encoder handed to the graveyard has been released, or `timeout` elapses.
+#[cfg(test)]
+pub fn wait_for_graveyard_shutdown(timeout: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        let counters = encoder_counters();
+        if counters.retired > 0 && counters.shut_down >= counters.retired {
+            return true;
+        }
+        if started.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn pool_lock() -> std::sync::MutexGuard<'static, Pool> {
+    POOL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn graveyard_pending() -> u64 {
+    HW_RETIRED.load(Ordering::Relaxed).saturating_sub(HW_SHUTDOWN.load(Ordering::Relaxed))
+}
+
+fn hardware_sessions_held() -> u64 {
+    HW_LIVE.load(Ordering::Relaxed).saturating_add(graveyard_pending())
+}
+
+fn release_live_slot() {
+    let mut live = HW_LIVE.load(Ordering::Relaxed);
+    while live > 0 {
+        match HW_LIVE.compare_exchange_weak(live, live - 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(current) => live = current,
+        }
+    }
+}
+
+/// Blocks until a new hardware MFT would fit under the session cap, retiring one parked
+/// encoder into the graveyard if every slot is a session we are still holding.
+fn acquire_hardware_slot() -> bool {
+    let budget = crate::safety::HARDWARE_SESSION_BUDGET;
+    let timeout = crate::safety::GRAVEYARD_DELAY + Duration::from_secs(2);
+    let started = Instant::now();
+    loop {
+        if crate::safety::hardware_slot_free(HW_LIVE.load(Ordering::Relaxed), graveyard_pending(), budget) {
+            return true;
+        }
+        if graveyard_pending() == 0 {
+            let oldest = {
+                let mut pool = pool_lock();
+                if pool.sessions.is_empty() {
+                    None
+                } else {
+                    Some(pool.sessions.remove(0))
+                }
+            };
+            match oldest {
+                Some(old) => {
+                    log::info!(
+                        "hardware session budget is {budget}; retiring parked {} and waiting for it to release",
+                        old.name
+                    );
+                    let name = old.name.clone();
+                    log_undelivered(&name, &bury(old));
+                }
+                None => {
+                    log::warn!("hardware session budget is {budget} with no parked encoder to retire");
+                    return false;
+                }
+            }
+        }
+        if started.elapsed() >= timeout {
+            log::warn!(
+                "timed out waiting for a hardware encoder slot ({} held, budget {budget}, {} still in the graveyard)",
+                hardware_sessions_held(),
+                graveyard_pending()
+            );
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Spaces *new* hardware MFTs. Reuse does not call this. A gap is a wait, not a software fallback.
+fn wait_for_hardware_create_gap() {
+    loop {
+        let gap = *CREATE_GAP.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut last = LAST_HARDWARE_CREATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        if crate::safety::hardware_create_allowed(*last, now, gap) {
+            *last = Some(now);
+            return;
+        }
+        let previous = last.expect("a refused create has a previous timestamp");
+        drop(last);
+        let remain = gap.saturating_sub(now.saturating_duration_since(previous));
+        std::thread::sleep(remain.min(Duration::from_millis(200)).max(Duration::from_millis(10)));
+    }
+}
+
+fn reclaim_hardware(gpu: &Gpu, settings: &Settings) -> Option<VideoEncoder> {
+    let wanted = session_key(gpu, settings);
+    let parked = {
+        let mut pool = pool_lock();
+        let pos = pool.sessions.iter().position(|parts| {
+            crate::safety::reuse_hardware_encoder(
+                parts.device_ptr == wanted.device,
+                parts.key() == wanted,
+                parts.broken,
+            )
+        })?;
+        pool.sessions.remove(pos)
+    };
+    match revive(parked) {
+        Ok(encoder) => Some(encoder),
+        Err(parts) => {
+            log::warn!("could not restart parked encoder {}; releasing it later", parts.name);
+            let name = parts.name.clone();
+            log_undelivered(&name, &bury(parts));
+            None
+        }
+    }
+}
+
+/// End the current stream and keep every sample. Flush runs only after the drain
+/// completes; flushing earlier drops a tail frame that has not been pulled yet.
+/// An empty output batch is not completion.
+fn end_stream(parts: &mut NativeParts) -> (bool, Vec<EncodedFrame>) {
+    unsafe {
+        // Async MFTs: NOTIFY_END_OF_STREAM, then COMMAND_DRAIN, then HaveOutput until
+        // METransformDrainComplete. DrainComplete is not posted if COMMAND_DRAIN is skipped.
+        // https://learn.microsoft.com/en-us/windows/win32/medfound/asynchronous-mfts#draining
+        let _ = parts.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+        let _ = parts.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+    }
+    let (drained, mut frames) = wait_for_drain_complete(parts);
+    if drained {
+        unsafe {
+            let _ = parts.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+            let _ = parts.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+        }
+        // Flush can leave NeedInput. Any sample that is still queued is kept.
+        frames.extend(take_queued_samples(parts));
+    } else {
+        log::warn!("{}: drain deadline hit; not flushing, so buffered samples stay available", parts.name);
+    }
+    (drained, frames)
+}
+
+fn begin_stream(parts: &mut NativeParts) -> bool {
+    let leftover = take_queued_samples(parts);
+    if !leftover.is_empty() {
+        log::warn!("{} sample(s) were still queued at restart; delivering them with the next session", leftover.len());
+        parts.tail.extend(leftover);
+    }
+    unsafe {
+        if let Err(err) = parts.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0) {
+            log::warn!("{}: BEGIN_STREAMING failed: {err}", parts.name);
+            return false;
+        }
+        if let Err(err) = parts.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0) {
+            log::warn!("{}: START_OF_STREAM failed: {err}", parts.name);
+            return false;
+        }
+    }
+    true
+}
+
+fn wait_for_drain_complete(parts: &mut NativeParts) -> (bool, Vec<EncodedFrame>) {
+    let mut frames = Vec::new();
+    let Some(events) = parts.events.clone() else {
+        let deadline = Instant::now() + SHUTDOWN_LIMIT;
+        while Instant::now() < deadline {
+            match pull_sample(parts) {
+                Pull::Sample(frame) => frames.push(frame),
+                Pull::NeedMore => {
+                    let finished = matches!(
+                        crate::safety::sync_drain_step(crate::safety::DrainKind::NeedMoreInput),
+                        crate::safety::DrainStep::Done
+                    );
+                    return (finished, frames);
+                }
+                Pull::Again => {}
+                Pull::Failed => return (false, frames),
+            }
+        }
+        log::warn!("{}: sync drain did not finish within {}ms", parts.name, SHUTDOWN_LIMIT.as_millis());
+        return (false, frames);
+    };
+    let deadline = Instant::now() + REUSE_DRAIN;
+    loop {
+        if Instant::now() >= deadline {
+            log::warn!("{}: drain did not finish within {}ms", parts.name, REUSE_DRAIN.as_millis());
+            return (false, frames);
+        }
+        match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+            Ok(event) => {
+                let kind = unsafe { event.GetType() }.unwrap_or(0);
+                let drain_kind = if kind == METransformDrainComplete.0 as u32 {
+                    crate::safety::DrainKind::DrainComplete
+                } else if kind == METransformHaveOutput.0 as u32 {
+                    crate::safety::DrainKind::Output
+                } else if kind == MEError.0 as u32 {
+                    crate::safety::DrainKind::Error
+                } else if kind == METransformNeedInput.0 as u32 {
+                    crate::safety::DrainKind::NeedMoreInput
+                } else {
+                    crate::safety::DrainKind::Quiet
+                };
+                let _ = crate::safety::worker_signal(drain_kind);
+                match crate::safety::async_drain_step(drain_kind) {
+                    crate::safety::DrainStep::KeepSample => {
+                        let mut pulled = false;
+                        for _ in 0..4 {
+                            match pull_sample(parts) {
+                                Pull::Sample(frame) => {
+                                    frames.push(frame);
+                                    pulled = true;
+                                    break;
+                                }
+                                Pull::Again => {}
+                                Pull::NeedMore => break,
+                                Pull::Failed => return (false, frames),
+                            }
+                        }
+                        if !pulled {
+                            log::warn!("{}: HaveOutput during drain produced no sample", parts.name);
+                        }
+                    }
+                    crate::safety::DrainStep::KeepWaiting => {}
+                    crate::safety::DrainStep::Done => return (true, frames),
+                    crate::safety::DrainStep::Failed => {
+                        log::warn!("{}: MEError during drain", parts.name);
+                        return (false, frames);
+                    }
+                }
+            }
+            Err(err) if err.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                // An empty batch is not METransformDrainComplete.
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => {
+                log::warn!("{}: event queue failed during drain: {err}", parts.name);
+                return (false, frames);
+            }
+        }
+    }
+}
+
+/// Pull queued samples. `NeedInput` is ignored. Samples are returned, never dropped.
+fn take_queued_samples(parts: &mut NativeParts) -> Vec<EncodedFrame> {
+    let Some(events) = parts.events.clone() else {
+        return Vec::new();
+    };
+    let mut frames = Vec::new();
+    for _ in 0..64 {
+        match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+            Ok(event) => {
+                let kind = unsafe { event.GetType() }.unwrap_or(0);
+                if kind == METransformHaveOutput.0 as u32 {
+                    if let Pull::Sample(frame) = pull_sample(parts) {
+                        frames.push(frame);
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    frames
+}
+
+enum Pull {
+    Sample(EncodedFrame),
+    /// Sync drain is finished.
+    NeedMore,
+    /// Format change or a transient empty pull. Keep draining.
+    Again,
+    Failed,
+}
+
+/// Returns the sample bytes when `ProcessOutput` produced one.
+fn pull_sample(parts: &mut NativeParts) -> Pull {
+    let sample = if parts.provides_samples { None } else { mf::empty_sample(parts.output_size).ok() };
+    let mut buffer = MFT_OUTPUT_DATA_BUFFER {
+        dwStreamID: parts.output_id,
+        pSample: ManuallyDrop::new(sample),
+        dwStatus: 0,
+        pEvents: ManuallyDrop::new(None),
+    };
+    let mut status = 0u32;
+    let result = unsafe { parts.transform.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status) };
+    let sample = ManuallyDrop::into_inner(buffer.pSample);
+    drop(ManuallyDrop::into_inner(buffer.pEvents));
+    match result {
+        Ok(()) => {
+            let Some(sample) = sample else {
+                return Pull::Again;
+            };
+            let time = unsafe { sample.GetSampleTime() }.unwrap_or(0);
+            match mf::sample_bytes(&sample) {
+                Ok(data) if !data.is_empty() => Pull::Sample(EncodedFrame { time, data }),
+                Ok(_) => Pull::Again,
+                Err(_) => Pull::Failed,
+            }
+        }
+        Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
+            let _ = crate::safety::worker_signal(crate::safety::DrainKind::NeedMoreInput);
+            Pull::NeedMore
+        }
+        Err(err) if err.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+            if let Ok(new_type) = unsafe { parts.transform.GetOutputAvailableType(parts.output_id, 0) } {
+                if unsafe { parts.transform.SetOutputType(parts.output_id, &new_type, 0) }.is_ok() {
+                    if let Ok(info) = unsafe { parts.transform.GetOutputStreamInfo(parts.output_id) } {
+                        parts.output_size = info.cbSize.max(parts.output_size);
+                    }
+                }
+            }
+            Pull::Again
+        }
+        Err(_) => Pull::Failed,
+    }
+}
+
+/// Restart a parked async MFT. `into_encoder` starts `need_input` at 0, so only a
+/// `METransformNeedInput` posted after `START_OF_STREAM` can authorize `ProcessInput`.
+#[allow(clippy::result_large_err)]
+fn revive(mut parts: NativeParts) -> std::result::Result<VideoEncoder, NativeParts> {
+    parts.sessions = parts.sessions.saturating_add(1);
+    if !begin_stream(&mut parts) {
+        log::warn!("could not restart parked encoder {}", parts.name);
+        return Err(parts);
+    }
+    // Deliver leftovers on the shell. They must not acknowledge inputs of the new stream.
+    let carried = std::mem::take(&mut parts.tail);
+    let mut encoder = host_on_worker(parts.into_encoder());
+    encoder.output = carried;
+    Ok(encoder)
+}
+
+#[allow(clippy::result_large_err)]
+fn park_hardware(mut parts: NativeParts) -> std::result::Result<Vec<EncodedFrame>, NativeParts> {
+    if !parts.hardware {
+        return Err(parts);
+    }
+    let forced = FORCE_RETIRE.load(Ordering::Relaxed) || parts.broken;
+    let aged_out = crate::safety::retire_reused_encoder(parts.sessions, parts.born.elapsed());
+    if aged_out && !forced {
+        log::info!(
+            "retiring {} after {} sessions ({:.0}s old)",
+            parts.name,
+            parts.sessions,
+            parts.born.elapsed().as_secs_f64()
+        );
+    }
+    // Drain before park, flush, or release. The collected samples go back to the caller.
+    let (drained, tail) = end_stream(&mut parts);
+    if !drained || forced || aged_out {
+        if !drained {
+            log::warn!("not reusing {}; the drain did not finish", parts.name);
+            parts.broken = true;
+        }
+        parts.tail.extend(tail);
+        return Err(parts);
+    }
+    let mut pool = pool_lock();
+    if pool.sessions.iter().any(|existing| existing.key() == parts.key()) {
+        drop(pool);
+        parts.tail.extend(tail);
+        return Err(parts);
+    }
+    if pool.sessions.len() >= POOL_LIMIT {
+        let old = pool.sessions.remove(0);
+        let old_name = old.name.clone();
+        drop(pool);
+        log::info!("hardware encoder pool is full; delaying release of {old_name}");
+        log_undelivered(&old_name, &bury(old));
+        pool_lock().sessions.push(parts);
+        return Ok(tail);
+    }
+    log::info!("parking hardware encoder {} for reuse", parts.name);
+    pool.sessions.push(parts);
+    Ok(tail)
+}
+
+struct Buried {
+    not_before: Instant,
+    parts: NativeParts,
+}
+
+/// Starts the process-lifetime graveyard thread. Safe to call more than once.
+/// A failed spawn is remembered: later retires leak the MFT instead of releasing it here.
+pub fn start_graveyard() {
+    static START: Once = Once::new();
+    START.call_once(|| {
+        let (tx, rx) = mpsc::channel();
+        match std::thread::Builder::new().name("encoder-graveyard".into()).spawn(move || graveyard_loop(rx)) {
+            Ok(_) => {
+                *graveyard_slot() = Some(tx);
+                log::info!("encoder graveyard thread started");
+            }
+            Err(err) => {
+                log::error!(
+                    "encoder graveyard thread failed to start: {err}. Hardware encoders will be leaked instead of released"
+                );
+            }
+        }
+    });
+}
+
+fn graveyard_slot() -> std::sync::MutexGuard<'static, Option<Sender<Buried>>> {
+    static SLOT: std::sync::Mutex<Option<Sender<Buried>>> = std::sync::Mutex::new(None);
+    SLOT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Moves parked hardware encoders to the graveyard. A `static` pool is not destroyed at
+/// process exit. Pair with [`finish_pending_retirements`] before the process ends.
+pub fn shutdown_pooled_encoders() {
+    start_graveyard();
+    let sessions = {
+        let mut pool = pool_lock();
+        std::mem::take(&mut pool.sessions)
+    };
+    if sessions.is_empty() {
+        return;
+    }
+    log::info!("retiring {} parked hardware encoder(s) on the graveyard thread", sessions.len());
+    for parts in sessions {
+        let name = parts.name.clone();
+        log_undelivered(&name, &bury(parts));
+    }
+}
+
+fn log_undelivered(name: &str, frames: &[EncodedFrame]) {
+    if frames.is_empty() {
+        return;
+    }
+    log::error!(
+        "{name} still held {} encoded sample(s) at release: {}",
+        frames.len(),
+        frames.iter().map(|frame| frame.time.to_string()).collect::<Vec<_>>().join(", ")
+    );
+}
+
+fn bury(mut parts: NativeParts) -> Vec<EncodedFrame> {
+    // The MFT leaves the live set and stays in the graveyard count until it is released.
+    release_live_slot();
+    // end_stream already sent EOS and COMMAND_DRAIN. Do not flush, and do not pull samples
+    // just to drop them. A non-blocking read keeps a sample that arrived after the deadline.
+    let mut frames = std::mem::take(&mut parts.tail);
+    let late = take_queued_samples(&mut parts);
+    if !late.is_empty() {
+        log::warn!("{} late sample(s) arrived while retiring {}", late.len(), parts.name);
+        frames.extend(late);
+    }
+    HW_RETIRED.fetch_add(1, Ordering::Relaxed);
+    log::info!("delaying release of hardware encoder {} by {}s", parts.name, crate::safety::GRAVEYARD_DELAY.as_secs());
+    start_graveyard();
+    let sender = graveyard_slot().clone();
+    let buried = Buried { not_before: Instant::now() + crate::safety::GRAVEYARD_DELAY, parts };
+    match sender {
+        Some(tx) => {
+            if let Err(err) = tx.send(buried) {
+                log::error!(
+                    "graveyard thread is gone; leaking {} so this thread does not Release it",
+                    err.0.parts.name
+                );
+                std::mem::forget(err.0);
+            }
+        }
+        None => {
+            log::error!("no graveyard thread; leaking the hardware encoder instead of releasing it on this thread");
+            std::mem::forget(buried);
+        }
+    }
+    frames
+}
+
+fn graveyard_loop(rx: mpsc::Receiver<Buried>) {
+    let _com = crate::win::ComGuard::mta();
+    let mut pending = Vec::new();
+    loop {
+        let wait = pending
+            .iter()
+            .filter_map(|item: &Buried| item.not_before.checked_duration_since(Instant::now()))
+            .min()
+            .unwrap_or(crate::safety::GRAVEYARD_DELAY);
+        match rx.recv_timeout(wait.max(Duration::from_millis(50))) {
+            Ok(item) => pending.push(item),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // The sender is gone. Dropping these parts would Release them on this thread
+                // without the delay. Leak them; the process is already going away.
+                for item in pending.drain(..) {
+                    std::mem::forget(item);
+                }
+                return;
+            }
+        }
+        let now = Instant::now();
+        let mut i = 0;
+        while i < pending.len() {
+            if pending[i].not_before <= now {
+                let item = pending.swap_remove(i);
+                release_buried(item.parts);
+            } else {
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Runs only on the graveyard thread, after [`crate::safety::GRAVEYARD_DELAY`].
+fn release_buried(parts: NativeParts) {
+    log::info!("releasing hardware encoder {}", parts.name);
+    // Final method on the MFT. Nothing on `transform` after this.
+    if let Ok(shutdown) = parts.transform.cast::<IMFShutdown>() {
+        if let Err(err) = unsafe { shutdown.Shutdown() } {
+            log::warn!("IMFShutdown::Shutdown on {} failed: {err}", parts.name);
+        }
+    } else {
+        log::info!("{} has no IMFShutdown", parts.name);
+    }
+    // MFT interfaces first. The device manager and device drop with `parts` after this
+    // function returns, and they are the first fields so they are released last.
+    drop(parts.codec_api);
+    drop(parts.events);
+    drop(parts.transform);
+    if let Some(activate) = parts.activate {
+        unsafe {
+            let _ = activate.ShutdownObject();
+        }
+    }
+    drop(parts.manager);
+    drop(parts.device);
+    HW_SHUTDOWN.fetch_add(1, Ordering::Relaxed);
+}
+
+fn release_software(parts: NativeParts) {
+    // end_stream already collected the samples. Pulling again here used to drop the bytes.
+    unsafe {
+        let _ = parts.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
     }
 }
 
@@ -427,4 +1986,535 @@ fn read_nv12(
         gpu.context.Unmap(staging, 0);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fallback_after, HW_FAILURES_BEFORE_SOFTWARE};
+
+    #[test]
+    fn worker_shutdown_returns_without_holding_a_sender() {
+        let mut encoder =
+            super::host_on_worker(super::encoder_shell(crate::config::Codec::H264, "shutdown".into(), None));
+        let started = std::time::Instant::now();
+        let drained = encoder.shutdown();
+        assert!(drained.is_empty(), "shutdown with no input must not invent frames");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "worker shutdown deadlocked after {}ms",
+            started.elapsed().as_millis()
+        );
+        assert!(encoder.shutdown().is_empty());
+    }
+
+    #[test]
+    fn stalled_worker_returns_unacknowledged_inputs() {
+        super::set_native_call_limit_for_tests(std::time::Duration::from_millis(200));
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                super::set_native_call_limit_for_tests(crate::safety::NATIVE_CALL_LIMIT);
+            }
+        }
+        let _restore = Restore;
+        let mut encoder = super::host_on_worker(super::encoder_shell(crate::config::Codec::H264, "stall".into(), None));
+        encoder.inflight.push_back(super::HeldInput { texture: None, time: 10, duration: 1 });
+        encoder.inflight.push_back(super::HeldInput { texture: None, time: 20, duration: 1 });
+        encoder.inflight.push_back(super::HeldInput { texture: None, time: 30, duration: 1 });
+        let remote = encoder.remote.as_ref().expect("worker").tx.clone();
+        remote.send(super::Request::SeedOutput { time: 10 }).expect("seed");
+        let delivered = encoder.take_output().expect("seeded output");
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(encoder.inflight.iter().map(|frame| frame.time).collect::<Vec<_>>(), vec![20, 30]);
+        remote.send(super::Request::Stall).expect("stall");
+        let started = std::time::Instant::now();
+        let err = encoder.poll().expect_err("the stalled worker must time out");
+        assert!(matches!(err, super::EncoderFault::Stalled));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let pending = encoder.take_unacknowledged();
+        assert_eq!(pending.iter().map(|frame| frame.time).collect::<Vec<_>>(), vec![20, 30]);
+        // Shutdown of a poisoned worker must not join the stuck thread.
+        let started = std::time::Instant::now();
+        let drained = encoder.shutdown();
+        assert!(drained.is_empty(), "a poisoned shutdown must not drop samples that were still queued");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    }
+
+    #[test]
+    fn software_fallback_starts_after_repeated_hardware_failures() {
+        assert!(!fallback_after(0));
+        assert!(!fallback_after(HW_FAILURES_BEFORE_SOFTWARE - 1));
+        assert!(fallback_after(HW_FAILURES_BEFORE_SOFTWARE));
+        assert!(fallback_after(HW_FAILURES_BEFORE_SOFTWARE + 4));
+    }
+}
+
+/// Real Media Foundation encoder. `cargo test` skips these. Run them with
+/// `cargo test -- --ignored media_foundation` or `scripts/soak.ps1`.
+#[cfg(test)]
+mod media_foundation {
+    use super::VideoEncoder;
+    use crate::config::Codec;
+    use crate::win::ComGuard;
+    use qr_mp4::{annexb_to_sample, ParamSets, VideoCodec};
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use windows::Win32::Graphics::Direct3D11::{ID3D11Texture2D, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
+
+    fn nv12_texture(gpu: &super::super::gpu::Gpu, width: u32, height: u32) -> ID3D11Texture2D {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_NV12,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: 0,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut tex = None;
+        unsafe { gpu.device.CreateTexture2D(&desc, None, Some(&mut tex)) }.expect("NV12 texture");
+        tex.expect("NV12 texture")
+    }
+
+    fn settings(width: u32, height: u32, allow_hardware: bool) -> super::Settings {
+        super::Settings {
+            codec: Codec::H264,
+            width,
+            height,
+            fps: 30,
+            bitrate_kbps: 800,
+            fast_preset: true,
+            allow_hardware,
+        }
+    }
+
+    fn keep_shutdown_drain(
+        encoder: &mut VideoEncoder,
+        encoded: &mut Vec<super::EncodedFrame>,
+        pending: &mut VecDeque<super::HeldInput>,
+    ) {
+        let drained = encoder.shutdown();
+        let unacknowledged = encoder.take_unacknowledged();
+        let handoff =
+            crate::safety::handoff_after_busy_timeout(drained, unacknowledged, std::mem::take(pending), |input| {
+                input.time
+            });
+        if !handoff.drained.is_empty() {
+            eprintln!(
+                "shutdown drain kept {} frame(s) on the old encoder: {}",
+                handoff.drained.len(),
+                handoff.drained.iter().map(|frame| frame.time.to_string()).collect::<Vec<_>>().join(", ")
+            );
+        }
+        encoded.extend(handoff.drained);
+        *pending = handoff.pending;
+    }
+
+    fn replay_after_stall(
+        gpu: &super::super::gpu::Gpu,
+        encoder: &mut VideoEncoder,
+        encoded: &mut Vec<super::EncodedFrame>,
+        accepted: &mut Vec<i64>,
+        width: u32,
+        height: u32,
+        mut allow_hardware: bool,
+    ) {
+        let mut pending: VecDeque<super::HeldInput> = encoder.take_unacknowledged().into();
+        eprintln!(
+            "hardware encoder stalled during {}; re-encoding {} frame(s) [{}]",
+            super::last_stall_phase(),
+            pending.len(),
+            pending.iter().map(|frame| frame.time.to_string()).collect::<Vec<_>>().join(", ")
+        );
+        loop {
+            if encoder.is_poisoned() {
+                keep_shutdown_drain(encoder, encoded, &mut pending);
+                let hardware = allow_hardware && !super::prefer_software();
+                match VideoEncoder::new(gpu, &settings(width, height, hardware)) {
+                    Ok(next) => *encoder = next,
+                    Err(err) => {
+                        eprintln!("replacement encoder was not created ({err}); {} frames still queued", pending.len());
+                        *encoder = VideoEncoder::new(gpu, &settings(width, height, false)).unwrap_or_else(|err| {
+                            panic!("software encoder failed ({err}); queued {:?}", times_of(&pending))
+                        });
+                    }
+                }
+            }
+            let encoder_ptr = encoder as *mut VideoEncoder;
+            let result = crate::safety::replay_until_accepted(
+                &mut pending,
+                crate::safety::REPLAY_DEADLINE,
+                |input: &super::HeldInput, force_key| {
+                    let encoder = unsafe { &mut *encoder_ptr };
+                    let Some(texture) = input.texture.as_ref() else {
+                        return Err("recovery frame has no texture".to_string());
+                    };
+                    match encoder.submit(gpu, texture, input.time, input.duration, force_key) {
+                        Ok(true) => {
+                            if !accepted.contains(&input.time) {
+                                accepted.push(input.time);
+                            }
+                            Ok(true)
+                        }
+                        Ok(false) => Ok(false),
+                        Err(super::EncoderFault::Stalled) => Err("stall".into()),
+                        Err(err) => Err(err.to_string()),
+                    }
+                },
+                || {
+                    let encoder = unsafe { &mut *encoder_ptr };
+                    match encoder.poll() {
+                        Ok(()) => match encoder.take_output() {
+                            Ok(frames) => {
+                                let produced = !frames.is_empty();
+                                encoded.extend(frames);
+                                Ok(produced)
+                            }
+                            Err(super::EncoderFault::Stalled) => Err("stall".into()),
+                            Err(err) => Err(err.to_string()),
+                        },
+                        Err(super::EncoderFault::Stalled) => Err("stall".into()),
+                        Err(err) => Err(err.to_string()),
+                    }
+                },
+            );
+            match result {
+                Ok(()) => {
+                    super::note_recovery();
+                    return;
+                }
+                Err(crate::safety::ReplayStop::BusyTimeout) => {
+                    encoder.mark_broken();
+                    keep_shutdown_drain(encoder, encoded, &mut pending);
+                    eprintln!(
+                        "recovery made no progress for {}s at {width}x{height}; falling back to software, queued {:?}",
+                        crate::safety::REPLAY_DEADLINE.as_secs(),
+                        times_of(&pending)
+                    );
+                    if !allow_hardware {
+                        panic!("software recovery made no progress; queued {:?}", times_of(&pending));
+                    }
+                    *encoder = VideoEncoder::new(gpu, &settings(width, height, false)).unwrap_or_else(|err| {
+                        panic!("software encoder failed ({err}); queued {:?}", times_of(&pending))
+                    });
+                    allow_hardware = false;
+                }
+                Err(crate::safety::ReplayStop::Stopped(err)) if err == "stall" => {
+                    keep_shutdown_drain(encoder, encoded, &mut pending);
+                    eprintln!(
+                        "stall during recovery ({}); {} frames still queued",
+                        super::last_stall_phase(),
+                        pending.len()
+                    );
+                }
+                Err(crate::safety::ReplayStop::Stopped(err)) => {
+                    panic!("replay failed ({err}); queued {:?}", times_of(&pending))
+                }
+            }
+        }
+    }
+
+    fn times_of(pending: &VecDeque<super::HeldInput>) -> Vec<i64> {
+        pending.iter().map(|frame| frame.time).collect()
+    }
+
+    /// Encodes a short clip, writes an MP4, and checks the file parses.
+    /// `None` when hardware was requested and this PC has no hardware H.264 encoder.
+    fn encode_mp4(
+        gpu: &super::super::gpu::Gpu,
+        width: u32,
+        height: u32,
+        allow_hardware: bool,
+    ) -> Option<std::path::PathBuf> {
+        let mut encoder = VideoEncoder::new(gpu, &settings(width, height, allow_hardware)).expect("H.264 encoder");
+        if allow_hardware && !encoder.is_hardware() {
+            eprintln!("no hardware H.264 encoder ({}); skipping that path", encoder.name);
+            let drained = encoder.shutdown();
+            assert!(
+                drained.is_empty(),
+                "skipping hardware dropped {} frame(s): {:?}",
+                drained.len(),
+                drained.iter().map(|frame| frame.time).collect::<Vec<_>>()
+            );
+            return None;
+        }
+        let label = if encoder.is_hardware() { "hardware" } else { "software" };
+        let frame = nv12_texture(gpu, width, height);
+        let step = 10_000_000 / 30;
+        let mut encoded = Vec::new();
+        let mut accepted = Vec::new();
+        let mut stamp = 0i64;
+        for _ in 0..60 {
+            let force_key = accepted.is_empty();
+            match encoder.submit(gpu, &frame, stamp, step, force_key) {
+                Ok(true) => {
+                    accepted.push(stamp);
+                    stamp += step;
+                }
+                Ok(false) => {}
+                Err(super::EncoderFault::Stalled) => {
+                    replay_after_stall(gpu, &mut encoder, &mut encoded, &mut accepted, width, height, allow_hardware);
+                    stamp = accepted.last().copied().unwrap_or(-step) + step;
+                }
+                Err(err) => panic!("{label} encoder submit failed: {err}"),
+            }
+            if let Err(super::EncoderFault::Stalled) = encoder.poll() {
+                replay_after_stall(gpu, &mut encoder, &mut encoded, &mut accepted, width, height, allow_hardware);
+            }
+            match encoder.take_output() {
+                Ok(frames) => encoded.extend(frames),
+                Err(super::EncoderFault::Stalled) => {
+                    replay_after_stall(gpu, &mut encoder, &mut encoded, &mut accepted, width, height, allow_hardware);
+                }
+                Err(err) => panic!("{label} encoder output failed: {err}"),
+            }
+            if encoded.len() >= 8 && encoded.len() >= accepted.len() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Empty polls are not the end of an async drain. Shutdown collects until
+        // METransformDrainComplete (or the sync drain finishes) and returns those samples.
+        let tail = encoder.shutdown();
+        if !tail.is_empty() {
+            eprintln!(
+                "{label} drain delivered {} tail frame(s) at {width}x{height}: {}",
+                tail.len(),
+                tail.iter().map(|frame| frame.time.to_string()).collect::<Vec<_>>().join(", ")
+            );
+        }
+        encoded.extend(tail);
+        if encoder.has_unacknowledged() {
+            replay_after_stall(gpu, &mut encoder, &mut encoded, &mut accepted, width, height, allow_hardware);
+            encoded.extend(encoder.shutdown());
+        }
+        assert!(encoded.len() >= 8, "{label} encoder produced {} frames", encoded.len());
+        if encoded.len() != accepted.len() {
+            let output_times: Vec<i64> = encoded.iter().map(|frame| frame.time).collect();
+            let missing: Vec<i64> = accepted.iter().copied().filter(|time| !output_times.contains(time)).collect();
+            eprintln!("{label} {width}x{height}: accepted {accepted:?}");
+            eprintln!("{label} {width}x{height}: output {output_times:?}");
+            eprintln!("{label} {width}x{height}: missing {missing:?}");
+        }
+        assert_eq!(
+            encoded.len(),
+            accepted.len(),
+            "{label} {width}x{height} encoded {} frames but accepted {}; missing timestamps",
+            encoded.len(),
+            accepted.len()
+        );
+        for (index, frame) in encoded.iter().enumerate() {
+            assert_eq!(
+                frame.time, accepted[index],
+                "{label} timestamp gap at frame {index}: got {}, expected {}",
+                frame.time, accepted[index]
+            );
+        }
+
+        let mut params = ParamSets::default();
+        let mut packets = Vec::new();
+        for frame in &encoded {
+            let (sample, key) = annexb_to_sample(VideoCodec::H264, &frame.data, &mut params);
+            if !sample.is_empty() {
+                packets.push(super::super::Packet { time: frame.time, data: Arc::<[u8]>::from(sample), key });
+            }
+        }
+        assert!(params.is_complete(VideoCodec::H264), "{label} encoder produced no parameter sets");
+        assert!(packets.iter().any(|p| p.key), "{label} encoder produced no keyframe");
+        let format = super::super::VideoFormat::from_params(Codec::H264, width, height, &params).expect("sample entry");
+        let clip = super::super::buffer::Clip { video: packets, audio: Vec::new() };
+        let dir = std::env::temp_dir().join(format!("qr-mft-{}-{}", label, std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join(format!("{label}-{width}x{height}.mp4"));
+        super::super::writer::write_clip(&path, &clip, &format, None).expect("write mp4");
+        let parsed = qr_mp4::probe(&path).unwrap_or_else(|err| panic!("{label} mp4 did not parse: {err}"));
+        assert_eq!(parsed.codec, Some(VideoCodec::H264));
+        let samples = parsed.tracks.iter().map(|t| t.samples.len()).sum::<usize>();
+        assert!(samples > 0, "{label} mp4 has no samples");
+        let _ = std::fs::remove_file(&path);
+        Some(path)
+    }
+
+    fn gpu() -> super::super::gpu::Gpu {
+        super::super::mf::startup();
+        super::super::gpu::Gpu::new().expect("Direct3D 11")
+    }
+
+    #[test]
+    #[ignore = "needs Media Foundation and a D3D11 device; not run in CI"]
+    fn media_foundation_software_encoder_writes_mp4() {
+        let _com = ComGuard::mta();
+        let gpu = gpu();
+        encode_mp4(&gpu, 320, 240, false).expect("software encoder");
+    }
+
+    #[test]
+    #[ignore = "needs a hardware H.264 MFT; skipped at runtime when this PC has none"]
+    fn media_foundation_hardware_encoder_writes_mp4() {
+        let _com = ComGuard::mta();
+        let gpu = gpu();
+        if encode_mp4(&gpu, 640, 360, true).is_none() {
+            eprintln!("skipping: no hardware H.264 encoder on this PC");
+        }
+    }
+
+    /// Lets ignored tests choose a create gap, and puts the production gap and retire flag
+    /// back even if the test panics.
+    struct HardwarePolicy;
+    impl HardwarePolicy {
+        fn open() -> Self {
+            Self::with_gap(Duration::ZERO)
+        }
+
+        fn paced() -> Self {
+            Self::with_gap(Duration::from_secs(2))
+        }
+
+        fn with_gap(gap: Duration) -> Self {
+            super::set_hardware_create_gap_for_tests(gap);
+            Self
+        }
+    }
+    impl Drop for HardwarePolicy {
+        fn drop(&mut self) {
+            super::set_hardware_create_gap_for_tests(crate::safety::HARDWARE_CREATE_GAP);
+            super::set_force_retire_hardware_for_tests(false);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs Media Foundation and a D3D11 device; not run in CI"]
+    fn media_foundation_encoder_restarts() {
+        let _com = ComGuard::mta();
+        let _policy = HardwarePolicy::open();
+        let gpu = gpu();
+        let mut hardware = encode_mp4(&gpu, 640, 360, true).is_some();
+        if hardware {
+            let before = super::encoder_counters();
+            encode_mp4(&gpu, 640, 360, true).expect("reused hardware encoder");
+            let after = super::encoder_counters();
+            assert!(after.reused > before.reused, "second session did not reuse the hardware encoder: {after:?}");
+            assert_eq!(after.created, before.created, "second session created a new hardware MFT: {after:?}");
+        }
+        for i in 0u32..4 {
+            let (width, height) = if i.is_multiple_of(2) { (320, 240) } else { (640, 360) };
+            if i.is_multiple_of(2) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            encode_mp4(&gpu, width, height, false).expect("software encoder");
+            if hardware {
+                let (width, height) = if i.is_multiple_of(2) { (640, 360) } else { (1280, 720) };
+                hardware = encode_mp4(&gpu, width, height, true).is_some();
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a hardware H.264 MFT; waits out the graveyard delay"]
+    fn media_foundation_graveyard_releases_hardware_encoder() {
+        let _com = ComGuard::mta();
+        let _policy = HardwarePolicy::open();
+        super::start_graveyard();
+        super::set_force_retire_hardware_for_tests(true);
+        let gpu = gpu();
+        let before = super::encoder_counters();
+        if encode_mp4(&gpu, 640, 360, true).is_none() {
+            eprintln!("skipping: no hardware H.264 encoder on this PC");
+            return;
+        }
+        let retired = super::encoder_counters();
+        assert!(retired.retired > before.retired, "forced retirement did not bury the encoder: {retired:?}");
+        let wait = crate::safety::GRAVEYARD_DELAY + Duration::from_secs(4);
+        assert!(
+            super::wait_for_graveyard_shutdown(wait),
+            "graveyard did not finish releasing the encoder: {:?}",
+            super::encoder_counters()
+        );
+    }
+
+    #[test]
+    #[ignore = "timed soak; set QUICKREPLAY_SOAK_SECS and run scripts/soak.ps1"]
+    fn soak_media_foundation_encoder() {
+        let _com = ComGuard::mta();
+        // One new hardware MFT at most every 2s. Most iterations reuse a parked session.
+        let _policy = HardwarePolicy::paced();
+        let seconds: u64 = std::env::var("QUICKREPLAY_SOAK_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+        let gpu = gpu();
+        let hardware = encode_mp4(&gpu, 1280, 720, true).is_some();
+        eprintln!("soak encoders: software{}", if hardware { " + hardware" } else { " only (no hardware MFT)" });
+        // The steady size is reused. Every 8th session switches format. A fifth distinct
+        // size is past the session budget, so that one retires a parked encoder and waits
+        // for the graveyard instead of creating an extra NVENC session.
+        let steady = (1280u32, 720u32);
+        let formats = [(640u32, 360u32), (1280, 720), (960, 540), (320, 240), (800, 600)];
+        let started = std::time::Instant::now();
+        let mut i = 0u64;
+        let mut hardware_turn = 0u64;
+        let mut hardware_sessions = 0u64;
+        let mut software_sessions = 0u64;
+        while started.elapsed().as_secs() < seconds {
+            if i.is_multiple_of(6) {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            let allow_hardware = hardware && !i.is_multiple_of(5);
+            if allow_hardware {
+                let (width, height) = match crate::safety::soak_hardware_format(hardware_turn, formats.len() as u64) {
+                    Some(index) => formats[index as usize],
+                    None => steady,
+                };
+                hardware_turn += 1;
+                if encode_mp4(&gpu, width, height, true).is_some() {
+                    hardware_sessions += 1;
+                } else {
+                    encode_mp4(&gpu, width, height, false).expect("software encoder");
+                    software_sessions += 1;
+                }
+            } else {
+                encode_mp4(&gpu, steady.0, steady.1, false).expect("software encoder");
+                software_sessions += 1;
+            }
+            i += 1;
+            if i.is_multiple_of(10) {
+                let counters = super::encoder_counters();
+                let (stalls, recoveries) = super::stall_counters();
+                eprintln!(
+                    "soak: {i} sessions in {:.1}s (hardware {hardware_sessions}, software {software_sessions}; mf created {}, reused {}, retired {}, shut down {}; stalls {stalls}, recoveries {recoveries}, last stall {})",
+                    started.elapsed().as_secs_f64(),
+                    counters.created,
+                    counters.reused,
+                    counters.retired,
+                    counters.shut_down,
+                    super::last_stall_phase()
+                );
+            }
+        }
+        super::shutdown_pooled_encoders();
+        assert!(
+            super::finish_pending_retirements(),
+            "graveyard left encoders pending at exit: {:?}",
+            super::encoder_counters()
+        );
+        let counters = super::encoder_counters();
+        let (stalls, recoveries) = super::stall_counters();
+        eprintln!(
+            "soak done: {i} sessions in {:.1}s (hardware {hardware_sessions}, software {software_sessions}; mf created {}, reused {}, retired {}, shut down {}; stalls {stalls}, recoveries {recoveries}, last stall {})",
+            started.elapsed().as_secs_f64(),
+            counters.created,
+            counters.reused,
+            counters.retired,
+            counters.shut_down,
+            super::last_stall_phase()
+        );
+        assert!(counters.shut_down >= counters.retired, "retirements still pending at exit: {counters:?}");
+        assert!(i > 0, "soak produced no encoder sessions");
+        if hardware {
+            assert!(hardware_sessions > software_sessions, "soak did not keep hardware as the common path");
+            assert!(counters.retired > 0, "soak never retired a hardware encoder");
+        }
+    }
 }

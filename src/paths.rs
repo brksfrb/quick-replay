@@ -60,6 +60,11 @@ pub fn log_path() -> PathBuf {
     data_dir().join("quickreplay.log")
 }
 
+/// Last replay buffer written to disk, so a process crash can still be turned into a file.
+pub fn checkpoint_path() -> PathBuf {
+    data_dir().join("replay-checkpoint.mp4")
+}
+
 pub fn install_dir() -> PathBuf {
     local_app_data().join("Programs").join(APP_NAME)
 }

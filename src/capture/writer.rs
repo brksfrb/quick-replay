@@ -51,6 +51,23 @@ fn part_path(path: &Path) -> PathBuf {
 }
 
 fn save_clip(path: &Path, clip: &Clip, video: &VideoFormat, audio: Option<&[u8]>) -> std::io::Result<f64> {
+    let part = part_path(path);
+    let seconds = write_clip_to(&part, clip, video, audio)?;
+    if let Err(err) = crate::persist::replace_file(&part, path) {
+        let _ = std::fs::remove_file(&part);
+        return Err(err);
+    }
+    Ok(seconds)
+}
+
+/// Writes a finished clip to `part` and fsyncs it. Does not publish `part` over a destination,
+/// so callers can give every attempt its own file name.
+pub(crate) fn write_clip_to(
+    part: &Path,
+    clip: &Clip,
+    video: &VideoFormat,
+    audio: Option<&[u8]>,
+) -> std::io::Result<f64> {
     let start = clip.video.first().ok_or_else(|| std::io::Error::other("empty clip"))?.time;
     let video_samples = clip
         .video
@@ -71,26 +88,29 @@ fn save_clip(path: &Path, clip: &Clip, video: &VideoFormat, audio: Option<&[u8]>
             .collect();
         tracks.push((audio_track(entry, offset), samples));
     }
-    if let Some(dir) = path.parent() {
+    if let Some(dir) = part.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let part = part_path(path);
-    let mut out = BufWriter::with_capacity(WRITE_BUFFER, File::create(&part)?);
+    let mut out = BufWriter::with_capacity(WRITE_BUFFER, File::create(part)?);
     let written = qr_mp4::write_faststart(&mut out, &tracks, |track, index, buf| {
         let packet = if track == 0 { &clip.video[index] } else { &clip.audio[index] };
         buf.clear();
         buf.extend_from_slice(&packet.data);
         Ok(())
     })
-    .and_then(|()| out.flush());
+    .and_then(|()| out.flush())
+    .and_then(|()| out.get_ref().sync_data());
     drop(out);
     if let Err(err) = written {
-        let _ = std::fs::remove_file(&part);
+        let _ = std::fs::remove_file(part);
         return Err(err);
     }
-    std::fs::rename(&part, path)?;
     let last = clip.video.last().map_or(start, |p| p.time);
     Ok((last - start) as f64 / HNS_PER_SEC as f64)
+}
+
+pub fn write_clip(path: &Path, clip: &Clip, video: &VideoFormat, audio: Option<&[u8]>) -> std::io::Result<f64> {
+    save_clip(path, clip, video, audio)
 }
 
 /// Writes the clip on its own thread; the handle lets shutdown wait for the file to be complete.
@@ -229,7 +249,9 @@ impl Recording {
         let mut file = writer.finish()?;
         file.flush()?;
         file.inner.get_ref().sync_data()?;
-        std::fs::rename(part_path(&self.path), &self.path)?;
+        let part = part_path(&self.path);
+        drop(file);
+        crate::persist::replace_file(&part, &self.path)?;
         Ok((self.last_video - self.start) as f64 / HNS_PER_SEC as f64)
     }
 }

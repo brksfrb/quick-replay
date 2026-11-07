@@ -36,6 +36,8 @@ pub struct General {
     pub name_after_app: bool,
     /// Download and install new versions from GitHub on its own.
     pub auto_update: bool,
+    /// Start again if the process is killed by a crash.
+    pub restart_on_crash: bool,
     /// Open the window maximized instead of centered.
     pub open_maximized: bool,
     /// One folder per game or app inside the video folder.
@@ -50,6 +52,7 @@ impl Default for General {
             copy_to_clipboard: false,
             name_after_app: true,
             auto_update: true,
+            restart_on_crash: true,
             open_maximized: false,
             organize_by_app: true,
         }
@@ -386,12 +389,7 @@ impl Config {
     /// Writes atomically (temp file + rename) so a crash never leaves a half-written config.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let text = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, text)?;
-        std::fs::rename(&tmp, path)
+        crate::persist::write_atomic(path, text.as_bytes())
     }
 
     /// True when a change needs the capture pipeline to restart.
@@ -417,6 +415,7 @@ mod tests {
         let config: Config = toml::from_str("[video]\nfps = 30\n").unwrap();
         assert_eq!(config.video.fps, 30);
         assert_eq!(config.replay, Replay::default());
+        assert!(config.general.restart_on_crash);
     }
 
     #[test]

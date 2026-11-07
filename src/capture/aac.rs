@@ -88,6 +88,19 @@ impl AacEncoder {
     }
 }
 
+impl Drop for AacEncoder {
+    fn drop(&mut self) {
+        // The audio thread is the only caller. Tell the MFT to drop any sample it still holds
+        // before this interface is released.
+        unsafe {
+            let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+            let _ = self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+            let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+            let _ = self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::bytes_per_second;

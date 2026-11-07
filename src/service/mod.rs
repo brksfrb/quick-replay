@@ -5,15 +5,18 @@ mod files;
 mod overlay;
 mod tray;
 
-use crate::capture::{Event, EventSink, Pipeline};
+use crate::capture::{Event, EventSink, Pipeline, PreservedReplay};
 use crate::config::Config;
 use crate::ipc::{self, Command, Status};
+use crate::safety::{self, wake_schedule, WakeSchedule};
 use crate::win::{clipboard, monitors, wide, ComGuard};
 use crate::{install, paths};
 use overlay::{Glyph, Overlay, Placement, Toast};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tray::{MenuItem, Tray, WM_TRAY};
 use windows::core::PCWSTR;
@@ -47,6 +50,12 @@ const TIMER_CLEANUP: usize = 4;
 const TIMER_TRIM: usize = 5;
 const TIMER_UPDATE: usize = 6;
 const TIMER_RESUME: usize = 7;
+const TIMER_WATCHDOG: usize = 8;
+const TIMER_CHECKPOINT: usize = 9;
+/// How often the service checks that the capture thread is still making progress.
+const WATCHDOG_TICK_MS: u32 = 2_000;
+/// How often the in-memory replay buffer is copied to disk so a process crash can still be saved.
+const CHECKPOINT_MS: u32 = 20_000;
 /// After waking from sleep, give the display and GPU time to come back before capturing again.
 const RESUME_DELAY_MS: u32 = 5_000;
 /// First update check a minute after start (not during login rush), then every 6 hours.
@@ -82,6 +91,14 @@ thread_local! {
     static SERVICE: RefCell<Option<Service>> = const { RefCell::new(None) };
 }
 
+/// True when a pipeline was started at or after the wake that asked for a restart.
+fn started_after_wake(started: Option<Instant>, woke: Option<Instant>) -> bool {
+    match (started, woke) {
+        (Some(started), Some(woke)) => started >= woke,
+        _ => false,
+    }
+}
+
 struct Service {
     hwnd: HWND,
     config: Config,
@@ -99,6 +116,11 @@ struct Service {
     display_off_since: Option<Instant>,
     /// When the PC last woke up (sleep, monitor or unlock): capture may need a few tries then.
     woke_at: Option<Instant>,
+    /// A wake restart is waiting on TIMER_RESUME. Further wake events only push that timer.
+    wake_restart_pending: bool,
+    /// Stop+start is on the stack. A nested request is stored in `restart_again` and run after.
+    restart_in_progress: bool,
+    restart_again: bool,
     failure_notified: bool,
     /// An update that waits for the current recording to end.
     pending_update: Option<(String, PathBuf)>,
@@ -110,6 +132,12 @@ struct Service {
     restart_after_recording: bool,
     failure: Option<String>,
     restart_delay_secs: u32,
+    /// Replay buffer taken from the pipeline that just stopped, waiting for the next start.
+    preserved: Option<PreservedReplay>,
+    /// Set on quit so an in-flight checkpoint doesn't publish a file after a normal exit.
+    checkpoint_cancel: Arc<AtomicBool>,
+    /// The rolling checkpoint path still holds crash evidence we could not move aside.
+    checkpoint_blocked: bool,
     taskbar_created: u32,
 }
 
@@ -300,7 +328,13 @@ impl Service {
             return true;
         }
         self.pipeline_generation += 1;
-        match Pipeline::start(&self.config, self.buffer_seconds(), self.events.clone(), self.pipeline_generation) {
+        match Pipeline::start(
+            &self.config,
+            self.buffer_seconds(),
+            self.events.clone(),
+            self.pipeline_generation,
+            self.preserved.as_ref(),
+        ) {
             Ok(pipeline) => {
                 let i = &pipeline.info;
                 log::info!("capturing {}x{} {:?} via {} (audio: {})", i.width, i.height, i.codec, i.encoder, i.audio);
@@ -308,6 +342,7 @@ impl Service {
                     self.notify(Glyph::Warning, "Using H.264 instead", "This PC has no hardware HEVC encoder");
                 }
                 self.pipeline = Some(pipeline);
+                self.preserved = None;
                 self.pipeline_started = Some(Instant::now());
                 unsafe { SetTimer(Some(self.hwnd), TIMER_TRIM, FIRST_TRIM_MS, None) };
                 self.failure = None;
@@ -322,7 +357,15 @@ impl Service {
     }
 
     fn stop_pipeline(&mut self) {
-        self.pipeline = None;
+        // Joins the capture threads (or gives up if one is stuck inside the encoder) and keeps
+        // the replay buffer for the next start.
+        if let Some(pipeline) = self.pipeline.take() {
+            let kept = pipeline.stop_and_take();
+            if let Some(replay) = &kept {
+                log::info!("kept {:.1}s of replay buffer across the capture restart", replay.seconds());
+            }
+            self.preserved = kept;
+        }
         self.pipeline_started = None;
     }
 
@@ -331,17 +374,55 @@ impl Service {
             self.restart_after_recording = true;
             return;
         }
-        self.stop_pipeline();
-        if self.buffer_enabled {
-            self.start_pipeline();
+        if self.restart_in_progress {
+            self.restart_again = true;
+            return;
         }
+        self.restart_in_progress = true;
+        loop {
+            self.restart_again = false;
+            // This call is the one restart. A wake timer must not start a second stop/start
+            // as soon as the message loop runs again.
+            self.wake_restart_pending = false;
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), TIMER_RESUME);
+            }
+            self.stop_pipeline();
+            if self.buffer_enabled {
+                self.start_pipeline();
+            } else {
+                self.preserved = None;
+            }
+            if !self.restart_again {
+                break;
+            }
+            log::info!("running the capture restart that arrived while the previous one was still stopping");
+        }
+        self.restart_in_progress = false;
     }
 
     /// After the PC woke up (sleep, monitor or unlock): start a fresh capture once the display is back.
+    /// Resume, monitor-on and unlock often arrive as a burst; they share one delayed restart.
     fn schedule_wake_restart(&mut self) {
-        log::info!("the PC woke up: restarting the screen capture in {} s", RESUME_DELAY_MS / 1000);
         self.woke_at = Some(Instant::now());
-        unsafe { SetTimer(Some(self.hwnd), TIMER_RESUME, RESUME_DELAY_MS, None) };
+        match wake_schedule(self.restart_in_progress, self.wake_restart_pending) {
+            WakeSchedule::Defer => {
+                self.restart_again = true;
+                log::info!("wake during a capture restart; it will run again once the encoder is released");
+            }
+            WakeSchedule::Coalesce => {
+                log::info!(
+                    "another wake event; keeping a single capture restart {} s from now",
+                    RESUME_DELAY_MS / 1000
+                );
+                unsafe { SetTimer(Some(self.hwnd), TIMER_RESUME, RESUME_DELAY_MS, None) };
+            }
+            WakeSchedule::Arm => {
+                log::info!("the PC woke up: restarting the screen capture in {} s", RESUME_DELAY_MS / 1000);
+                self.wake_restart_pending = true;
+                unsafe { SetTimer(Some(self.hwnd), TIMER_RESUME, RESUME_DELAY_MS, None) };
+            }
+        }
     }
 
     fn pipeline_failed(&mut self, message: String) {
@@ -387,10 +468,12 @@ impl Service {
             }
             self.hide_badge();
             if !self.buffer_enabled || self.restart_after_recording {
+                let restart = self.buffer_enabled;
                 self.restart_after_recording = false;
-                self.stop_pipeline();
-                if self.buffer_enabled {
-                    self.start_pipeline();
+                if restart {
+                    self.restart_pipeline();
+                } else {
+                    self.stop_pipeline();
                 }
             }
             if let Some((version, path)) = self.pending_update.take() {
@@ -603,12 +686,17 @@ impl Service {
                                 "The screen capture was lost; what was recorded is saved",
                             );
                         }
-                        self.stop_pipeline();
-                        if self.buffer_enabled {
-                            self.start_pipeline();
-                        }
+                        self.restart_pipeline();
                         self.update_tray();
                     }
+                }
+                Event::BufferRecovered { path, seconds } => {
+                    log::info!("replay buffer saved after an encoder change: {}", path.display());
+                    self.saved(
+                        &path,
+                        "Replay buffer saved",
+                        format!("Encoder restarted · {}", format_duration(seconds)),
+                    );
                 }
                 Event::PipelineFailed { generation, message } => {
                     if generation == self.pipeline_generation && self.pipeline.is_some() {
@@ -645,7 +733,11 @@ impl Service {
                 unsafe {
                     let _ = KillTimer(Some(self.hwnd), TIMER_RESUME);
                 }
-                if self.recording_since.is_none() {
+                self.wake_restart_pending = false;
+                if started_after_wake(self.pipeline_started, self.woke_at) {
+                    // A failure retry (or another restart) already built a capture after this wake.
+                    log::info!("screen capture already restarted after this wake");
+                } else if self.recording_since.is_none() {
                     self.restart_pipeline();
                 }
             }
@@ -662,7 +754,54 @@ impl Service {
                 }
                 trim_working_set();
             }
+            TIMER_WATCHDOG => self.watchdog(),
+            TIMER_CHECKPOINT => self.checkpoint_buffer(),
             _ => {}
+        }
+    }
+
+    /// The capture thread updates a heartbeat every frame. If that stops, the encoder or the
+    /// capture call is stuck and the thread's own error path will never run.
+    fn watchdog(&mut self) {
+        if self.restart_in_progress {
+            return;
+        }
+        let Some(pipeline) = &self.pipeline else {
+            return;
+        };
+        let last = pipeline.last_heartbeat_ms();
+        let running_long_enough = self.pipeline_started.is_some_and(|t| t.elapsed() > safety::WATCHDOG_LIMIT);
+        if !running_long_enough || !safety::watchdog_due(last, safety::now_ms(), safety::WATCHDOG_LIMIT) {
+            return;
+        }
+        let age_s = safety::now_ms().saturating_sub(last) as f64 / 1000.0;
+        log::warn!("capture watchdog: no progress for {age_s:.1}s, restarting");
+        if self.recording_since.take().is_some() {
+            self.hide_badge();
+            self.notify(
+                Glyph::Warning,
+                "Recording stopped",
+                "The encoder stopped responding; what was recorded is saved",
+            );
+        }
+        self.restart_pipeline();
+        self.update_tray();
+    }
+
+    fn checkpoint_buffer(&mut self) {
+        for path in files::retry_pending_checkpoints(&self.config) {
+            self.notify_video("Replay recovered", "Saved before QuickReplay stopped", &path);
+        }
+        if self.checkpoint_blocked {
+            let _ = files::publish_checkpoint(&self.config);
+            self.checkpoint_blocked = files::live_checkpoint_blocked();
+            if self.checkpoint_blocked {
+                log::warn!("not writing a new checkpoint over the unpublished crash file");
+                return;
+            }
+        }
+        if let Some(pipeline) = &self.pipeline {
+            pipeline.checkpoint(paths::checkpoint_path(), &self.checkpoint_cancel);
         }
     }
 
@@ -706,8 +845,22 @@ impl Service {
                 pipeline.stop_recording();
             }
         }
-        // Dropping the pipeline waits for recordings to finish writing.
+        // A normal quit doesn't need the rolling checkpoint. A file we could not publish is
+        // unrecovered evidence: leave it so the next start can park and retry it.
+        self.checkpoint_cancel.store(true, Ordering::Relaxed);
         self.stop_pipeline();
+        self.preserved = None;
+        if safety::keep_blocked_checkpoint(self.checkpoint_blocked) {
+            log::warn!("keeping unpublished replay checkpoint {}", paths::checkpoint_path().display());
+        } else {
+            let _ = std::fs::remove_file(paths::checkpoint_path());
+        }
+        // `static` pools are not dropped at exit. Move parked MFTs to the graveyard thread
+        // and wait out its delay so a retirement still pending is released before we exit.
+        crate::capture::encoder::shutdown_pooled_encoders();
+        if !crate::capture::encoder::finish_pending_retirements() {
+            log::warn!("some hardware encoders were still in the graveyard at quit");
+        }
         unsafe { PostQuitMessage(0) };
     }
 
@@ -885,6 +1038,7 @@ pub fn run(mode: StartMode) {
         return;
     };
     crate::update::cleanup();
+    crate::capture::encoder::start_graveyard();
     let _com = ComGuard::sta();
     log::info!("QuickReplay {} starting ({})", env!("CARGO_PKG_VERSION"), paths::current_exe().display());
     let config = load_config();
@@ -945,6 +1099,9 @@ pub fn run(mode: StartMode) {
         opengl_front: false,
         display_off_since: None,
         woke_at: None,
+        wake_restart_pending: false,
+        restart_in_progress: false,
+        restart_again: false,
         failure_notified: false,
         pending_update: None,
         update_running: false,
@@ -955,6 +1112,9 @@ pub fn run(mode: StartMode) {
         restart_after_recording: false,
         failure: None,
         restart_delay_secs: 0,
+        preserved: None,
+        checkpoint_cancel: Arc::new(AtomicBool::new(false)),
+        checkpoint_blocked: false,
         taskbar_created,
     };
     SERVICE.with(|cell| *cell.borrow_mut() = Some(service));
@@ -976,6 +1136,12 @@ pub fn run(mode: StartMode) {
             files::enforce_limits(&paths::video_dir(&s.config), &s.config.storage);
             unsafe { SetTimer(Some(hwnd), TIMER_CLEANUP, CLEANUP_MS, None) };
             unsafe { SetTimer(Some(hwnd), TIMER_UPDATE, FIRST_UPDATE_MS, None) };
+            unsafe { SetTimer(Some(hwnd), TIMER_WATCHDOG, WATCHDOG_TICK_MS, None) };
+            unsafe { SetTimer(Some(hwnd), TIMER_CHECKPOINT, CHECKPOINT_MS, None) };
+            for path in files::publish_checkpoint(&s.config) {
+                s.notify_video("Replay recovered", "Saved before QuickReplay stopped", &path);
+            }
+            s.checkpoint_blocked = files::live_checkpoint_blocked();
             if mode.updated {
                 s.notify(Glyph::Check, "QuickReplay updated", &format!("Now on version {}", env!("CARGO_PKG_VERSION")));
             }
@@ -1004,4 +1170,21 @@ pub fn run(mode: StartMode) {
         let _ = DestroyWindow(hwnd);
     }
     log::info!("QuickReplay stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::started_after_wake;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_capture_started_after_wake_is_not_restarted_again() {
+        let woke = Instant::now();
+        let earlier = woke.checked_sub(Duration::from_secs(5)).unwrap();
+        assert!(!started_after_wake(Some(earlier), Some(woke)));
+        assert!(started_after_wake(Some(woke), Some(woke)));
+        assert!(started_after_wake(Some(woke + Duration::from_secs(1)), Some(woke)));
+        assert!(!started_after_wake(None, Some(woke)));
+        assert!(!started_after_wake(Some(woke), None));
+    }
 }

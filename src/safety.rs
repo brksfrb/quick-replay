@@ -1,0 +1,761 @@
+//! Decisions the capture pipeline and the crash supervisor share.
+//! No Windows types, so the stress test runs on any platform.
+
+use std::collections::VecDeque;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// No progress from the capture thread for this long means it is wedged.
+pub const WATCHDOG_LIMIT: Duration = Duration::from_secs(8);
+/// How long a restart waits for the capture threads before leaving a stuck encoder to release itself.
+pub const JOIN_LIMIT: Duration = Duration::from_secs(3);
+/// NVIDIA's Media Foundation encoder queues work on `RTWorkQ` that can run after
+/// `METransformDrainComplete`. The MFT, its event generator, and the D3D device stay
+/// referenced at least this long, and are released only on a background thread.
+pub const GRAVEYARD_DELAY: Duration = Duration::from_secs(8);
+/// Minimum gap between *new* hardware encoder objects. Reusing one does not count.
+pub const HARDWARE_CREATE_GAP: Duration = Duration::from_secs(3);
+/// A hardware `ProcessInput` / `ProcessOutput` that runs longer than this has stalled in the driver.
+/// The caller stops waiting. The call and its thread are abandoned, not released.
+pub const NATIVE_CALL_LIMIT: Duration = Duration::from_secs(3);
+/// Reuse the same MFT only this many times. Thousands of reuses of one NVIDIA session have stalled the driver.
+pub const ENCODER_REUSE_SESSIONS: u32 = 50;
+/// Reuse the same MFT only this long, even if it has been used less often.
+pub const ENCODER_REUSE_AGE: Duration = Duration::from_secs(10 * 60);
+/// Parked, in-use, and not-yet-released graveyard encoders all hold an NVENC session.
+/// Consumer GeForce drivers reject new sessions past a small cap (8 on current drivers).
+/// Staying at 4 leaves room for the one being started while others are still draining.
+pub const HARDWARE_SESSION_BUDGET: u64 = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WakeSchedule {
+    /// First wake event in a burst: arm the delayed restart.
+    Arm,
+    /// Another wake event before that restart runs: keep a single timer and push its deadline.
+    Coalesce,
+    /// Stop/start is already running.
+    Defer,
+}
+
+pub fn wake_schedule(restart_in_progress: bool, pending: bool) -> WakeSchedule {
+    if restart_in_progress {
+        WakeSchedule::Defer
+    } else if pending {
+        WakeSchedule::Coalesce
+    } else {
+        WakeSchedule::Arm
+    }
+}
+
+/// Milliseconds since the Unix epoch. The capture thread and the watchdog share this clock.
+pub fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+pub fn watchdog_due(last_beat_ms: u64, now_ms: u64, limit: Duration) -> bool {
+    now_ms.saturating_sub(last_beat_ms) > limit.as_millis() as u64
+}
+
+/// Codec parameters of the frames currently in the replay buffer.
+#[derive(Clone, Copy)]
+pub struct Encoding<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub sample_entry: &'a [u8],
+}
+
+/// True when new encoder output can be appended to frames already in the buffer.
+pub fn same_encoding(old: Encoding<'_>, new: Encoding<'_>) -> bool {
+    old.width == new.width && old.height == new.height && old.sample_entry == new.sample_entry
+}
+
+/// Backoff after a child that died immediately, so a startup crash doesn't spin.
+pub fn restart_backoff(fast_failures: u32) -> Duration {
+    Duration::from_secs(1u64.checked_shl(fast_failures.min(6)).unwrap_or(64).min(60))
+}
+
+/// The supervisor starts the app again only after an unexpected exit.
+pub fn should_restart_process(clean_exit: bool, enabled: bool) -> bool {
+    enabled && !clean_exit
+}
+
+/// What an encoder worker can report while it is shutting down.
+///
+/// An empty queue is not completion. Async hardware encoders finish by posting
+/// `METransformDrainComplete`. Synchronous ones finish by returning "need more input"
+/// after a drain. A driver that never sends either signal is the only case where a
+/// timeout is used, and that path must not pretend the worker is idle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainKind {
+    Output,
+    /// The event queue had nothing in it. The worker has not said it is done.
+    Quiet,
+    DrainComplete,
+    NeedMoreInput,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerSignal {
+    StillWorking,
+    Finished,
+    Failed,
+}
+
+pub fn worker_signal(kind: DrainKind) -> WorkerSignal {
+    match kind {
+        DrainKind::Output | DrainKind::Quiet => WorkerSignal::StillWorking,
+        DrainKind::DrainComplete | DrainKind::NeedMoreInput => WorkerSignal::Finished,
+        DrainKind::Error => WorkerSignal::Failed,
+    }
+}
+
+/// Run `write` while `clip` is still owned. The frames are dropped only after `Ok`.
+pub fn release_after_write<T, E>(clip: T, write: impl FnOnce(&T) -> Result<(), E>) -> Result<(), (T, E)> {
+    match write(&clip) {
+        Ok(()) => Ok(()),
+        Err(err) => Err((clip, err)),
+    }
+}
+
+/// A brand-new hardware MFT, not a reused one. Bursts of wake/monitor restarts must not
+/// construct dozens of NVIDIA sessions.
+pub fn hardware_create_allowed(last: Option<std::time::Instant>, now: std::time::Instant, gap: Duration) -> bool {
+    match last {
+        Some(previous) => now.saturating_duration_since(previous) >= gap,
+        None => true,
+    }
+}
+
+/// A new hardware MFT is allowed only while parked, in-use, and graveyard sessions are under the cap.
+pub fn hardware_slot_free(live: u64, graveyard_pending: u64, budget: u64) -> bool {
+    live.saturating_add(graveyard_pending) < budget
+}
+
+/// Parked sessions are retired once they have been reused too many times or for too long.
+pub fn retire_reused_encoder(sessions: u32, age: Duration) -> bool {
+    sessions >= ENCODER_REUSE_SESSIONS || age >= ENCODER_REUSE_AGE
+}
+
+/// `None` keeps the steady resolution. Format changes are counted in hardware iterations only,
+/// so a size is not requested solely on the software turns (every 5th soak session).
+#[cfg(test)]
+pub fn soak_hardware_format(hardware_turn: u64, format_count: u64) -> Option<u64> {
+    if format_count == 0 || !hardware_turn.is_multiple_of(8) {
+        return None;
+    }
+    Some((hardware_turn / 8) % format_count)
+}
+
+/// Run `work` on another thread. If it misses `limit`, the thread is leaked and this returns
+/// [`CallResult::Stalled`]. Joining would wait for the stuck call, which is what freezes capture.
+#[cfg(test)]
+pub fn call_with_deadline<T: Send + 'static>(
+    limit: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> CallResult<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let value = work();
+        let _ = tx.send(value);
+    });
+    match rx.recv_timeout(limit) {
+        Ok(value) => {
+            let _ = handle.join();
+            CallResult::Done(value)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            std::mem::forget(handle);
+            CallResult::Stalled
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = handle.join();
+            CallResult::Stalled
+        }
+    }
+}
+
+#[derive(Debug)]
+#[cfg(test)]
+pub enum CallResult<T> {
+    Done(T),
+    Stalled,
+}
+
+/// Encode `frames`. When the encoder blocks, abandon it, keep what was already encoded, and
+/// re-encode the current frame on a fresh encoder that does not block.
+#[cfg(test)]
+pub fn capture_through_stall(frames: &[u32], stall_at: Option<u32>) -> Vec<u32> {
+    let mut encoded = Vec::new();
+    let mut block_next = false;
+    for &frame in frames {
+        if stall_at == Some(frame) {
+            block_next = true;
+        }
+        let block = block_next;
+        block_next = false;
+        match call_with_deadline(Duration::from_millis(200), move || {
+            if block {
+                // Park, don't spin. The thread is leaked when the deadline wins.
+                loop {
+                    std::thread::park();
+                }
+            }
+            frame
+        }) {
+            CallResult::Done(value) => encoded.push(value),
+            CallResult::Stalled => {
+                let retry = call_with_deadline(Duration::from_millis(200), move || frame);
+                if let CallResult::Done(value) = retry {
+                    encoded.push(value);
+                }
+            }
+        }
+    }
+    encoded
+}
+
+/// Why [`replay_until_accepted`] stopped before the queue was empty.
+#[derive(Debug)]
+pub enum ReplayStop<E> {
+    /// `Ok(false)` kept coming back and `service_output` produced nothing until `deadline`.
+    BusyTimeout,
+    Stopped(E),
+}
+
+/// How long a replay may sit on `Ok(false)` with empty polls before it gives up on that encoder.
+/// The clock starts over when a frame is accepted or a sample comes out.
+pub const REPLAY_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Submit every queued input. `Ok(false)` means the encoder did not accept the frame:
+/// the same item stays at the front, `service_output` runs, and the call retries.
+/// Backs off while polls stay empty so a stuck encoder cannot spin forever.
+/// `deadline` is how long that empty stretch may last. Accepting a frame or pulling a
+/// sample starts it over, so a long queue that is making progress is not cut off.
+/// [`ReplayStop::BusyTimeout`] and [`ReplayStop::Stopped`] both leave the unaccepted tail in `pending`.
+pub fn replay_until_accepted<T, E>(
+    pending: &mut VecDeque<T>,
+    deadline: Duration,
+    mut submit: impl FnMut(&T, bool) -> Result<bool, E>,
+    mut service_output: impl FnMut() -> Result<bool, E>,
+) -> Result<(), ReplayStop<E>> {
+    let mut started = std::time::Instant::now();
+    let mut pause = Duration::from_millis(1);
+    let mut force_key = true;
+    while !pending.is_empty() {
+        if started.elapsed() >= deadline {
+            return Err(ReplayStop::BusyTimeout);
+        }
+        let accepted = {
+            let item = pending.front().expect("replay queue is non-empty");
+            match submit(item, force_key) {
+                Ok(accepted) => accepted,
+                Err(err) => return Err(ReplayStop::Stopped(err)),
+            }
+        };
+        if accepted {
+            pending.pop_front();
+            force_key = false;
+            pause = Duration::from_millis(1);
+            started = std::time::Instant::now();
+        } else {
+            let produced = match service_output() {
+                Ok(produced) => produced,
+                Err(err) => return Err(ReplayStop::Stopped(err)),
+            };
+            if produced {
+                pause = Duration::from_millis(1);
+                started = std::time::Instant::now();
+            } else {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(20));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Frames a busy-timeout fallback must keep when it replaces the encoder.
+/// `drained` belongs to the segment that was already running. `pending` is what the
+/// replacement still has to accept: inputs the drain did not acknowledge, then the
+/// frames that were never accepted, with no timestamp twice.
+#[derive(Debug, PartialEq, Eq)]
+pub struct BusyHandoff<S, I> {
+    pub drained: Vec<S>,
+    pub pending: VecDeque<I>,
+}
+
+/// Keep a shutdown drain, then the inputs that still need a sample.
+/// Unacknowledged inputs stay in front of the unaccepted queue so an accepted frame
+/// whose sample never came out is not skipped in favor of a later one.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn handoff_after_busy_timeout<S, I, K>(
+    drained: Vec<S>,
+    unacknowledged: impl IntoIterator<Item = I>,
+    still_queued: impl IntoIterator<Item = I>,
+    key: impl Fn(&I) -> K,
+) -> BusyHandoff<S, I>
+where
+    K: PartialEq,
+{
+    let mut pending = VecDeque::new();
+    let mut seen = Vec::new();
+    for item in unacknowledged.into_iter().chain(still_queued) {
+        let id = key(&item);
+        if seen.contains(&id) {
+            continue;
+        }
+        seen.push(id);
+        pending.push_back(item);
+    }
+    BusyHandoff { drained, pending }
+}
+
+/// What one step of an encoder drain means. An empty batch is [`DrainStep::KeepWaiting`],
+/// not completion. Async MFTs finish on `METransformDrainComplete`; sync MFTs finish when
+/// the drain says it needs more input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainStep {
+    KeepWaiting,
+    KeepSample,
+    Done,
+    Failed,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn async_drain_step(kind: DrainKind) -> DrainStep {
+    match kind {
+        DrainKind::Output => DrainStep::KeepSample,
+        DrainKind::Quiet | DrainKind::NeedMoreInput => DrainStep::KeepWaiting,
+        DrainKind::DrainComplete => DrainStep::Done,
+        DrainKind::Error => DrainStep::Failed,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn sync_drain_step(kind: DrainKind) -> DrainStep {
+    match kind {
+        DrainKind::Output => DrainStep::KeepSample,
+        DrainKind::NeedMoreInput | DrainKind::DrainComplete => DrainStep::Done,
+        DrainKind::Quiet => DrainStep::KeepWaiting,
+        DrainKind::Error => DrainStep::Failed,
+    }
+}
+
+/// Walk a scripted drain. Empty steps do not stop the walk or drop later samples.
+/// `done` is false when the script ends without a completion event: the tail is not finished.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn collect_drain_events(events: &[DrainKind], async_mft: bool) -> (Vec<usize>, bool) {
+    let mut samples = Vec::new();
+    for (index, kind) in events.iter().copied().enumerate() {
+        match if async_mft { async_drain_step(kind) } else { sync_drain_step(kind) } {
+            DrainStep::KeepSample => samples.push(index),
+            DrainStep::KeepWaiting => {}
+            DrainStep::Done => return (samples, true),
+            DrainStep::Failed => return (samples, false),
+        }
+    }
+    (samples, false)
+}
+
+/// Same device and same output format: flush and reconfigure, do not destroy the MFT.
+pub fn reuse_hardware_encoder(same_device: bool, same_format: bool, broken: bool) -> bool {
+    same_device && same_format && !broken
+}
+
+/// Quit must not delete a checkpoint that never made it into the video folder.
+pub fn keep_blocked_checkpoint(blocked: bool) -> bool {
+    blocked
+}
+
+/// Append `item`. When the queue is already at `limit`, try to spill the oldest to disk first.
+/// A failed spill keeps that oldest segment and still appends `item`. Nothing is overwritten.
+pub fn enqueue_unsaved<T, E>(
+    queue: &mut VecDeque<T>,
+    item: T,
+    limit: usize,
+    spill_oldest: impl FnOnce(&T) -> Result<(), E>,
+) -> Option<E> {
+    let mut spill_error = None;
+    if limit > 0 && queue.len() >= limit {
+        if let Some(oldest) = queue.front() {
+            match spill_oldest(oldest) {
+                Ok(()) => {
+                    queue.pop_front();
+                }
+                Err(err) => spill_error = Some(err),
+            }
+        }
+    }
+    queue.push_back(item);
+    spill_error
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct Fmt {
+        w: u32,
+        h: u32,
+        tag: u8,
+    }
+
+    /// One frame of evidence. `t` is the pipeline timestamp.
+    struct Session {
+        frames: Vec<i64>,
+        recovered: Vec<Vec<i64>>,
+        format: Fmt,
+        heartbeat: u64,
+        now: u64,
+        produced: usize,
+    }
+
+    impl Session {
+        fn new() -> Session {
+            Session {
+                frames: Vec::new(),
+                recovered: Vec::new(),
+                format: Fmt { w: 1920, h: 1080, tag: 1 },
+                heartbeat: 0,
+                now: 0,
+                produced: 0,
+            }
+        }
+
+        fn push_frames(&mut self, count: usize) {
+            for _ in 0..count {
+                self.now += 100;
+                self.heartbeat = self.now;
+                self.frames.push(self.now as i64);
+                self.produced += 1;
+            }
+        }
+
+        /// Encoder or capture thread stopped reporting. The watchdog restarts it.
+        fn hang(&mut self, frozen_for_ms: u64) {
+            self.now += frozen_for_ms;
+            assert!(watchdog_due(self.heartbeat, self.now, WATCHDOG_LIMIT), "a hung encoder must trip the watchdog");
+            self.restart(self.format);
+        }
+
+        fn wake_burst(&mut self, events: usize) {
+            let mut pending = false;
+            let mut arms = 0;
+            for _ in 0..events {
+                match wake_schedule(false, pending) {
+                    WakeSchedule::Arm => {
+                        pending = true;
+                        arms += 1;
+                    }
+                    WakeSchedule::Coalesce => {}
+                    WakeSchedule::Defer => {}
+                }
+            }
+            // A burst that arrives while the restart is on the stack must not start a second one.
+            assert_eq!(wake_schedule(true, pending), WakeSchedule::Defer);
+            assert_eq!(arms, 1, "a wake burst must schedule one restart");
+            self.restart(self.format);
+        }
+
+        fn change_resolution(&mut self, w: u32, h: u32) {
+            self.restart(Fmt { w, h, tag: self.format.tag.wrapping_add(1) });
+        }
+
+        fn restart(&mut self, new_format: Fmt) {
+            let old_entry = [self.format.tag];
+            let new_entry = [new_format.tag];
+            let old = Encoding { width: self.format.w, height: self.format.h, sample_entry: &old_entry };
+            let new = Encoding { width: new_format.w, height: new_format.h, sample_entry: &new_entry };
+            if !self.frames.is_empty() && !same_encoding(old, new) {
+                self.recovered.push(std::mem::take(&mut self.frames));
+            }
+            self.format = new_format;
+            self.heartbeat = self.now;
+        }
+
+        fn evidence(&self) -> usize {
+            self.frames.len() + self.recovered.iter().map(Vec::len).sum::<usize>()
+        }
+    }
+
+    #[test]
+    fn wake_events_collapse_to_one_restart() {
+        assert_eq!(wake_schedule(false, false), WakeSchedule::Arm);
+        assert_eq!(wake_schedule(false, true), WakeSchedule::Coalesce);
+        assert_eq!(wake_schedule(true, false), WakeSchedule::Defer);
+        assert_eq!(wake_schedule(true, true), WakeSchedule::Defer);
+    }
+
+    #[test]
+    fn watchdog_ignores_a_live_encoder() {
+        let now = 10_000;
+        assert!(!watchdog_due(now - 1000, now, WATCHDOG_LIMIT));
+        assert!(watchdog_due(now - 8001, now, WATCHDOG_LIMIT));
+        assert!(!watchdog_due(now, now - 5, WATCHDOG_LIMIT), "a clock step backwards is not a hang");
+    }
+
+    #[test]
+    fn different_parameters_cannot_share_a_buffer() {
+        let sps = [1u8, 2, 3];
+        let same = Encoding { width: 1920, height: 1080, sample_entry: &sps };
+        assert!(same_encoding(same, same));
+        assert!(!same_encoding(same, Encoding { width: 1280, ..same }));
+        assert!(!same_encoding(same, Encoding { sample_entry: &[9, 9], ..same }));
+    }
+
+    #[test]
+    fn an_empty_encoder_queue_is_not_a_finished_worker() {
+        assert_eq!(worker_signal(DrainKind::Quiet), WorkerSignal::StillWorking);
+        assert_eq!(worker_signal(DrainKind::Output), WorkerSignal::StillWorking);
+        assert_eq!(worker_signal(DrainKind::DrainComplete), WorkerSignal::Finished);
+        assert_eq!(worker_signal(DrainKind::NeedMoreInput), WorkerSignal::Finished);
+        assert_eq!(worker_signal(DrainKind::Error), WorkerSignal::Failed);
+        // A run of quiet polls must not be treated as "the worker exited".
+        let mut saw_finish = false;
+        for kind in [DrainKind::Quiet, DrainKind::Quiet, DrainKind::Output, DrainKind::Quiet] {
+            if worker_signal(kind) == WorkerSignal::Finished {
+                saw_finish = true;
+            }
+        }
+        assert!(!saw_finish);
+        assert_eq!(worker_signal(DrainKind::DrainComplete), WorkerSignal::Finished);
+    }
+
+    #[test]
+    fn a_second_format_change_does_not_overwrite_unsaved_frames() {
+        let mut queue = VecDeque::new();
+        assert!(enqueue_unsaved(&mut queue, "segment-a", 2, |_| Err("disk")).is_none());
+        assert!(enqueue_unsaved(&mut queue, "segment-b", 2, |_| Err("disk")).is_none());
+        let err = enqueue_unsaved(&mut queue, "segment-c", 2, |_| Err("disk")).unwrap();
+        assert_eq!(err, "disk");
+        assert_eq!(queue.make_contiguous(), ["segment-a", "segment-b", "segment-c"]);
+        let spilled = enqueue_unsaved(&mut queue, "segment-d", 2, |oldest| {
+            assert_eq!(*oldest, "segment-a");
+            Ok::<(), &str>(())
+        });
+        assert!(spilled.is_none());
+        assert_eq!(queue.make_contiguous(), ["segment-b", "segment-c", "segment-d"]);
+    }
+
+    #[test]
+    fn format_change_keeps_frames_until_the_write_succeeds() {
+        let frames = vec![1u8, 2, 3, 4];
+        let (frames, err) = release_after_write(frames, |_| Err("disk full")).unwrap_err();
+        assert_eq!(err, "disk full");
+        assert_eq!(frames, vec![1, 2, 3, 4], "a failed write must hand the frames back");
+        // A writer thread that never starts is the same: the caller still holds them.
+        let frames = match false {
+            true => release_after_write(frames, |_| Ok(())),
+            false => Err((frames, "spawn failed")),
+        };
+        let (frames, _) = frames.unwrap_err();
+        assert_eq!(frames, vec![1, 2, 3, 4]);
+        assert!(release_after_write(frames, |_| Ok::<(), &str>(())).is_ok());
+    }
+
+    #[test]
+    fn hardware_sessions_are_reused_and_not_recreated_in_a_burst() {
+        assert!(reuse_hardware_encoder(true, true, false));
+        assert!(!reuse_hardware_encoder(true, true, true), "a broken encoder is not reused");
+        assert!(!reuse_hardware_encoder(false, true, false), "a different D3D device is not reused");
+        assert!(!reuse_hardware_encoder(true, false, false));
+        let t0 = std::time::Instant::now();
+        assert!(hardware_create_allowed(None, t0, HARDWARE_CREATE_GAP));
+        assert!(!hardware_create_allowed(Some(t0), t0, HARDWARE_CREATE_GAP));
+        assert!(hardware_create_allowed(Some(t0), t0 + HARDWARE_CREATE_GAP, HARDWARE_CREATE_GAP));
+        assert!(GRAVEYARD_DELAY >= Duration::from_secs(5) && GRAVEYARD_DELAY <= Duration::from_secs(10));
+        assert!(hardware_slot_free(3, 0, HARDWARE_SESSION_BUDGET));
+        assert!(!hardware_slot_free(3, 1, HARDWARE_SESSION_BUDGET), "a graveyard encoder still holds a session");
+        assert!(!hardware_slot_free(0, HARDWARE_SESSION_BUDGET, HARDWARE_SESSION_BUDGET));
+        assert_eq!(HARDWARE_SESSION_BUDGET, 4);
+        assert!(!retire_reused_encoder(ENCODER_REUSE_SESSIONS - 1, Duration::from_secs(1)));
+        assert!(retire_reused_encoder(ENCODER_REUSE_SESSIONS, Duration::from_secs(1)));
+        assert!(retire_reused_encoder(1, ENCODER_REUSE_AGE));
+        assert_eq!(soak_hardware_format(0, 5), Some(0), "the first hardware turn asks for format 0");
+        assert_eq!(soak_hardware_format(1, 5), None);
+        assert_eq!(soak_hardware_format(8, 5), Some(1));
+        let mut seen = [false; 5];
+        let mut hardware_turn = 0u64;
+        for iteration in 0..80u64 {
+            if iteration.is_multiple_of(5) {
+                continue;
+            }
+            if let Some(index) = soak_hardware_format(hardware_turn, 5) {
+                seen[index as usize] = true;
+            }
+            hardware_turn += 1;
+        }
+        assert!(seen.iter().all(|hit| *hit), "a format landed only on software turns: {seen:?}");
+    }
+
+    #[test]
+    fn recovery_keeps_every_frame_when_submit_is_busy_and_stalls_again() {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct Frame {
+            id: u32,
+            time: i64,
+        }
+        let frames =
+            [Frame { id: 1, time: 0 }, Frame { id: 2, time: 10 }, Frame { id: 3, time: 20 }, Frame { id: 4, time: 30 }];
+        let mut pending: VecDeque<Frame> = frames.iter().cloned().collect();
+        // false, false, true for the first frame, then a stall on the second,
+        // a failed rebuild that must not drop the tail, then false, true for the rest.
+        let mut script =
+            VecDeque::from([Ok(false), Ok(false), Ok(true), Err("stall"), Ok(false), Ok(true), Ok(true), Ok(true)]);
+        let mut accepted = Vec::new();
+        let mut services = 0u32;
+        let mut stalled = false;
+        loop {
+            let result = replay_until_accepted(
+                &mut pending,
+                Duration::from_secs(2),
+                |frame, _force_key| match script.pop_front().expect("script") {
+                    Ok(true) => {
+                        accepted.push(frame.clone());
+                        Ok(true)
+                    }
+                    Ok(false) => Ok(false),
+                    Err(reason) => Err(reason),
+                },
+                || {
+                    services += 1;
+                    Ok(false)
+                },
+            );
+            match result {
+                Ok(()) => break,
+                Err(ReplayStop::Stopped("stall")) if !stalled => {
+                    stalled = true;
+                    let held: Vec<_> = pending.iter().cloned().collect();
+                    assert_eq!(held.iter().map(|frame| frame.id).collect::<Vec<_>>(), vec![2, 3, 4]);
+                    let build: Result<(), &str> = Err("encoder unavailable");
+                    if let Err(err) = build {
+                        assert_eq!(err, "encoder unavailable");
+                        assert_eq!(pending.iter().cloned().collect::<Vec<_>>(), held);
+                    }
+                }
+                Err(err) => panic!("recovery dropped frames: {err:?}; still held {pending:?}"),
+            }
+        }
+        assert!(stalled, "the scripted second stall did not run");
+        assert!(services >= 3, "busy submits must service output before retrying");
+        assert_eq!(accepted, frames);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn replay_deadline_keeps_the_queue_when_the_encoder_stays_busy() {
+        let mut pending = VecDeque::from([10i64, 20, 30]);
+        let started = std::time::Instant::now();
+        let result = replay_until_accepted(
+            &mut pending,
+            Duration::from_millis(40),
+            |_frame, _force_key| Ok::<bool, &str>(false),
+            || Ok(false),
+        );
+        assert!(matches!(result, Err(ReplayStop::BusyTimeout)));
+        assert_eq!(pending, VecDeque::from([10, 20, 30]));
+        assert!(started.elapsed() < Duration::from_secs(2), "busy replay spun without a deadline");
+    }
+
+    #[test]
+    fn busy_timeout_publishes_the_drained_prefix_before_software_replays_the_rest() {
+        // A (10) and B (20) were accepted. Shutdown drained both. C and D were never accepted.
+        let handoff =
+            handoff_after_busy_timeout(vec![10, 20], Vec::<i64>::new(), VecDeque::from([30, 40]), |time| *time);
+        let mut old_segment = vec![1];
+        old_segment.extend(handoff.drained);
+        let software: Vec<i64> = handoff.pending.iter().copied().collect();
+        assert_eq!(old_segment, vec![1, 10, 20], "the drained prefix stays on the old segment");
+        assert_eq!(software, vec![30, 40], "software replays only what was not accepted");
+        assert!(software.iter().all(|time| !old_segment.contains(time)));
+    }
+
+    #[test]
+    fn busy_timeout_requeues_an_accepted_frame_when_the_shutdown_drain_is_incomplete() {
+        // A (10) came out. B (20) was accepted but the drain did not return it.
+        // C (30) was never accepted. 20 also sitting in the queue must not be encoded twice.
+        let handoff =
+            handoff_after_busy_timeout(vec![10], VecDeque::from([20]), VecDeque::from([20, 30]), |time| *time);
+        assert_eq!(handoff.drained, vec![10]);
+        assert_eq!(handoff.pending, VecDeque::from([20, 30]));
+        let mut published = handoff.drained;
+        let replay: Vec<i64> = handoff.pending.iter().copied().collect();
+        published.extend(replay);
+        assert_eq!(published, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn empty_drain_batch_keeps_the_delayed_tail() {
+        let events = [
+            DrainKind::Quiet,
+            DrainKind::Quiet,
+            DrainKind::Output,
+            DrainKind::Quiet,
+            DrainKind::Output,
+            DrainKind::DrainComplete,
+        ];
+        let (samples, done) = collect_drain_events(&events, true);
+        assert!(done, "DrainComplete is what finishes an async drain, not an empty batch");
+        assert_eq!(samples, vec![2, 4], "the sample after the empty batch has to be kept");
+        let (early, done) = collect_drain_events(&events[..5], true);
+        assert!(!done);
+        assert_eq!(early, vec![2, 4]);
+        let (sync_samples, sync_done) = collect_drain_events(&[DrainKind::Output, DrainKind::NeedMoreInput], false);
+        assert!(sync_done);
+        assert_eq!(sync_samples, vec![0]);
+    }
+
+    #[test]
+    fn stalled_encoder_keeps_frames_and_capture_continues() {
+        let encoded = capture_through_stall(&[1, 2, 3, 4, 5], Some(4));
+        assert_eq!(encoded, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn quit_keeps_an_unpublished_checkpoint() {
+        assert!(keep_blocked_checkpoint(true));
+        assert!(!keep_blocked_checkpoint(false));
+    }
+
+    #[test]
+    fn crash_restart_backoff_grows_and_stays_bounded() {
+        assert_eq!(restart_backoff(0), Duration::from_secs(1));
+        assert_eq!(restart_backoff(3), Duration::from_secs(8));
+        assert_eq!(restart_backoff(100), Duration::from_secs(60));
+        assert!(should_restart_process(false, true));
+        assert!(!should_restart_process(true, true));
+        assert!(!should_restart_process(false, false));
+    }
+
+    /// Encoder hangs, monitor wake bursts, and resolution changes, back to back.
+    /// Every frame is still either in the buffer or in a recovered segment.
+    #[test]
+    fn stress_hangs_wakes_and_resolution_changes() {
+        let mut session = Session::new();
+        for step in 0..60 {
+            session.push_frames(12);
+            match step % 3 {
+                0 => session.hang(9_000),
+                1 => session.wake_burst(6),
+                _ => session.change_resolution(1280 + (step % 5) * 64, 720 + (step % 4) * 40),
+            }
+            assert_eq!(
+                session.evidence(),
+                session.produced,
+                "step {step}: a restart dropped replay frames (buffered {}, recovered segments {})",
+                session.frames.len(),
+                session.recovered.len()
+            );
+            assert!(session.heartbeat == session.now, "a restart must resume the heartbeat");
+        }
+        assert!(session.recovered.len() > 10, "resolution changes must recover the previous buffer, not discard it");
+        assert!(!session.frames.is_empty() || session.recovered.last().is_some());
+        // A same-format restart (the hang path) keeps the live buffer growing across the loop.
+        let tail = session.frames.len();
+        session.hang(9_000);
+        assert_eq!(session.frames.len(), tail, "a hung encoder restart must keep the buffered frames");
+    }
+}
