@@ -14,6 +14,13 @@ pub const JOIN_LIMIT: Duration = Duration::from_secs(3);
 pub const GRAVEYARD_DELAY: Duration = Duration::from_secs(8);
 /// Minimum gap between *new* hardware encoder objects. Reusing one does not count.
 pub const HARDWARE_CREATE_GAP: Duration = Duration::from_secs(3);
+/// A hardware `ProcessInput` / `ProcessOutput` that runs longer than this has stalled in the driver.
+/// The caller stops waiting. The call and its thread are abandoned, not released.
+pub const NATIVE_CALL_LIMIT: Duration = Duration::from_secs(3);
+/// Reuse the same MFT only this many times. Thousands of reuses of one NVIDIA session have stalled the driver.
+pub const ENCODER_REUSE_SESSIONS: u32 = 50;
+/// Reuse the same MFT only this long, even if it has been used less often.
+pub const ENCODER_REUSE_AGE: Duration = Duration::from_secs(10 * 60);
 /// Parked, in-use, and not-yet-released graveyard encoders all hold an NVENC session.
 /// Consumer GeForce drivers reject new sessions past a small cap (8 on current drivers).
 /// Staying at 4 leaves room for the one being started while others are still draining.
@@ -122,6 +129,89 @@ pub fn hardware_create_allowed(last: Option<std::time::Instant>, now: std::time:
 /// A new hardware MFT is allowed only while parked, in-use, and graveyard sessions are under the cap.
 pub fn hardware_slot_free(live: u64, graveyard_pending: u64, budget: u64) -> bool {
     live.saturating_add(graveyard_pending) < budget
+}
+
+/// Parked sessions are retired once they have been reused too many times or for too long.
+pub fn retire_reused_encoder(sessions: u32, age: Duration) -> bool {
+    sessions >= ENCODER_REUSE_SESSIONS || age >= ENCODER_REUSE_AGE
+}
+
+/// `None` keeps the steady resolution. Format changes are counted in hardware iterations only,
+/// so a size is not requested solely on the software turns (every 5th soak session).
+#[cfg(test)]
+pub fn soak_hardware_format(hardware_turn: u64, format_count: u64) -> Option<u64> {
+    if format_count == 0 || !hardware_turn.is_multiple_of(8) {
+        return None;
+    }
+    Some((hardware_turn / 8) % format_count)
+}
+
+/// Run `work` on another thread. If it misses `limit`, the thread is leaked and this returns
+/// [`CallResult::Stalled`]. Joining would wait for the stuck call, which is what freezes capture.
+#[cfg(test)]
+pub fn call_with_deadline<T: Send + 'static>(
+    limit: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> CallResult<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let value = work();
+        let _ = tx.send(value);
+    });
+    match rx.recv_timeout(limit) {
+        Ok(value) => {
+            let _ = handle.join();
+            CallResult::Done(value)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            std::mem::forget(handle);
+            CallResult::Stalled
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = handle.join();
+            CallResult::Stalled
+        }
+    }
+}
+
+#[derive(Debug)]
+#[cfg(test)]
+pub enum CallResult<T> {
+    Done(T),
+    Stalled,
+}
+
+/// Encode `frames`. When the encoder blocks, abandon it, keep what was already encoded, and
+/// re-encode the current frame on a fresh encoder that does not block.
+#[cfg(test)]
+pub fn capture_through_stall(frames: &[u32], stall_at: Option<u32>) -> Vec<u32> {
+    let mut encoded = Vec::new();
+    let mut block_next = false;
+    for &frame in frames {
+        if stall_at == Some(frame) {
+            block_next = true;
+        }
+        let block = block_next;
+        block_next = false;
+        match call_with_deadline(Duration::from_millis(200), move || {
+            if block {
+                // Park, don't spin. The thread is leaked when the deadline wins.
+                loop {
+                    std::thread::park();
+                }
+            }
+            frame
+        }) {
+            CallResult::Done(value) => encoded.push(value),
+            CallResult::Stalled => {
+                let retry = call_with_deadline(Duration::from_millis(200), move || frame);
+                if let CallResult::Done(value) = retry {
+                    encoded.push(value);
+                }
+            }
+        }
+    }
+    encoded
 }
 
 /// Same device and same output format: flush and reconfigure, do not destroy the MFT.
@@ -336,6 +426,30 @@ mod tests {
         assert!(!hardware_slot_free(3, 1, HARDWARE_SESSION_BUDGET), "a graveyard encoder still holds a session");
         assert!(!hardware_slot_free(0, HARDWARE_SESSION_BUDGET, HARDWARE_SESSION_BUDGET));
         assert_eq!(HARDWARE_SESSION_BUDGET, 4);
+        assert!(!retire_reused_encoder(ENCODER_REUSE_SESSIONS - 1, Duration::from_secs(1)));
+        assert!(retire_reused_encoder(ENCODER_REUSE_SESSIONS, Duration::from_secs(1)));
+        assert!(retire_reused_encoder(1, ENCODER_REUSE_AGE));
+        assert_eq!(soak_hardware_format(0, 5), Some(0), "the first hardware turn asks for format 0");
+        assert_eq!(soak_hardware_format(1, 5), None);
+        assert_eq!(soak_hardware_format(8, 5), Some(1));
+        let mut seen = [false; 5];
+        let mut hardware_turn = 0u64;
+        for iteration in 0..80u64 {
+            if iteration.is_multiple_of(5) {
+                continue;
+            }
+            if let Some(index) = soak_hardware_format(hardware_turn, 5) {
+                seen[index as usize] = true;
+            }
+            hardware_turn += 1;
+        }
+        assert!(seen.iter().all(|hit| *hit), "a format landed only on software turns: {seen:?}");
+    }
+
+    #[test]
+    fn stalled_encoder_keeps_frames_and_capture_continues() {
+        let encoded = capture_through_stall(&[1, 2, 3, 4, 5], Some(4));
+        assert_eq!(encoded, vec![1, 2, 3, 4, 5]);
     }
 
     #[test]

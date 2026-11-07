@@ -4,9 +4,10 @@
 # parses, shuts the encoder down, then starts another. Resolution changes and a
 # short sleep stand in for a monitor mode switch and a display sleep/wake.
 # Most sessions reuse a parked hardware encoder. A new hardware MFT is created
-# at most about once every 2 seconds. Encoders still in the graveyard count
-# against the NVENC session budget, so a full budget waits instead of falling
-# back to software. The log line counts created, reused, retired, and shut down.
+# at most about once every 2 seconds, and a session is retired after 50 reuses.
+# Driver calls give up after 3 seconds: a stall is abandoned, counted, and the
+# frame is re-encoded. The log line counts created, reused, retired, shut down,
+# stalls, and recoveries.
 #
 # Usage (from the repo root):
 #   powershell -ExecutionPolicy Bypass -File scripts/soak.ps1 -Minutes 15

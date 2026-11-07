@@ -3,7 +3,7 @@
 
 use super::clock::{Clock, HNS_PER_SEC};
 use super::convert::Converter;
-use super::encoder::{self, VideoEncoder};
+use super::encoder::{self, EncoderFault, VideoEncoder};
 use super::gpu::Gpu;
 use super::screen::ScreenCapture;
 use super::{Packet, Shared, VideoFormat};
@@ -94,6 +94,8 @@ struct State {
     cursor: bool,
     /// Cap non-fullscreen content at WINDOWED_FPS.
     windowed_cap: bool,
+    bitrate_kbps: u32,
+    fast_preset: bool,
 }
 
 impl Drop for State {
@@ -125,6 +127,8 @@ fn init(settings: &config::Video) -> Result<State, String> {
         fast_preset: settings.quality != config::Quality::High,
         allow_hardware: !encoder::prefer_software(),
     };
+    let bitrate_kbps = encoder_settings.bitrate_kbps;
+    let fast_preset = encoder_settings.fast_preset;
     let encoder = VideoEncoder::new(&gpu, &encoder_settings)?;
     let windowed_cap = settings.full_rate_only_fullscreen && i64::from(fps) > WINDOWED_FPS;
     Ok(State {
@@ -138,7 +142,24 @@ fn init(settings: &config::Video) -> Result<State, String> {
         monitor: monitor.handle,
         cursor: settings.capture_cursor,
         windowed_cap,
+        bitrate_kbps,
+        fast_preset,
     })
+}
+
+fn replace_stalled_encoder(s: &mut State) -> Result<(), String> {
+    let settings = encoder::Settings {
+        codec: s.encoder.codec,
+        width: s.width,
+        height: s.height,
+        fps: s.fps,
+        bitrate_kbps: s.bitrate_kbps,
+        fast_preset: s.fast_preset,
+        allow_hardware: !encoder::prefer_software(),
+    };
+    s.encoder = VideoEncoder::new(&s.gpu, &settings)?;
+    encoder::note_recovery();
+    Ok(())
 }
 
 pub fn spawn(
@@ -308,6 +329,15 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
             let force_key = pending_key || key_due;
             let accepted = match s.encoder.submit(&s.gpu, frame, target, interval, force_key) {
                 Ok(accepted) => accepted,
+                Err(EncoderFault::Stalled) => match replace_stalled_encoder(&mut s) {
+                    Ok(()) => match s.encoder.submit(&s.gpu, frame, target, interval, force_key) {
+                        Ok(accepted) => accepted,
+                        Err(err) => {
+                            return Err(encoder_error(&mut s.encoder, format!("encoder failed after a stall: {err}")))
+                        }
+                    },
+                    Err(err) => return Err(err),
+                },
                 Err(err) => return Err(encoder_error(&mut s.encoder, format!("encoder failed: {err}"))),
             };
             if accepted {
@@ -321,7 +351,11 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
                 return Err(encoder_error(&mut s.encoder, "the video encoder stopped responding".into()));
             }
         } else if let Err(err) = s.encoder.poll() {
-            return Err(encoder_error(&mut s.encoder, format!("encoder failed: {err}")));
+            if matches!(err, EncoderFault::Stalled) {
+                replace_stalled_encoder(&mut s)?;
+            } else {
+                return Err(encoder_error(&mut s.encoder, format!("encoder failed: {err}")));
+            }
         }
 
         for frame in s.encoder.take_output() {

@@ -63,8 +63,63 @@ pub struct VideoEncoder {
     device_ptr: usize,
     /// `shutdown` has already handed the native objects off. Drop is then a no-op.
     released: bool,
+    /// A driver call missed its deadline. The native objects and their thread are leaked.
+    poisoned: bool,
+    /// How many times this MFT has been started, including the first.
+    sessions: u32,
+    born: Instant,
+    /// Hardware driver calls run here. Empty for the software encoder and for the copy that lives on the worker.
+    remote: Option<Remote>,
     pub codec: Codec,
     pub name: String,
+}
+
+/// The windows crate does not mark COM pointers `Send`. One hardware encoder is owned by its
+/// driver thread; the capture thread only sends it commands.
+unsafe impl Send for VideoEncoder {}
+
+#[derive(Debug)]
+pub enum EncoderFault {
+    Native(windows::core::Error),
+    /// `ProcessInput` or `ProcessOutput` did not return within [`crate::safety::NATIVE_CALL_LIMIT`].
+    Stalled,
+}
+
+impl std::fmt::Display for EncoderFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EncoderFault::Native(err) => write!(f, "{}", hresult_text(err)),
+            EncoderFault::Stalled => {
+                write!(f, "driver call exceeded {}s", crate::safety::NATIVE_CALL_LIMIT.as_secs())
+            }
+        }
+    }
+}
+
+enum Request {
+    Submit {
+        gpu: usize,
+        frame: usize,
+        time: i64,
+        duration: i64,
+        force_key: bool,
+        reply: Sender<std::result::Result<bool, windows::core::Error>>,
+    },
+    Poll {
+        reply: Sender<std::result::Result<(), windows::core::Error>>,
+    },
+    TakeOutput {
+        reply: Sender<Vec<EncodedFrame>>,
+    },
+    MarkBroken,
+    Shutdown {
+        reply: Sender<()>,
+    },
+}
+
+struct Remote {
+    tx: Sender<Request>,
+    join: Option<std::thread::JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -208,42 +263,40 @@ impl VideoEncoder {
                 return Ok(encoder);
             }
             if !acquire_hardware_slot() {
-                return Err(
-                    "hardware encoder session budget is full; not falling back to software because of our own churn"
-                        .into(),
-                );
-            }
-            wait_for_hardware_create_gap();
-            let mut activated = false;
-            for activate in hardware_encoders(gpu, settings.codec) {
-                let name = activate.cast::<IMFAttributes>().map(|a| mf::friendly_name(&a)).unwrap_or_default();
-                match Self::from_activate(gpu, &activate, settings, name.clone()) {
-                    Ok(encoder) => {
-                        HW_LIVE.fetch_add(1, Ordering::Relaxed);
-                        HW_CREATED.fetch_add(1, Ordering::Relaxed);
-                        return Ok(encoder);
-                    }
-                    Err(err) => {
-                        activated = true;
-                        log::warn!("hardware encoder '{name}' failed: {}", hresult_text(&err));
-                        // ActivateObject failed or configure released the transform already.
-                        // ShutdownObject drops the activation object's own reference.
-                        if let Err(shutdown_err) = unsafe { activate.ShutdownObject() } {
-                            log::warn!(
-                                "ShutdownObject after '{name}' failed to activate: {}",
-                                hresult_text(&shutdown_err)
-                            );
+                log::warn!("hardware session budget is full of sessions that cannot be released; using software");
+            } else {
+                wait_for_hardware_create_gap();
+                let mut activated = false;
+                for activate in hardware_encoders(gpu, settings.codec) {
+                    let name = activate.cast::<IMFAttributes>().map(|a| mf::friendly_name(&a)).unwrap_or_default();
+                    match Self::from_activate(gpu, &activate, settings, name.clone()) {
+                        Ok(encoder) => {
+                            HW_LIVE.fetch_add(1, Ordering::Relaxed);
+                            HW_CREATED.fetch_add(1, Ordering::Relaxed);
+                            return Ok(host_on_worker(encoder));
+                        }
+                        Err(err) => {
+                            activated = true;
+                            log::warn!("hardware encoder '{name}' failed: {}", hresult_text(&err));
+                            // ActivateObject failed or configure released the transform already.
+                            // ShutdownObject drops the activation object's own reference.
+                            if let Err(shutdown_err) = unsafe { activate.ShutdownObject() } {
+                                log::warn!(
+                                    "ShutdownObject after '{name}' failed to activate: {}",
+                                    hresult_text(&shutdown_err)
+                                );
+                            }
                         }
                     }
                 }
-            }
-            if activated {
-                log::warn!(
-                    "no usable hardware encoder for {:?}; using software after an activation failure",
-                    settings.codec
-                );
-            } else {
-                log::warn!("no hardware encoder for {:?} was enumerated; using software", settings.codec);
+                if activated {
+                    log::warn!(
+                        "no usable hardware encoder for {:?}; using software after an activation failure",
+                        settings.codec
+                    );
+                } else {
+                    log::warn!("no hardware encoder for {:?} was enumerated; using software", settings.codec);
+                }
             }
         } else {
             log::warn!("using the software H.264 encoder after repeated hardware-encoder failures");
@@ -259,6 +312,9 @@ impl VideoEncoder {
     /// The next drop must not return this session to the reuse pool.
     pub fn mark_broken(&mut self) {
         self.broken = true;
+        if let Some(remote) = &self.remote {
+            let _ = remote.tx.send(Request::MarkBroken);
+        }
     }
 
     fn from_activate(gpu: &Gpu, activate: &IMFActivate, s: &Settings, name: String) -> Result<VideoEncoder> {
@@ -373,6 +429,10 @@ impl VideoEncoder {
             manager: d3d_aware.then(|| gpu.manager.clone()),
             device_ptr: gpu.device.as_raw() as usize,
             released: false,
+            poisoned: false,
+            sessions: 1,
+            born: Instant::now(),
+            remote: None,
             codec: s.codec,
             name,
         })
@@ -383,7 +443,33 @@ impl VideoEncoder {
     }
 
     /// Feeds one frame. Returns false when the encoder is busy and the frame was dropped.
+    /// Hardware driver calls run on this encoder's worker thread and give up after
+    /// [`crate::safety::NATIVE_CALL_LIMIT`]. A miss abandons the session instead of stalling capture.
     pub fn submit(
+        &mut self,
+        gpu: &Gpu,
+        frame: &ID3D11Texture2D,
+        time: i64,
+        duration: i64,
+        force_key: bool,
+    ) -> std::result::Result<bool, EncoderFault> {
+        if self.poisoned {
+            return Err(EncoderFault::Stalled);
+        }
+        let driver = self.remote.as_ref().map(|remote| remote.tx.clone());
+        if let Some(driver) = driver {
+            let gpu = gpu as *const Gpu as usize;
+            let frame = frame as *const ID3D11Texture2D as usize;
+            let result = remote_call(&driver, |reply| Request::Submit { gpu, frame, time, duration, force_key, reply });
+            if matches!(result, Err(EncoderFault::Stalled)) {
+                self.abandon_after_stall();
+            }
+            return result;
+        }
+        self.submit_local(gpu, frame, time, duration, force_key).map_err(EncoderFault::Native)
+    }
+
+    fn submit_local(
         &mut self,
         gpu: &Gpu,
         frame: &ID3D11Texture2D,
@@ -417,12 +503,34 @@ impl VideoEncoder {
     }
 
     /// Collects finished frames without feeding a new one.
-    pub fn poll(&mut self) -> Result<()> {
+    pub fn poll(&mut self) -> std::result::Result<(), EncoderFault> {
+        if self.poisoned {
+            return Err(EncoderFault::Stalled);
+        }
+        let driver = self.remote.as_ref().map(|remote| remote.tx.clone());
+        if let Some(driver) = driver {
+            let result = remote_call(&driver, |reply| Request::Poll { reply });
+            if matches!(result, Err(EncoderFault::Stalled)) {
+                self.abandon_after_stall();
+            }
+            return result;
+        }
+        self.poll_local().map_err(EncoderFault::Native)
+    }
+
+    fn poll_local(&mut self) -> Result<()> {
         self.pump()
     }
 
     /// Encoded frames that have come out since the last call.
     pub fn take_output(&mut self) -> Vec<EncodedFrame> {
+        if let Some(remote) = &self.remote {
+            let (tx, rx) = mpsc::channel();
+            if remote.tx.send(Request::TakeOutput { reply: tx }).is_err() {
+                return Vec::new();
+            }
+            return rx.recv_timeout(crate::safety::NATIVE_CALL_LIMIT).unwrap_or_default();
+        }
         std::mem::take(&mut self.output)
     }
 
@@ -537,6 +645,33 @@ impl VideoEncoder {
     /// The synchronous software encoder has no `RTWorkQ` thread. It is drained until
     /// `MF_E_TRANSFORM_NEED_MORE_INPUT` and released on this thread.
     pub fn shutdown(&mut self) {
+        if self.released || self.poisoned {
+            return;
+        }
+        let driver = self.remote.as_ref().map(|remote| remote.tx.clone());
+        if let Some(driver) = driver {
+            let (tx, rx) = mpsc::channel();
+            if driver.send(Request::Shutdown { reply: tx }).is_err() {
+                self.abandon_after_stall();
+                return;
+            }
+            if rx.recv_timeout(crate::safety::NATIVE_CALL_LIMIT).is_err() {
+                self.abandon_after_stall();
+                return;
+            }
+            self.released = true;
+            if let Some(remote) = self.remote.take() {
+                drop(remote.tx);
+                if let Some(join) = remote.join {
+                    let _ = join.join();
+                }
+            }
+            return;
+        }
+        self.shutdown_local();
+    }
+
+    fn shutdown_local(&mut self) {
         if self.released {
             return;
         }
@@ -582,15 +717,156 @@ impl VideoEncoder {
             bitrate_kbps: self.bitrate_kbps,
             fast_preset: self.fast_preset,
             device_ptr: self.device_ptr,
+            sessions: self.sessions,
+            born: self.born,
             codec: self.codec,
             name: std::mem::take(&mut self.name),
         })
+    }
+
+    fn abandon_after_stall(&mut self) {
+        if self.poisoned {
+            return;
+        }
+        self.poisoned = true;
+        self.released = true;
+        self.broken = true;
+        if let Some(remote) = self.remote.take() {
+            // Dropping the sender is how a late return learns we gave up. Forgetting the
+            // join handle is what keeps this thread from waiting inside the driver.
+            std::mem::forget(remote.join);
+            drop(remote.tx);
+        }
+        note_stall();
+    }
+
+    fn leak_native(&mut self) {
+        self.released = true;
+        self.broken = true;
+        self.poisoned = true;
+        std::mem::forget(self.transform.take());
+        std::mem::forget(self.activate.take());
+        std::mem::forget(self.codec_api.take());
+        std::mem::forget(self.events.take());
+        std::mem::forget(self.device.take());
+        std::mem::forget(self.manager.take());
+        let _ = std::mem::replace(&mut self.input, Input::Gpu);
     }
 }
 
 impl Drop for VideoEncoder {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+fn remote_call<T: Send + 'static>(
+    driver: &Sender<Request>,
+    build: impl FnOnce(Sender<std::result::Result<T, windows::core::Error>>) -> Request,
+) -> std::result::Result<T, EncoderFault> {
+    let (tx, rx) = mpsc::channel();
+    if driver.send(build(tx)).is_err() {
+        return Err(EncoderFault::Stalled);
+    }
+    match rx.recv_timeout(crate::safety::NATIVE_CALL_LIMIT) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(EncoderFault::Native(err)),
+        Err(_) => Err(EncoderFault::Stalled),
+    }
+}
+
+/// Moves a hardware encoder onto the one thread that is allowed to call into the driver.
+fn host_on_worker(encoder: VideoEncoder) -> VideoEncoder {
+    let codec = encoder.codec;
+    let name = encoder.name.clone();
+    let (tx, rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new().name("encoder-driver".into()).spawn(move || driver_loop(encoder, rx));
+    let join = match spawned {
+        Ok(join) => join,
+        Err(err) => {
+            log::error!("encoder driver thread failed to start: {err}");
+            return encoder_shell(codec, name, None);
+        }
+    };
+    encoder_shell(codec, name, Some(Remote { tx, join: Some(join) }))
+}
+
+fn encoder_shell(codec: Codec, name: String, remote: Option<Remote>) -> VideoEncoder {
+    VideoEncoder {
+        transform: None,
+        activate: None,
+        codec_api: None,
+        events: None,
+        need_input: 0,
+        provides_samples: false,
+        output_size: 0,
+        input: Input::Gpu,
+        input_id: 0,
+        output_id: 0,
+        width: 0,
+        height: 0,
+        output: Vec::new(),
+        uses_d3d: false,
+        hardware: true,
+        broken: false,
+        fps: 0,
+        bitrate_kbps: 0,
+        fast_preset: false,
+        device: None,
+        manager: None,
+        device_ptr: 0,
+        released: false,
+        poisoned: false,
+        sessions: 0,
+        born: Instant::now(),
+        remote,
+        codec,
+        name,
+    }
+}
+
+fn driver_loop(mut encoder: VideoEncoder, rx: mpsc::Receiver<Request>) {
+    let _com = crate::win::ComGuard::mta();
+    while let Ok(request) = rx.recv() {
+        match request {
+            Request::Submit { gpu, frame, time, duration, force_key, reply } => {
+                let result = unsafe {
+                    let gpu = &*(gpu as *const Gpu);
+                    let frame = &*(frame as *const ID3D11Texture2D);
+                    encoder.submit_local(gpu, frame, time, duration, force_key)
+                };
+                if reply.send(result).is_err() {
+                    log::error!(
+                        "driver call finished after the deadline; leaking {} instead of releasing it",
+                        encoder.name
+                    );
+                    encoder.leak_native();
+                    return;
+                }
+            }
+            Request::Poll { reply } => {
+                let result = encoder.poll_local();
+                if reply.send(result).is_err() {
+                    log::error!(
+                        "driver poll finished after the deadline; leaking {} instead of releasing it",
+                        encoder.name
+                    );
+                    encoder.leak_native();
+                    return;
+                }
+            }
+            Request::TakeOutput { reply } => {
+                let _ = reply.send(std::mem::take(&mut encoder.output));
+            }
+            Request::MarkBroken => encoder.broken = true,
+            Request::Shutdown { reply } => {
+                encoder.shutdown_local();
+                let _ = reply.send(());
+            }
+        }
+    }
+    if !encoder.released {
+        encoder.shutdown_local();
     }
 }
 
@@ -632,6 +908,8 @@ struct NativeParts {
     bitrate_kbps: u32,
     fast_preset: bool,
     device_ptr: usize,
+    sessions: u32,
+    born: Instant,
     codec: Codec,
     name: String,
 }
@@ -674,6 +952,10 @@ impl NativeParts {
             manager: self.manager,
             device_ptr: self.device_ptr,
             released: false,
+            poisoned: false,
+            sessions: self.sessions,
+            born: self.born,
+            remote: None,
             codec: self.codec,
             name: self.name,
         }
@@ -713,6 +995,27 @@ static HW_CREATED: AtomicU64 = AtomicU64::new(0);
 static HW_REUSED: AtomicU64 = AtomicU64::new(0);
 static HW_RETIRED: AtomicU64 = AtomicU64::new(0);
 static HW_SHUTDOWN: AtomicU64 = AtomicU64::new(0);
+static STALLS: AtomicU64 = AtomicU64::new(0);
+static RECOVERIES: AtomicU64 = AtomicU64::new(0);
+
+pub fn note_stall() {
+    STALLS.fetch_add(1, Ordering::Relaxed);
+    note_hardware_failure();
+    log::error!(
+        "hardware encoder driver call exceeded {}s; abandoning the session and its thread without releasing them",
+        crate::safety::NATIVE_CALL_LIMIT.as_secs()
+    );
+}
+
+pub fn note_recovery() {
+    RECOVERIES.fetch_add(1, Ordering::Relaxed);
+    log::warn!("re-encoded on a fresh session after a driver stall");
+}
+
+#[cfg(test)]
+pub fn stall_counters() -> (u64, u64) {
+    (STALLS.load(Ordering::Relaxed), RECOVERIES.load(Ordering::Relaxed))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg(test)]
@@ -1026,16 +1329,28 @@ fn pull_and_discard(parts: &mut NativeParts) -> bool {
 
 /// Restart a parked async MFT. `into_encoder` starts `need_input` at 0, so only a
 /// `METransformNeedInput` posted after `START_OF_STREAM` can authorize `ProcessInput`.
+#[allow(clippy::result_large_err)]
 fn revive(mut parts: NativeParts) -> std::result::Result<VideoEncoder, NativeParts> {
+    parts.sessions = parts.sessions.saturating_add(1);
     if !begin_stream(&mut parts) {
         log::warn!("could not restart parked encoder {}", parts.name);
         return Err(parts);
     }
-    Ok(parts.into_encoder())
+    Ok(host_on_worker(parts.into_encoder()))
 }
 
+#[allow(clippy::result_large_err)]
 fn park_hardware(mut parts: NativeParts) -> std::result::Result<(), NativeParts> {
     if FORCE_RETIRE.load(Ordering::Relaxed) || parts.broken || !parts.hardware {
+        return Err(parts);
+    }
+    if crate::safety::retire_reused_encoder(parts.sessions, parts.born.elapsed()) {
+        log::info!(
+            "retiring {} after {} sessions ({:.0}s old)",
+            parts.name,
+            parts.sessions,
+            parts.born.elapsed().as_secs_f64()
+        );
         return Err(parts);
     }
     if !end_stream(&mut parts) {
@@ -1360,6 +1675,17 @@ mod media_foundation {
             match encoder.submit(gpu, &frame, stamp, step, force_key) {
                 Ok(true) => stamp += step,
                 Ok(false) => {}
+                Err(super::EncoderFault::Stalled) => {
+                    eprintln!("hardware encoder stalled; abandoning it and re-encoding the frame");
+                    let again = encoder.is_hardware() && !super::prefer_software();
+                    encoder = VideoEncoder::new(gpu, &settings(width, height, again)).expect("replacement encoder");
+                    super::note_recovery();
+                    match encoder.submit(gpu, &frame, stamp, step, force_key) {
+                        Ok(true) => stamp += step,
+                        Ok(false) => {}
+                        Err(err) => panic!("replacement encoder submit failed: {err}"),
+                    }
+                }
                 Err(err) => panic!("{label} encoder submit failed: {err}"),
             }
             let _ = encoder.poll();
@@ -1510,26 +1836,36 @@ mod media_foundation {
         let formats = [(640u32, 360u32), (1280, 720), (960, 540), (320, 240), (800, 600)];
         let started = std::time::Instant::now();
         let mut i = 0u64;
+        let mut hardware_turn = 0u64;
         let mut hardware_sessions = 0u64;
         let mut software_sessions = 0u64;
         while started.elapsed().as_secs() < seconds {
-            let (width, height) =
-                if i.is_multiple_of(8) { formats[((i / 8) % formats.len() as u64) as usize] } else { steady };
             if i.is_multiple_of(6) {
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
             let allow_hardware = hardware && !i.is_multiple_of(5);
-            if allow_hardware && encode_mp4(&gpu, width, height, true).is_some() {
-                hardware_sessions += 1;
+            if allow_hardware {
+                let (width, height) = match crate::safety::soak_hardware_format(hardware_turn, formats.len() as u64) {
+                    Some(index) => formats[index as usize],
+                    None => steady,
+                };
+                hardware_turn += 1;
+                if encode_mp4(&gpu, width, height, true).is_some() {
+                    hardware_sessions += 1;
+                } else {
+                    encode_mp4(&gpu, width, height, false).expect("software encoder");
+                    software_sessions += 1;
+                }
             } else {
-                encode_mp4(&gpu, width, height, false).expect("software encoder");
+                encode_mp4(&gpu, steady.0, steady.1, false).expect("software encoder");
                 software_sessions += 1;
             }
             i += 1;
             if i.is_multiple_of(10) {
                 let counters = super::encoder_counters();
+                let (stalls, recoveries) = super::stall_counters();
                 eprintln!(
-                    "soak: {i} sessions in {:.1}s (hardware {hardware_sessions}, software {software_sessions}; mf created {}, reused {}, retired {}, shut down {})",
+                    "soak: {i} sessions in {:.1}s (hardware {hardware_sessions}, software {software_sessions}; mf created {}, reused {}, retired {}, shut down {}; stalls {stalls}, recoveries {recoveries})",
                     started.elapsed().as_secs_f64(),
                     counters.created,
                     counters.reused,
@@ -1545,8 +1881,9 @@ mod media_foundation {
             super::encoder_counters()
         );
         let counters = super::encoder_counters();
+        let (stalls, recoveries) = super::stall_counters();
         eprintln!(
-            "soak done: {i} sessions in {:.1}s (hardware {hardware_sessions}, software {software_sessions}; mf created {}, reused {}, retired {}, shut down {})",
+            "soak done: {i} sessions in {:.1}s (hardware {hardware_sessions}, software {software_sessions}; mf created {}, reused {}, retired {}, shut down {}; stalls {stalls}, recoveries {recoveries})",
             started.elapsed().as_secs_f64(),
             counters.created,
             counters.reused,
