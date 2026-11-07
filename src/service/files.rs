@@ -113,17 +113,73 @@ pub fn new_video_path(config: &Config, fallback: &str) -> PathBuf {
     paths::unique_path(&dir, &format!("{prefix} {}", timestamp()))
 }
 
-/// Moves a crash checkpoint into the video folder. The checkpoint is only on disk when the
-/// process didn't get to delete it (a crash or a power loss).
-pub fn publish_checkpoint(config: &Config) -> Option<PathBuf> {
+/// Publishes crash checkpoints into the video folder. A live checkpoint whose publish fails is
+/// moved to a unique `replay-pending …` name so the next rolling checkpoint cannot overwrite it.
+/// Returns the videos that were published. Pending files that still fail are left in place.
+pub fn publish_checkpoint(config: &Config) -> Vec<PathBuf> {
+    let mut published = retry_pending_checkpoints(config);
     let src = paths::checkpoint_path();
-    let len = std::fs::metadata(&src).ok()?.len();
+    if !src.is_file() {
+        return published;
+    }
+    match publish_one(&src, config) {
+        Some(dest) => published.push(dest),
+        None => {
+            let len = std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
+            if len < 1024 {
+                // Not a real recording. Remove it so it cannot block the rolling checkpoint path.
+                let _ = std::fs::remove_file(&src);
+            } else if src.is_file() {
+                match park_live_checkpoint() {
+                    Ok(parked) => log::warn!("parked unpublished checkpoint at {}", parked.display()),
+                    Err(err) => log::warn!("could not park checkpoint ({err}); leaving {}", src.display()),
+                }
+            }
+        }
+    }
+    published
+}
+
+/// Tries again to publish checkpoints that were parked after a failed publish.
+pub fn retry_pending_checkpoints(config: &Config) -> Vec<PathBuf> {
+    pending_checkpoint_files().into_iter().filter_map(|path| publish_one(&path, config)).collect()
+}
+
+/// True when the rolling checkpoint path still holds a file we could not move aside.
+pub fn live_checkpoint_blocked() -> bool {
+    paths::checkpoint_path().is_file()
+}
+
+fn park_live_checkpoint() -> std::io::Result<PathBuf> {
+    let src = paths::checkpoint_path();
+    let dest = paths::unique_path(&paths::data_dir(), &format!("replay-pending {}", timestamp()));
+    crate::persist::publish_preserving(&src, &dest)?;
+    Ok(dest)
+}
+
+fn pending_checkpoint_files() -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = std::fs::read_dir(paths::data_dir()) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("replay-pending") && name.to_ascii_lowercase().ends_with(".mp4") {
+            files.push(entry.path());
+        }
+    }
+    files.sort();
+    files
+}
+
+fn publish_one(src: &Path, config: &Config) -> Option<PathBuf> {
+    let len = std::fs::metadata(src).ok()?.len();
     if len < 1024 {
         log::warn!("replay checkpoint {} is only {len} bytes; leaving it in place", src.display());
         return None;
     }
     let dest = paths::unique_path(&paths::video_dir(config), &format!("Recovered replay {}", timestamp()));
-    match crate::persist::publish_preserving(&src, &dest) {
+    match crate::persist::publish_preserving(src, &dest) {
         Ok(()) => Some(dest),
         Err(err) => {
             log::warn!("could not publish the replay checkpoint ({err}); keeping {}", src.display());

@@ -17,6 +17,7 @@ use crate::config::{Codec, Config};
 use crate::paths;
 use crate::safety::{self, Encoding};
 use buffer::{Clip, ReplayBuffer};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
@@ -152,9 +153,12 @@ pub struct Shared {
     checkpoint_busy: AtomicBool,
     /// Timestamp of the newest frame already copied into the crash checkpoint.
     checkpoint_newest: AtomicI64,
-    /// Format-change frames kept until a write of them has succeeded.
-    unsaved: Mutex<Option<UnsavedBuffer>>,
+    /// Format-change segments kept until each write has succeeded. Oldest first.
+    unsaved: Mutex<VecDeque<UnsavedBuffer>>,
 }
+
+/// How many unsaved segments to keep before trying to spill the oldest to disk.
+const UNSAVED_LIMIT: usize = 4;
 
 /// Replay state carried from one encoder session to the next so a restart doesn't wipe it.
 pub struct PreservedReplay {
@@ -162,8 +166,8 @@ pub struct PreservedReplay {
     format: Option<Arc<VideoFormat>>,
     audio_entry: Option<Arc<Vec<u8>>>,
     clock: clock::Clock,
-    /// Frames removed from the live buffer whose file is not on disk yet.
-    unsaved: Option<UnsavedBuffer>,
+    /// Frames removed from the live buffer whose files are not on disk yet.
+    unsaved: VecDeque<UnsavedBuffer>,
 }
 
 #[derive(Clone)]
@@ -202,50 +206,53 @@ impl Shared {
         *lock(&self.video_format) = Some(new);
     }
 
-    /// Moves the current buffer aside and writes it. The frames stay in `unsaved` until the
-    /// write returns success, including when the write fails. They are not handed to a detached
-    /// thread that could exit before the file exists.
+    /// Moves the current buffer aside and writes it. Older unsaved segments stay queued until
+    /// their own writes succeed. A new segment is appended, never written over an older one.
     fn recover_buffer(&self, format: Arc<VideoFormat>) {
-        self.flush_unsaved();
         let Some(clip) = lock(&self.buffer).as_mut().and_then(ReplayBuffer::take_clip) else {
             return;
         };
         let path = paths::unique_path(&self.video_dir, &format!("Recovered replay {}", local_stamp()));
         let frames = clip.video.len();
         log::warn!("encoder parameters changed; saving {frames} replay frames to {}", path.display());
-        *lock(&self.unsaved) = Some(UnsavedBuffer { clip, format, audio: self.audio_entry.clone(), path });
+        let segment = UnsavedBuffer { clip, format, audio: self.audio_entry.clone(), path };
+        {
+            let mut queue = lock(&self.unsaved);
+            if let Some(err) = safety::enqueue_unsaved(&mut queue, segment, UNSAVED_LIMIT, |oldest| {
+                let seconds = clip_seconds(&oldest.clip);
+                let path = oldest.path.clone();
+                write_unsaved(oldest)?;
+                self.events.send(Event::BufferRecovered { path, seconds });
+                Ok::<(), std::io::Error>(())
+            }) {
+                log::error!("could not spill the oldest unsaved replay segment ({err}); keeping it queued");
+            }
+        }
         self.flush_unsaved();
     }
 
     fn flush_unsaved(&self) {
-        let Some(unsaved) = lock(&self.unsaved).clone() else {
-            return;
-        };
-        let seconds = clip_seconds(&unsaved.clip);
-        let path = unsaved.path.clone();
-        let frames = unsaved.clip.video.len();
-        // `release_after_write` drops this copy only after the file is complete. The mutex keeps
-        // its own copy until that success is observed, so a failed write cannot lose the frames.
-        match safety::release_after_write(unsaved, |unsaved| {
-            writer::write_clip(
-                &unsaved.path,
-                &unsaved.clip,
-                &unsaved.format,
-                unsaved.audio.as_deref().map(Vec::as_slice),
-            )
-            .map(|_| ())
-        }) {
-            Ok(()) => {
-                let mut slot = lock(&self.unsaved);
-                if slot.as_ref().is_some_and(|held| held.path == path) {
-                    *slot = None;
+        loop {
+            let Some(unsaved) = lock(&self.unsaved).front().cloned() else {
+                return;
+            };
+            let seconds = clip_seconds(&unsaved.clip);
+            let path = unsaved.path.clone();
+            let frames = unsaved.clip.video.len();
+            match safety::release_after_write(unsaved, |unsaved| write_unsaved(unsaved).map(|_| ())) {
+                Ok(()) => {
+                    let mut queue = lock(&self.unsaved);
+                    if queue.front().is_some_and(|held| held.path == path) {
+                        queue.pop_front();
+                    }
+                    log::info!("saved {seconds:.1}s of replay buffer to {}", path.display());
+                    self.events.send(Event::BufferRecovered { path, seconds });
                 }
-                log::info!("saved {seconds:.1}s of replay buffer to {}", path.display());
-                self.events.send(Event::BufferRecovered { path, seconds });
-            }
-            Err((_, err)) => {
-                log::error!("could not save the replay buffer ({err}); keeping {frames} frames");
-                self.events.send(Event::SaveFailed(format!("Couldn't save the replay buffer: {err}")));
+                Err((_, err)) => {
+                    log::error!("could not save the replay buffer ({err}); keeping {frames} frames queued");
+                    self.events.send(Event::SaveFailed(format!("Couldn't save the replay buffer: {err}")));
+                    return;
+                }
             }
         }
     }
@@ -394,7 +401,7 @@ impl Pipeline {
             writers: Mutex::new(Vec::new()),
             checkpoint_busy: AtomicBool::new(false),
             checkpoint_newest: AtomicI64::new(i64::MIN),
-            unsaved: Mutex::new(preserved.and_then(|p| p.unsaved.clone())),
+            unsaved: Mutex::new(preserved.map(|p| p.unsaved.clone()).unwrap_or_default()),
         });
         let stop = Arc::new(AtomicBool::new(false));
         let (video_thread, video) = video::spawn(config.video.clone(), clock, shared.clone(), stop.clone())?;
@@ -540,9 +547,9 @@ impl Pipeline {
         let _gate = lock(&PIPELINE_GATE);
         self.finish(safety::JOIN_LIMIT);
         self.shared.flush_unsaved();
-        let unsaved = lock(&self.shared.unsaved).take();
+        let unsaved = std::mem::take(&mut *lock(&self.shared.unsaved));
         let buffer = lock(&self.shared.buffer).take();
-        if buffer.as_ref().is_none_or(ReplayBuffer::is_empty) && unsaved.is_none() {
+        if buffer.as_ref().is_none_or(ReplayBuffer::is_empty) && unsaved.is_empty() {
             return None;
         }
         Some(PreservedReplay {
@@ -602,6 +609,10 @@ impl Drop for Pipeline {
         // inside a native call; that thread releases its own objects when the call returns.
         self.finish(safety::JOIN_LIMIT);
     }
+}
+
+fn write_unsaved(unsaved: &UnsavedBuffer) -> std::io::Result<f64> {
+    writer::write_clip(&unsaved.path, &unsaved.clip, &unsaved.format, unsaved.audio.as_deref().map(Vec::as_slice))
 }
 
 fn clip_seconds(clip: &Clip) -> f64 {

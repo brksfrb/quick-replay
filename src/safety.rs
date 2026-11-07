@@ -1,6 +1,7 @@
 //! Decisions the capture pipeline and the crash supervisor share.
 //! No Windows types, so the stress test runs on any platform.
 
+use std::collections::VecDeque;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// No progress from the capture thread for this long means it is wedged.
@@ -100,6 +101,29 @@ pub fn release_after_write<T, E>(clip: T, write: impl FnOnce(&T) -> Result<(), E
         Ok(()) => Ok(()),
         Err(err) => Err((clip, err)),
     }
+}
+
+/// Append `item`. When the queue is already at `limit`, try to spill the oldest to disk first.
+/// A failed spill keeps that oldest segment and still appends `item`. Nothing is overwritten.
+pub fn enqueue_unsaved<T, E>(
+    queue: &mut VecDeque<T>,
+    item: T,
+    limit: usize,
+    spill_oldest: impl FnOnce(&T) -> Result<(), E>,
+) -> Option<E> {
+    let mut spill_error = None;
+    if limit > 0 && queue.len() >= limit {
+        if let Some(oldest) = queue.front() {
+            match spill_oldest(oldest) {
+                Ok(()) => {
+                    queue.pop_front();
+                }
+                Err(err) => spill_error = Some(err),
+            }
+        }
+    }
+    queue.push_back(item);
+    spill_error
 }
 
 #[cfg(test)]
@@ -232,6 +256,22 @@ mod tests {
         }
         assert!(!saw_finish);
         assert_eq!(worker_signal(DrainKind::DrainComplete), WorkerSignal::Finished);
+    }
+
+    #[test]
+    fn a_second_format_change_does_not_overwrite_unsaved_frames() {
+        let mut queue = VecDeque::new();
+        assert!(enqueue_unsaved(&mut queue, "segment-a", 2, |_| Err("disk")).is_none());
+        assert!(enqueue_unsaved(&mut queue, "segment-b", 2, |_| Err("disk")).is_none());
+        let err = enqueue_unsaved(&mut queue, "segment-c", 2, |_| Err("disk")).unwrap();
+        assert_eq!(err, "disk");
+        assert_eq!(queue.make_contiguous(), ["segment-a", "segment-b", "segment-c"]);
+        let spilled = enqueue_unsaved(&mut queue, "segment-d", 2, |oldest| {
+            assert_eq!(*oldest, "segment-a");
+            Ok::<(), &str>(())
+        });
+        assert!(spilled.is_none());
+        assert_eq!(queue.make_contiguous(), ["segment-b", "segment-c", "segment-d"]);
     }
 
     #[test]

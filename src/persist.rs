@@ -272,4 +272,22 @@ mod tests {
         assert!(!old_tmp.exists(), "the stale temp file is discarded");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn a_parked_checkpoint_survives_a_new_write_to_the_live_path() {
+        let dir = std::env::temp_dir().join(format!("qr-park-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("replay-checkpoint.mp4");
+        let evidence = b"crash-evidence-that-must-remain";
+        std::fs::write(&live, evidence).unwrap();
+        let parked = dir.join("replay-pending 2026-11-07 12-00-00.mp4");
+        publish_preserving(&live, &parked).unwrap();
+        assert!(!live.exists(), "parking frees the live checkpoint path");
+        assert_eq!(std::fs::read(&parked).unwrap(), evidence);
+        std::fs::write(&live, b"newer-rolling-checkpoint").unwrap();
+        assert_eq!(std::fs::read(&parked).unwrap(), evidence, "the new checkpoint must not replace the parked one");
+        assert_eq!(std::fs::read(&live).unwrap(), b"newer-rolling-checkpoint");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

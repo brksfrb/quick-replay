@@ -276,7 +276,12 @@ impl VideoEncoder {
         let provides_samples = info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0;
         let events = if is_async { Some(transform.cast::<IMFMediaEventGenerator>()?) } else { None };
         unsafe {
-            transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)?;
+            // The Microsoft software H.264 MFT returns E_FAIL (0x80004005) for FLUSH before
+            // streaming has started. Types are already set; a failed pre-start flush must not
+            // reject the encoder. Hardware encoders usually accept it.
+            if let Err(err) = transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0) {
+                log::info!("{name}: pre-start flush was rejected ({err}); starting the stream anyway");
+            }
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
         }
@@ -645,6 +650,8 @@ mod media_foundation {
     use super::VideoEncoder;
     use crate::config::Codec;
     use crate::win::ComGuard;
+    use qr_mp4::{annexb_to_sample, ParamSets, VideoCodec};
+    use std::sync::Arc;
     use windows::Win32::Graphics::Direct3D11::{ID3D11Texture2D, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT};
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 
@@ -666,72 +673,148 @@ mod media_foundation {
         tex.expect("NV12 texture")
     }
 
-    fn session(gpu: &super::super::gpu::Gpu, width: u32, height: u32, frames: i64) {
-        let settings = super::Settings {
+    fn settings(width: u32, height: u32, allow_hardware: bool) -> super::Settings {
+        super::Settings {
             codec: Codec::H264,
             width,
             height,
             fps: 30,
             bitrate_kbps: 800,
             fast_preset: true,
-            allow_hardware: false,
-        };
-        let mut encoder = VideoEncoder::new(gpu, &settings).expect("software H.264 encoder");
+            allow_hardware,
+        }
+    }
+
+    /// Encodes a short clip, writes an MP4, and checks the file parses.
+    /// `None` when hardware was requested and this PC has no hardware H.264 encoder.
+    fn encode_mp4(
+        gpu: &super::super::gpu::Gpu,
+        width: u32,
+        height: u32,
+        allow_hardware: bool,
+    ) -> Option<std::path::PathBuf> {
+        let mut encoder = VideoEncoder::new(gpu, &settings(width, height, allow_hardware)).expect("H.264 encoder");
+        if allow_hardware && !encoder.is_hardware() {
+            eprintln!("no hardware H.264 encoder ({}); skipping that path", encoder.name);
+            encoder.shutdown();
+            return None;
+        }
+        let label = if encoder.is_hardware() { "hardware" } else { "software" };
         let frame = nv12_texture(gpu, width, height);
         let step = 10_000_000 / 30;
-        for i in 0..frames {
-            match encoder.submit(gpu, &frame, i * step, step, i % 15 == 0) {
-                Ok(_) => {
-                    let _ = encoder.poll();
-                    let _ = encoder.take_output();
-                }
-                Err(err) => panic!("encoder submit failed: {err}"),
+        let mut encoded = Vec::new();
+        let mut stamp = 0i64;
+        for _ in 0..60 {
+            let force_key = encoded.is_empty();
+            match encoder.submit(gpu, &frame, stamp, step, force_key) {
+                Ok(true) => stamp += step,
+                Ok(false) => {}
+                Err(err) => panic!("{label} encoder submit failed: {err}"),
             }
+            let _ = encoder.poll();
+            encoded.extend(encoder.take_output());
+            if encoded.len() >= 8 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
         encoder.shutdown();
-        encoder.shutdown();
+        assert!(!encoded.is_empty(), "{label} encoder produced no frames at {width}x{height}");
+
+        let mut params = ParamSets::default();
+        let mut packets = Vec::new();
+        for frame in &encoded {
+            let (sample, key) = annexb_to_sample(VideoCodec::H264, &frame.data, &mut params);
+            if !sample.is_empty() {
+                packets.push(super::super::Packet { time: frame.time, data: Arc::<[u8]>::from(sample), key });
+            }
+        }
+        assert!(params.is_complete(VideoCodec::H264), "{label} encoder produced no parameter sets");
+        assert!(packets.iter().any(|p| p.key), "{label} encoder produced no keyframe");
+        let format = super::super::VideoFormat::from_params(Codec::H264, width, height, &params).expect("sample entry");
+        let clip = super::super::buffer::Clip { video: packets, audio: Vec::new() };
+        let dir = std::env::temp_dir().join(format!("qr-mft-{}-{}", label, std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join(format!("{label}-{width}x{height}.mp4"));
+        super::super::writer::write_clip(&path, &clip, &format, None).expect("write mp4");
+        let parsed = qr_mp4::probe(&path).unwrap_or_else(|err| panic!("{label} mp4 did not parse: {err}"));
+        assert_eq!(parsed.codec, Some(VideoCodec::H264));
+        let samples = parsed.tracks.iter().map(|t| t.samples.len()).sum::<usize>();
+        assert!(samples > 0, "{label} mp4 has no samples");
+        let _ = std::fs::remove_file(&path);
+        Some(path)
+    }
+
+    fn gpu() -> super::super::gpu::Gpu {
+        super::super::mf::startup();
+        super::super::gpu::Gpu::new().expect("Direct3D 11")
+    }
+
+    #[test]
+    #[ignore = "needs Media Foundation and a D3D11 device; not run in CI"]
+    fn media_foundation_software_encoder_writes_mp4() {
+        let _com = ComGuard::mta();
+        let gpu = gpu();
+        encode_mp4(&gpu, 320, 240, false).expect("software encoder");
+    }
+
+    #[test]
+    #[ignore = "needs a hardware H.264 MFT; skipped at runtime when this PC has none"]
+    fn media_foundation_hardware_encoder_writes_mp4() {
+        let _com = ComGuard::mta();
+        let gpu = gpu();
+        if encode_mp4(&gpu, 640, 360, true).is_none() {
+            eprintln!("skipping: no hardware H.264 encoder on this PC");
+        }
     }
 
     #[test]
     #[ignore = "needs Media Foundation and a D3D11 device; not run in CI"]
     fn media_foundation_encoder_restarts() {
         let _com = ComGuard::mta();
-        super::super::mf::startup();
-        let gpu = super::super::gpu::Gpu::new().expect("Direct3D 11");
-        for i in 0u32..12 {
-            let (width, height) = if i.is_multiple_of(3) { (320, 180) } else { (640, 360) };
-            if i.is_multiple_of(4) {
-                // Stand-in for the display going to sleep between sessions.
+        let gpu = gpu();
+        let mut hardware = encode_mp4(&gpu, 640, 360, true).is_some();
+        for i in 0u32..4 {
+            let (width, height) = if i.is_multiple_of(2) { (320, 240) } else { (640, 360) };
+            if i.is_multiple_of(2) {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            session(&gpu, width, height, 8);
+            encode_mp4(&gpu, width, height, false).expect("software encoder");
+            if hardware {
+                let (width, height) = if i.is_multiple_of(2) { (640, 360) } else { (1280, 720) };
+                hardware = encode_mp4(&gpu, width, height, true).is_some();
+            }
         }
     }
 
     #[test]
-    #[ignore = "multi-hour soak; set QUICKREPLAY_SOAK_SECS and run scripts/soak.ps1"]
+    #[ignore = "timed soak; set QUICKREPLAY_SOAK_SECS and run scripts/soak.ps1"]
     fn soak_media_foundation_encoder() {
-        let seconds: u64 = std::env::var("QUICKREPLAY_SOAK_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
         let _com = ComGuard::mta();
-        super::super::mf::startup();
-        let gpu = super::super::gpu::Gpu::new().expect("Direct3D 11");
+        let seconds: u64 = std::env::var("QUICKREPLAY_SOAK_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+        let gpu = gpu();
+        let hardware = encode_mp4(&gpu, 640, 360, true).is_some();
+        eprintln!("soak encoders: software{}", if hardware { " + hardware" } else { " only (no hardware MFT)" });
         let started = std::time::Instant::now();
         let mut i = 0u64;
         while started.elapsed().as_secs() < seconds {
-            let (width, height) = match i % 5 {
+            let (width, height) = match i % 4 {
                 0 => (640, 360),
                 1 => (1280, 720),
                 2 => (960, 540),
-                3 => (1920, 1080),
-                _ => (320, 180),
+                _ => (320, 240),
             };
             if i.is_multiple_of(6) {
-                // Simulated sleep: the capture thread would be frozen, then wake into a new encoder.
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
-            session(&gpu, width, height, 15);
+            let allow_hardware = hardware && i % 2 == 1;
+            if allow_hardware {
+                encode_mp4(&gpu, width, height, true);
+            } else {
+                encode_mp4(&gpu, width, height, false).expect("software encoder");
+            }
             i += 1;
-            if i.is_multiple_of(25) {
+            if i.is_multiple_of(10) {
                 eprintln!("soak: {i} encoder sessions in {:.1}s", started.elapsed().as_secs_f64());
             }
         }

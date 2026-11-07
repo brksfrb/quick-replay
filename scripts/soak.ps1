@@ -1,24 +1,29 @@
-# Multi-hour soak of the real Media Foundation encoder.
+# Soak the real Media Foundation encoders (software and hardware, when present).
 #
-# Each iteration builds a software H.264 encoder, submits frames, shuts it down
-# (waiting for the drain signal), then starts another. Resolution changes and a
+# Each iteration builds an H.264 encoder, submits frames, checks that an MP4
+# parses, shuts the encoder down, then starts another. Resolution changes and a
 # short sleep stand in for a monitor mode switch and a display sleep/wake.
-# The replay-buffer logic is covered by the in-process stress test; this script
-# is the native encoder running for hours on a Windows PC.
 #
 # Usage (from the repo root):
-#   powershell -ExecutionPolicy Bypass -File scripts/soak.ps1
-#   powershell -ExecutionPolicy Bypass -File scripts/soak.ps1 -Hours 8
+#   powershell -ExecutionPolicy Bypass -File scripts/soak.ps1 -Minutes 15
+#   powershell -ExecutionPolicy Bypass -File scripts/soak.ps1 -Hours 4
+#   powershell -ExecutionPolicy Bypass -File scripts/soak.ps1 -Hours 1 -Minutes 30
 
 param(
-    [int]$Hours = 4
+    [int]$Minutes = 0,
+    [int]$Hours = 0
 )
 
 $ErrorActionPreference = "Stop"
-$seconds = $Hours * 3600
+if ($Minutes -eq 0 -and $Hours -eq 0) {
+    $Hours = 4
+}
+$totalMinutes = $Minutes + ($Hours * 60)
+$seconds = $totalMinutes * 60
 $env:QUICKREPLAY_SOAK_SECS = "$seconds"
-Write-Host "Soaking the Media Foundation encoder for $Hours hour(s) ($seconds s)."
+Write-Host "Soaking software and hardware Media Foundation encoders for $totalMinutes minute(s) ($seconds s)."
 Write-Host "Simulated events: resolution changes, and a sleep/wake gap every few sessions."
+Write-Host "A PC with no hardware H.264 encoder runs the software encoder only."
 cargo test --bin QuickReplay -- --ignored soak_media_foundation_encoder --nocapture --test-threads=1
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE

@@ -136,6 +136,8 @@ struct Service {
     preserved: Option<PreservedReplay>,
     /// Set on quit so an in-flight checkpoint doesn't publish a file after a normal exit.
     checkpoint_cancel: Arc<AtomicBool>,
+    /// The rolling checkpoint path still holds crash evidence we could not move aside.
+    checkpoint_blocked: bool,
     taskbar_created: u32,
 }
 
@@ -787,6 +789,17 @@ impl Service {
     }
 
     fn checkpoint_buffer(&mut self) {
+        for path in files::retry_pending_checkpoints(&self.config) {
+            self.notify_video("Replay recovered", "Saved before QuickReplay stopped", &path);
+        }
+        if self.checkpoint_blocked {
+            let _ = files::publish_checkpoint(&self.config);
+            self.checkpoint_blocked = files::live_checkpoint_blocked();
+            if self.checkpoint_blocked {
+                log::warn!("not writing a new checkpoint over the unpublished crash file");
+                return;
+            }
+        }
         if let Some(pipeline) = &self.pipeline {
             pipeline.checkpoint(paths::checkpoint_path(), &self.checkpoint_cancel);
         }
@@ -1089,6 +1102,7 @@ pub fn run(mode: StartMode) {
         restart_delay_secs: 0,
         preserved: None,
         checkpoint_cancel: Arc::new(AtomicBool::new(false)),
+        checkpoint_blocked: false,
         taskbar_created,
     };
     SERVICE.with(|cell| *cell.borrow_mut() = Some(service));
@@ -1112,9 +1126,10 @@ pub fn run(mode: StartMode) {
             unsafe { SetTimer(Some(hwnd), TIMER_UPDATE, FIRST_UPDATE_MS, None) };
             unsafe { SetTimer(Some(hwnd), TIMER_WATCHDOG, WATCHDOG_TICK_MS, None) };
             unsafe { SetTimer(Some(hwnd), TIMER_CHECKPOINT, CHECKPOINT_MS, None) };
-            if let Some(path) = files::publish_checkpoint(&s.config) {
+            for path in files::publish_checkpoint(&s.config) {
                 s.notify_video("Replay recovered", "Saved before QuickReplay stopped", &path);
             }
+            s.checkpoint_blocked = files::live_checkpoint_blocked();
             if mode.updated {
                 s.notify(Glyph::Check, "QuickReplay updated", &format!("Now on version {}", env!("CARGO_PKG_VERSION")));
             }
