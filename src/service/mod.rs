@@ -855,9 +855,12 @@ impl Service {
         } else {
             let _ = std::fs::remove_file(paths::checkpoint_path());
         }
-        // `static` pools are not dropped at exit. Move parked MFTs to the graveyard thread.
-        // Quit does not wait out the delay: if this process ends first, the OS reclaims them.
+        // `static` pools are not dropped at exit. Move parked MFTs to the graveyard thread
+        // and wait out its delay so a retirement still pending is released before we exit.
         crate::capture::encoder::shutdown_pooled_encoders();
+        if !crate::capture::encoder::finish_pending_retirements() {
+            log::warn!("some hardware encoders were still in the graveyard at quit");
+        }
         unsafe { PostQuitMessage(0) };
     }
 

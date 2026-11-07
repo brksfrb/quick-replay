@@ -674,10 +674,9 @@ struct Pool {
 /// Parked hardware encoders.
 ///
 /// Rust does not drop `static` items when the process exits, so a `Drop` impl here would
-/// never run. [`shutdown_pooled_encoders`] is what a normal quit calls. It moves the MFTs
-/// to the graveyard thread and does not wait for the delay: if the process ends first, this
-/// thread does not `Release` them and the OS reclaims the memory. Releasing them inline on
-/// the way out is the ntdll crash.
+/// never run. [`shutdown_pooled_encoders`] moves them to the graveyard thread, and
+/// [`finish_pending_retirements`] waits out the delay before exit so a retirement that is
+/// still pending is released there. Releasing them inline on the quitting thread is the ntdll crash.
 static POOL: std::sync::Mutex<Pool> = std::sync::Mutex::new(Pool { sessions: Vec::new() });
 static LAST_HARDWARE_CREATE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
 static CREATE_GAP: std::sync::Mutex<Duration> = std::sync::Mutex::new(crate::safety::HARDWARE_CREATE_GAP);
@@ -718,6 +717,29 @@ pub fn set_hardware_create_gap_for_tests(gap: Duration) {
 #[cfg(test)]
 pub fn set_force_retire_hardware_for_tests(enabled: bool) {
     FORCE_RETIRE.store(enabled, Ordering::Relaxed);
+}
+
+/// Waits until every encoder handed to the graveyard has been released.
+/// Process exit calls this so a retirement still inside the delay is not abandoned.
+pub fn finish_pending_retirements() -> bool {
+    let timeout = crate::safety::GRAVEYARD_DELAY + Duration::from_secs(2);
+    let started = Instant::now();
+    loop {
+        let retired = HW_RETIRED.load(Ordering::Relaxed);
+        let shut_down = HW_SHUTDOWN.load(Ordering::Relaxed);
+        if shut_down >= retired {
+            return true;
+        }
+        if started.elapsed() >= timeout {
+            log::warn!(
+                "graveyard still holding {} hardware encoder(s) after {}s",
+                retired.saturating_sub(shut_down),
+                timeout.as_secs()
+            );
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Blocks until every encoder handed to the graveyard has been released, or `timeout` elapses.
@@ -778,9 +800,11 @@ fn reclaim_hardware(gpu: &Gpu, settings: &Settings) -> Option<VideoEncoder> {
 /// `METransformDrainComplete`. Stale `METransformNeedInput` events are not input credit.
 fn end_stream(parts: &mut NativeParts) -> bool {
     unsafe {
-        // Async MFTs complete this with METransformDrainComplete. COMMAND_DRAIN is the
-        // synchronous-MFT message and is not part of the reuse sequence.
+        // Async MFTs: NOTIFY_END_OF_STREAM, then COMMAND_DRAIN, then HaveOutput until
+        // METransformDrainComplete. DrainComplete is not posted if COMMAND_DRAIN is skipped.
+        // https://learn.microsoft.com/en-us/windows/win32/medfound/asynchronous-mfts#draining
         let _ = parts.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+        let _ = parts.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
     }
     let drained = wait_for_drain_complete(parts);
     unsafe {
@@ -968,8 +992,8 @@ fn graveyard_slot() -> std::sync::MutexGuard<'static, Option<Sender<Buried>>> {
     SLOT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Moves parked hardware encoders to the graveyard. Called on a normal quit because a
-/// `static` pool is not destroyed at process exit. Does not wait for [`crate::safety::GRAVEYARD_DELAY`].
+/// Moves parked hardware encoders to the graveyard. A `static` pool is not destroyed at
+/// process exit. Pair with [`finish_pending_retirements`] before the process ends.
 pub fn shutdown_pooled_encoders() {
     start_graveyard();
     let sessions = {
@@ -979,10 +1003,7 @@ pub fn shutdown_pooled_encoders() {
     if sessions.is_empty() {
         return;
     }
-    log::info!(
-        "retiring {} parked hardware encoder(s); if the process exits before the graveyard delay, the OS reclaims them",
-        sessions.len()
-    );
+    log::info!("retiring {} parked hardware encoder(s) on the graveyard thread", sessions.len());
     for parts in sessions {
         bury(parts);
     }
@@ -1410,6 +1431,11 @@ mod media_foundation {
             }
         }
         super::shutdown_pooled_encoders();
+        assert!(
+            super::finish_pending_retirements(),
+            "graveyard left encoders pending at exit: {:?}",
+            super::encoder_counters()
+        );
         let counters = super::encoder_counters();
         eprintln!(
             "soak done: {i} sessions in {:.1}s (hardware {hardware_sessions}, software {software_sessions}; mf created {}, reused {}, retired {}, shut down {})",
@@ -1419,6 +1445,7 @@ mod media_foundation {
             counters.retired,
             counters.shut_down
         );
+        assert!(counters.shut_down >= counters.retired, "retirements still pending at exit: {counters:?}");
         assert!(i > 0, "soak produced no encoder sessions");
         if hardware {
             assert!(hardware_sessions > software_sessions, "soak did not keep hardware as the common path");
