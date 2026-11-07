@@ -10,6 +10,7 @@ use super::{Packet, Shared, VideoFormat};
 use crate::config::{self, Codec};
 use crate::win::ComGuard;
 use qr_mp4::{ParamSets, VideoCodec};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -96,6 +97,9 @@ struct State {
     windowed_cap: bool,
     bitrate_kbps: u32,
     fast_preset: bool,
+    /// Pictures not yet accepted by the current encoder. Survives a busy submit, a second stall,
+    /// and a failure to construct the replacement.
+    recovery: VecDeque<encoder::HeldInput>,
 }
 
 impl Drop for State {
@@ -144,6 +148,7 @@ fn init(settings: &config::Video) -> Result<State, String> {
         windowed_cap,
         bitrate_kbps,
         fast_preset,
+        recovery: VecDeque::new(),
     })
 }
 
@@ -153,6 +158,7 @@ struct LiveParser {
     format_known: bool,
     need_key: bool,
     format_since: i64,
+    last_key: i64,
 }
 
 fn replace_stalled_encoder(
@@ -174,8 +180,59 @@ fn replace_stalled_encoder(
             }
         }
     }
-    // The old bitstream is finished. A software H.264 fallback must not be parsed as HEVC.
-    shared.seal_for_new_encoder();
+    for input in pending {
+        if !s.recovery.iter().any(|kept| kept.time == input.time) {
+            s.recovery.push_back(input);
+        }
+    }
+    flush_recovery(s, shared, parser, current_time)
+}
+
+fn flush_recovery(s: &mut State, shared: &Shared, parser: &mut LiveParser, current_time: i64) -> Result<(), String> {
+    if s.recovery.is_empty() {
+        return Ok(());
+    }
+    loop {
+        if s.encoder.is_poisoned() {
+            if let Err(err) = open_replacement(s) {
+                log::error!(
+                    "replacement encoder was not created ({err}); keeping {} recovery frames",
+                    s.recovery.len()
+                );
+                return Err(err);
+            }
+            reset_parser(s, shared, parser, current_time);
+        }
+        let width = s.width;
+        let height = s.height;
+        let replay = replay_held(&mut s.encoder, &s.gpu, &mut s.recovery, &mut |encoder, frames| {
+            publish_frames(encoder, width, height, shared, parser, frames)
+        });
+        match replay {
+            Ok(()) => {
+                encoder::note_recovery();
+                return Ok(());
+            }
+            Err(err) if err == "stall" => {
+                let mut again: VecDeque<encoder::HeldInput> = s.encoder.take_unacknowledged().into();
+                again.retain(|frame| !s.recovery.iter().any(|kept| kept.time == frame.time));
+                again.append(&mut s.recovery);
+                s.recovery = again;
+                if let Err(open_err) = open_replacement(s) {
+                    log::error!(
+                        "replacement encoder was not created ({open_err}); keeping {} recovery frames",
+                        s.recovery.len()
+                    );
+                    return Err(open_err);
+                }
+                reset_parser(s, shared, parser, current_time);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn open_replacement(s: &mut State) -> Result<(), String> {
     let settings = encoder::Settings {
         codec: s.encoder.codec,
         width: s.width,
@@ -186,6 +243,12 @@ fn replace_stalled_encoder(
         allow_hardware: !encoder::prefer_software(),
     };
     s.encoder = VideoEncoder::new(&s.gpu, &settings)?;
+    Ok(())
+}
+
+fn reset_parser(s: &State, shared: &Shared, parser: &mut LiveParser, current_time: i64) {
+    // The old bitstream is finished. A software H.264 fallback must not be parsed as HEVC.
+    shared.seal_for_new_encoder();
     parser.codec = match s.encoder.codec {
         Codec::H264 => VideoCodec::H264,
         Codec::Hevc => VideoCodec::Hevc,
@@ -194,19 +257,76 @@ fn replace_stalled_encoder(
     parser.format_known = false;
     parser.need_key = true;
     parser.format_since = current_time;
-    let mut first = true;
-    for input in pending {
-        let force_key = first || parser.need_key;
-        first = false;
-        let Some(texture) = input.texture.as_ref() else {
+}
+
+type PublishFrames<'a> = dyn FnMut(&VideoEncoder, Vec<encoder::EncodedFrame>) -> Result<(), String> + 'a;
+
+fn replay_held(
+    encoder: &mut VideoEncoder,
+    gpu: &Gpu,
+    recovery: &mut VecDeque<encoder::HeldInput>,
+    publish: &mut PublishFrames<'_>,
+) -> Result<(), String> {
+    // The two callbacks run one at a time. A shared reference would make that illegal to express.
+    let encoder = encoder as *mut VideoEncoder;
+    crate::safety::replay_until_accepted(
+        recovery,
+        |input, force_key| {
+            let encoder = unsafe { &mut *encoder };
+            let Some(texture) = input.texture.as_ref() else {
+                return Err("recovery frame has no texture".to_string());
+            };
+            match encoder.submit(gpu, texture, input.time, input.duration, force_key) {
+                Ok(accepted) => Ok(accepted),
+                Err(EncoderFault::Stalled) => Err("stall".into()),
+                Err(err) => Err(err.to_string()),
+            }
+        },
+        || {
+            let encoder = unsafe { &mut *encoder };
+            match encoder.poll() {
+                Ok(()) => match encoder.take_output() {
+                    Ok(frames) => publish(encoder, frames),
+                    Err(EncoderFault::Stalled) => Err("stall".into()),
+                    Err(err) => Err(err.to_string()),
+                },
+                Err(EncoderFault::Stalled) => Err("stall".into()),
+                Err(err) => Err(err.to_string()),
+            }
+        },
+    )
+}
+
+fn publish_frames(
+    encoder: &VideoEncoder,
+    width: u32,
+    height: u32,
+    shared: &Shared,
+    parser: &mut LiveParser,
+    frames: Vec<encoder::EncodedFrame>,
+) -> Result<(), String> {
+    for frame in frames {
+        let (sample, key) = qr_mp4::annexb_to_sample(parser.codec, &frame.data, &mut parser.params);
+        if !parser.format_known && parser.params.is_complete(parser.codec) {
+            match VideoFormat::from_params(encoder.codec, width, height, &parser.params) {
+                Ok(format) => {
+                    shared.set_video_format(format);
+                    parser.format_known = true;
+                }
+                Err(err) => return Err(format!("unexpected encoder output: {err}")),
+            }
+        }
+        if parser.need_key && !key {
             continue;
-        };
-        match s.encoder.submit(&s.gpu, texture, input.time, input.duration, force_key) {
-            Ok(_) => {}
-            Err(err) => return Err(format!("re-encode after a stall failed: {err}")),
+        }
+        if key {
+            parser.need_key = false;
+            parser.last_key = frame.time;
+        }
+        if parser.format_known && !sample.is_empty() {
+            shared.push_video(Packet { time: frame.time, data: sample.into(), key });
         }
     }
-    encoder::note_recovery();
     Ok(())
 }
 
@@ -287,12 +407,12 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
         format_known: false,
         need_key: false,
         format_since: clock.now(),
+        last_key: i64::MIN / 2,
     };
     let mut current = None;
     let mut tick = clock.now() / interval + 1;
     let mut pending_key = false;
     let mut last_encoded = i64::MIN / 2;
-    let mut last_key = i64::MIN / 2;
     // Share of the screen changed since the last encoded frame (also covers changes the busy
     // encoder couldn't take yet).
     let mut pending_change = 0.0f32;
@@ -307,6 +427,11 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
 
     while !stop.load(Ordering::Relaxed) {
         shared.beat();
+        if !s.recovery.is_empty() {
+            if let Err(err) = flush_recovery(&mut s, shared, &mut parser, current_time) {
+                log::error!("replay still holding {} frames after {err}", s.recovery.len());
+            }
+        }
         let target = tick * interval;
         let wait = target - clock.now();
         if wait > 0 {
@@ -347,7 +472,7 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
         let big_change = pending_change >= SMALL_CHANGE && target - last_encoded >= min_gap;
         let small_change_due = pending_change > 0.0 && target - last_encoded >= HNS_PER_SEC / SMALL_CHANGE_FPS;
         let dirty = big_change || small_change_due;
-        let key_due = target - last_key >= HNS_PER_SEC - interval / 2;
+        let key_due = target - parser.last_key >= HNS_PER_SEC - interval / 2;
         let refresh_due = target - last_encoded >= HNS_PER_SEC - interval / 2;
         let wanted = dirty || refresh_due || pending_key;
         if wanted && s.capture.has_frame() {
@@ -389,7 +514,10 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
                 Err(EncoderFault::Stalled) => {
                     // submit already kept this frame. Do not snapshot `current` again.
                     current_submitted = true;
-                    replace_stalled_encoder(&mut s, shared, &mut parser, None, true, target, interval)?;
+                    if let Err(err) = replace_stalled_encoder(&mut s, shared, &mut parser, None, true, target, interval)
+                    {
+                        log::error!("replay paused: {err}; {} frames still queued", s.recovery.len());
+                    }
                     recovered = true;
                     true
                 }
@@ -409,7 +537,7 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
             }
         } else if let Err(err) = s.encoder.poll() {
             if matches!(err, EncoderFault::Stalled) {
-                replace_stalled_encoder(
+                if let Err(err) = replace_stalled_encoder(
                     &mut s,
                     shared,
                     &mut parser,
@@ -417,7 +545,9 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
                     current_submitted,
                     current_time,
                     interval,
-                )?;
+                ) {
+                    log::error!("replay paused: {err}; {} frames still queued", s.recovery.len());
+                }
                 pending_key = true;
             } else {
                 return Err(encoder_error(&mut s.encoder, format!("encoder failed: {err}")));
@@ -427,7 +557,7 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
         let output = match s.encoder.take_output() {
             Ok(frames) => frames,
             Err(EncoderFault::Stalled) => {
-                replace_stalled_encoder(
+                if let Err(err) = replace_stalled_encoder(
                     &mut s,
                     shared,
                     &mut parser,
@@ -435,34 +565,15 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
                     current_submitted,
                     current_time,
                     interval,
-                )?;
+                ) {
+                    log::error!("replay paused: {err}; {} frames still queued", s.recovery.len());
+                }
                 pending_key = true;
                 Vec::new()
             }
             Err(err) => return Err(encoder_error(&mut s.encoder, format!("encoder failed: {err}"))),
         };
-        for frame in output {
-            let (sample, key) = qr_mp4::annexb_to_sample(parser.codec, &frame.data, &mut parser.params);
-            if !parser.format_known && parser.params.is_complete(parser.codec) {
-                match VideoFormat::from_params(s.encoder.codec, s.width, s.height, &parser.params) {
-                    Ok(format) => {
-                        shared.set_video_format(format);
-                        parser.format_known = true;
-                    }
-                    Err(err) => return Err(format!("unexpected encoder output: {err}")),
-                }
-            }
-            if parser.need_key && !key {
-                continue;
-            }
-            if key {
-                parser.need_key = false;
-                last_key = frame.time;
-            }
-            if parser.format_known && !sample.is_empty() {
-                shared.push_video(Packet { time: frame.time, data: sample.into(), key });
-            }
-        }
+        publish_frames(&s.encoder, s.width, s.height, shared, &mut parser, output)?;
 
         if !parser.format_known && target - parser.format_since > STALL_LIMIT {
             return Err(encoder_error(&mut s.encoder, "the video encoder produced no usable output".into()));

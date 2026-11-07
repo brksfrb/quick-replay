@@ -214,6 +214,30 @@ pub fn capture_through_stall(frames: &[u32], stall_at: Option<u32>) -> Vec<u32> 
     encoded
 }
 
+/// Submit every queued input. `Ok(false)` means the encoder did not accept the frame:
+/// the same item stays at the front, `service_output` runs, and the call retries.
+/// `Err` leaves the unaccepted tail, including the frame in hand, in `pending`.
+pub fn replay_until_accepted<T, E>(
+    pending: &mut VecDeque<T>,
+    mut submit: impl FnMut(&T, bool) -> Result<bool, E>,
+    mut service_output: impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    let mut force_key = true;
+    while !pending.is_empty() {
+        let accepted = {
+            let item = pending.front().expect("replay queue is non-empty");
+            submit(item, force_key)?
+        };
+        if accepted {
+            pending.pop_front();
+            force_key = false;
+        } else {
+            service_output()?;
+        }
+    }
+    Ok(())
+}
+
 /// Same device and same output format: flush and reconfigure, do not destroy the MFT.
 pub fn reuse_hardware_encoder(same_device: bool, same_format: bool, broken: bool) -> bool {
     same_device && same_format && !broken
@@ -250,6 +274,7 @@ pub fn enqueue_unsaved<T, E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     struct Fmt {
@@ -444,6 +469,60 @@ mod tests {
             hardware_turn += 1;
         }
         assert!(seen.iter().all(|hit| *hit), "a format landed only on software turns: {seen:?}");
+    }
+
+    #[test]
+    fn recovery_keeps_every_frame_when_submit_is_busy_and_stalls_again() {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct Frame {
+            id: u32,
+            time: i64,
+        }
+        let frames =
+            [Frame { id: 1, time: 0 }, Frame { id: 2, time: 10 }, Frame { id: 3, time: 20 }, Frame { id: 4, time: 30 }];
+        let mut pending: VecDeque<Frame> = frames.iter().cloned().collect();
+        // false, false, true for the first frame, then a stall on the second,
+        // a failed rebuild that must not drop the tail, then false, true for the rest.
+        let mut script =
+            VecDeque::from([Ok(false), Ok(false), Ok(true), Err("stall"), Ok(false), Ok(true), Ok(true), Ok(true)]);
+        let mut accepted = Vec::new();
+        let mut services = 0u32;
+        let mut stalled = false;
+        loop {
+            let result = replay_until_accepted(
+                &mut pending,
+                |frame, _force_key| match script.pop_front().expect("script") {
+                    Ok(true) => {
+                        accepted.push(frame.clone());
+                        Ok(true)
+                    }
+                    Ok(false) => Ok(false),
+                    Err(reason) => Err(reason),
+                },
+                || {
+                    services += 1;
+                    Ok(())
+                },
+            );
+            match result {
+                Ok(()) => break,
+                Err("stall") if !stalled => {
+                    stalled = true;
+                    let held: Vec<_> = pending.iter().cloned().collect();
+                    assert_eq!(held.iter().map(|frame| frame.id).collect::<Vec<_>>(), vec![2, 3, 4]);
+                    let build: Result<(), &str> = Err("encoder unavailable");
+                    if let Err(err) = build {
+                        assert_eq!(err, "encoder unavailable");
+                        assert_eq!(pending.iter().cloned().collect::<Vec<_>>(), held);
+                    }
+                }
+                Err(err) => panic!("recovery dropped frames: {err}; still held {pending:?}"),
+            }
+        }
+        assert!(stalled, "the scripted second stall did not run");
+        assert!(services >= 3, "busy submits must service output before retrying");
+        assert_eq!(accepted, frames);
+        assert!(pending.is_empty());
     }
 
     #[test]

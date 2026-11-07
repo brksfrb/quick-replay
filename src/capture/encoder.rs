@@ -11,7 +11,7 @@ use super::mf;
 use crate::config::Codec;
 use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Once;
 use std::time::{Duration, Instant};
@@ -334,6 +334,10 @@ impl VideoEncoder {
         self.hardware
     }
 
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     /// The next drop must not return this session to the reuse pool.
     pub fn mark_broken(&mut self) {
         self.broken = true;
@@ -497,7 +501,7 @@ impl VideoEncoder {
             });
             self.keep_if_outstanding(&result, owned, time, duration);
             if matches!(result, Err(EncoderFault::Stalled)) {
-                self.abandon_after_stall();
+                self.abandon_after_stall(StallPhase::Submit);
             }
             return result;
         }
@@ -552,7 +556,7 @@ impl VideoEncoder {
         if let Some(driver) = driver {
             let result = remote_call(&driver, |reply| Request::Poll { reply });
             if matches!(result, Err(EncoderFault::Stalled)) {
-                self.abandon_after_stall();
+                self.abandon_after_stall(StallPhase::ProcessOutput);
             }
             return result;
         }
@@ -573,13 +577,13 @@ impl VideoEncoder {
             let driver = remote.tx.clone();
             let (tx, rx) = mpsc::channel();
             if driver.send(Request::TakeOutput { reply: tx }).is_err() {
-                self.abandon_after_stall();
+                self.abandon_after_stall(StallPhase::ProcessOutput);
                 return Err(EncoderFault::Stalled);
             }
             match rx.recv_timeout(native_call_limit()) {
                 Ok(frames) => frames,
                 Err(_) => {
-                    self.abandon_after_stall();
+                    self.abandon_after_stall(StallPhase::ProcessOutput);
                     return Err(EncoderFault::Stalled);
                 }
             }
@@ -771,12 +775,12 @@ impl VideoEncoder {
         let (ack_tx, ack_rx) = mpsc::channel();
         if remote.tx.send(Request::Shutdown { reply: ack_tx }).is_err() {
             drop(remote.tx);
-            self.leak_worker(remote.join);
+            self.leak_worker(remote.join, StallPhase::Shutdown);
             return;
         }
         drop(remote.tx);
         if ack_rx.recv_timeout(native_call_limit()).is_err() {
-            self.leak_worker(remote.join);
+            self.leak_worker(remote.join, StallPhase::Drain);
             return;
         }
         // The ack means shutdown_local returned. The worker must then leave the loop.
@@ -785,7 +789,7 @@ impl VideoEncoder {
         match remote.done.recv_timeout(native_call_limit()) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.leak_worker(remote.join);
+                self.leak_worker(remote.join, StallPhase::Shutdown);
                 return;
             }
         }
@@ -793,19 +797,19 @@ impl VideoEncoder {
             if !join_within(join, Duration::from_secs(1)) {
                 self.poisoned = true;
                 self.released = true;
-                note_stall();
+                note_stall(StallPhase::Shutdown);
                 return;
             }
         }
         self.released = true;
     }
 
-    fn leak_worker(&mut self, join: Option<std::thread::JoinHandle<()>>) {
+    fn leak_worker(&mut self, join: Option<std::thread::JoinHandle<()>>, phase: StallPhase) {
         self.poisoned = true;
         self.released = true;
         self.broken = true;
         std::mem::forget(join);
-        note_stall();
+        note_stall(phase);
     }
 
     fn shutdown_local(&mut self) {
@@ -861,7 +865,7 @@ impl VideoEncoder {
         })
     }
 
-    fn abandon_after_stall(&mut self) {
+    fn abandon_after_stall(&mut self, phase: StallPhase) {
         if self.poisoned {
             return;
         }
@@ -874,7 +878,7 @@ impl VideoEncoder {
             std::mem::forget(remote.join);
             drop(remote.tx);
         }
-        note_stall();
+        note_stall(phase);
     }
 
     fn leak_native(&mut self) {
@@ -1191,15 +1195,51 @@ static HW_RETIRED: AtomicU64 = AtomicU64::new(0);
 static HW_SHUTDOWN: AtomicU64 = AtomicU64::new(0);
 static STALLS: AtomicU64 = AtomicU64::new(0);
 static RECOVERIES: AtomicU64 = AtomicU64::new(0);
+static LAST_STALL_PHASE: AtomicU8 = AtomicU8::new(255);
 static CALL_LIMIT: std::sync::Mutex<Duration> = std::sync::Mutex::new(crate::safety::NATIVE_CALL_LIMIT);
 
-pub fn note_stall() {
+#[derive(Clone, Copy, Debug)]
+pub enum StallPhase {
+    Submit,
+    ProcessOutput,
+    Drain,
+    Shutdown,
+}
+
+impl std::fmt::Display for StallPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            StallPhase::Submit => "submit",
+            StallPhase::ProcessOutput => "ProcessOutput",
+            StallPhase::Drain => "drain",
+            StallPhase::Shutdown => "shutdown",
+        })
+    }
+}
+
+pub fn note_stall(phase: StallPhase) {
     STALLS.fetch_add(1, Ordering::Relaxed);
+    LAST_STALL_PHASE.store(phase as u8, Ordering::Relaxed);
     note_hardware_failure();
-    log::error!(
-        "hardware encoder driver call exceeded {}s; abandoning the session and its thread without releasing them",
+    eprintln!(
+        "hardware encoder stalled during {phase} (driver call exceeded {}s); abandoning the session without releasing it",
         crate::safety::NATIVE_CALL_LIMIT.as_secs()
     );
+    log::error!(
+        "hardware encoder stalled during {phase} (driver call exceeded {}s); abandoning the session without releasing it",
+        crate::safety::NATIVE_CALL_LIMIT.as_secs()
+    );
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn last_stall_phase() -> &'static str {
+    match LAST_STALL_PHASE.load(Ordering::Relaxed) {
+        0 => "submit",
+        1 => "ProcessOutput",
+        2 => "drain",
+        3 => "shutdown",
+        _ => "none",
+    }
 }
 
 pub fn note_recovery() {
@@ -1857,6 +1897,7 @@ mod media_foundation {
     use crate::config::Codec;
     use crate::win::ComGuard;
     use qr_mp4::{annexb_to_sample, ParamSets, VideoCodec};
+    use std::collections::VecDeque;
     use std::sync::Arc;
     use std::time::Duration;
     use windows::Win32::Graphics::Direct3D11::{ID3D11Texture2D, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT};
@@ -1892,6 +1933,96 @@ mod media_foundation {
         }
     }
 
+    fn replay_after_stall(
+        gpu: &super::super::gpu::Gpu,
+        encoder: &mut VideoEncoder,
+        encoded: &mut Vec<super::EncodedFrame>,
+        accepted: &mut Vec<i64>,
+        width: u32,
+        height: u32,
+        allow_hardware: bool,
+    ) {
+        let mut pending: VecDeque<super::HeldInput> = encoder.take_unacknowledged().into();
+        eprintln!(
+            "hardware encoder stalled during {}; re-encoding {} frame(s) [{}]",
+            super::last_stall_phase(),
+            pending.len(),
+            pending.iter().map(|frame| frame.time.to_string()).collect::<Vec<_>>().join(", ")
+        );
+        loop {
+            if encoder.is_poisoned() {
+                let hardware = allow_hardware && !super::prefer_software();
+                match VideoEncoder::new(gpu, &settings(width, height, hardware)) {
+                    Ok(next) => *encoder = next,
+                    Err(err) => {
+                        eprintln!("replacement encoder was not created ({err}); {} frames still queued", pending.len());
+                        *encoder = VideoEncoder::new(gpu, &settings(width, height, false)).unwrap_or_else(|err| {
+                            panic!("software encoder failed ({err}); queued {:?}", times_of(&pending))
+                        });
+                    }
+                }
+            }
+            let encoder_ptr = encoder as *mut VideoEncoder;
+            let result = crate::safety::replay_until_accepted(
+                &mut pending,
+                |input: &super::HeldInput, force_key| {
+                    let encoder = unsafe { &mut *encoder_ptr };
+                    let Some(texture) = input.texture.as_ref() else {
+                        return Err("recovery frame has no texture".to_string());
+                    };
+                    match encoder.submit(gpu, texture, input.time, input.duration, force_key) {
+                        Ok(true) => {
+                            if !accepted.contains(&input.time) {
+                                accepted.push(input.time);
+                            }
+                            Ok(true)
+                        }
+                        Ok(false) => Ok(false),
+                        Err(super::EncoderFault::Stalled) => Err("stall".into()),
+                        Err(err) => Err(err.to_string()),
+                    }
+                },
+                || {
+                    let encoder = unsafe { &mut *encoder_ptr };
+                    match encoder.poll() {
+                        Ok(()) => match encoder.take_output() {
+                            Ok(frames) => {
+                                encoded.extend(frames);
+                                Ok(())
+                            }
+                            Err(super::EncoderFault::Stalled) => Err("stall".into()),
+                            Err(err) => Err(err.to_string()),
+                        },
+                        Err(super::EncoderFault::Stalled) => Err("stall".into()),
+                        Err(err) => Err(err.to_string()),
+                    }
+                },
+            );
+            match result {
+                Ok(()) => {
+                    super::note_recovery();
+                    return;
+                }
+                Err(err) if err == "stall" => {
+                    let mut again: VecDeque<super::HeldInput> = encoder.take_unacknowledged().into();
+                    again.retain(|frame| !pending.iter().any(|kept| kept.time == frame.time));
+                    again.append(&mut pending);
+                    pending = again;
+                    eprintln!(
+                        "stall during recovery ({}); {} frames still queued",
+                        super::last_stall_phase(),
+                        pending.len()
+                    );
+                }
+                Err(err) => panic!("replay failed ({err}); queued {:?}", times_of(&pending)),
+            }
+        }
+    }
+
+    fn times_of(pending: &VecDeque<super::HeldInput>) -> Vec<i64> {
+        pending.iter().map(|frame| frame.time).collect()
+    }
+
     /// Encodes a short clip, writes an MP4, and checks the file parses.
     /// `None` when hardware was requested and this PC has no hardware H.264 encoder.
     fn encode_mp4(
@@ -1910,50 +2041,69 @@ mod media_foundation {
         let frame = nv12_texture(gpu, width, height);
         let step = 10_000_000 / 30;
         let mut encoded = Vec::new();
+        let mut accepted = Vec::new();
         let mut stamp = 0i64;
         for _ in 0..60 {
-            let force_key = encoded.is_empty();
+            let force_key = accepted.is_empty();
             match encoder.submit(gpu, &frame, stamp, step, force_key) {
-                Ok(true) => stamp += step,
+                Ok(true) => {
+                    accepted.push(stamp);
+                    stamp += step;
+                }
                 Ok(false) => {}
                 Err(super::EncoderFault::Stalled) => {
-                    eprintln!("hardware encoder stalled; abandoning it and re-encoding unacknowledged frames");
-                    let pending = encoder.take_unacknowledged();
-                    let retry_current = pending.is_empty();
-                    let last_time = pending.last().map(|input| input.time);
-                    let again = encoder.is_hardware() && !super::prefer_software();
-                    encoder = VideoEncoder::new(gpu, &settings(width, height, again)).expect("replacement encoder");
-                    super::note_recovery();
-                    for (index, input) in pending.into_iter().enumerate() {
-                        let Some(texture) = input.texture.as_ref() else {
-                            continue;
-                        };
-                        match encoder.submit(gpu, texture, input.time, input.duration, index == 0) {
-                            Ok(_) => {}
-                            Err(err) => panic!("replacement encoder submit failed: {err}"),
-                        }
-                    }
-                    if retry_current {
-                        match encoder.submit(gpu, &frame, stamp, step, true) {
-                            Ok(true) => stamp += step,
-                            Ok(false) => {}
-                            Err(err) => panic!("replacement encoder submit failed: {err}"),
-                        }
-                    } else if let Some(last_time) = last_time {
-                        stamp = last_time + step;
-                    }
+                    replay_after_stall(gpu, &mut encoder, &mut encoded, &mut accepted, width, height, allow_hardware);
+                    stamp = accepted.last().copied().unwrap_or(-step) + step;
                 }
                 Err(err) => panic!("{label} encoder submit failed: {err}"),
             }
-            let _ = encoder.poll();
-            encoded.extend(encoder.take_output().unwrap_or_else(|err| panic!("{label} encoder output failed: {err}")));
-            if encoded.len() >= 8 {
+            if let Err(super::EncoderFault::Stalled) = encoder.poll() {
+                replay_after_stall(gpu, &mut encoder, &mut encoded, &mut accepted, width, height, allow_hardware);
+            }
+            match encoder.take_output() {
+                Ok(frames) => encoded.extend(frames),
+                Err(super::EncoderFault::Stalled) => {
+                    replay_after_stall(gpu, &mut encoder, &mut encoded, &mut accepted, width, height, allow_hardware);
+                }
+                Err(err) => panic!("{label} encoder output failed: {err}"),
+            }
+            if encoded.len() >= 8 && encoded.len() >= accepted.len() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        for _ in 0..40 {
+            if encoded.len() >= accepted.len() {
+                break;
+            }
+            if let Err(super::EncoderFault::Stalled) = encoder.poll() {
+                replay_after_stall(gpu, &mut encoder, &mut encoded, &mut accepted, width, height, allow_hardware);
+            }
+            match encoder.take_output() {
+                Ok(frames) if frames.is_empty() => break,
+                Ok(frames) => encoded.extend(frames),
+                Err(super::EncoderFault::Stalled) => {
+                    replay_after_stall(gpu, &mut encoder, &mut encoded, &mut accepted, width, height, allow_hardware);
+                }
+                Err(err) => panic!("{label} encoder output failed: {err}"),
+            }
+        }
         encoder.shutdown();
-        assert!(!encoded.is_empty(), "{label} encoder produced no frames at {width}x{height}");
+        assert!(encoded.len() >= 8, "{label} encoder produced {} frames", encoded.len());
+        assert_eq!(
+            encoded.len(),
+            accepted.len(),
+            "{label} encoded {} frames but accepted {}; missing timestamps",
+            encoded.len(),
+            accepted.len()
+        );
+        for (index, frame) in encoded.iter().enumerate() {
+            assert_eq!(
+                frame.time, accepted[index],
+                "{label} timestamp gap at frame {index}: got {}, expected {}",
+                frame.time, accepted[index]
+            );
+        }
 
         let mut params = ParamSets::default();
         let mut packets = Vec::new();
@@ -2122,12 +2272,13 @@ mod media_foundation {
                 let counters = super::encoder_counters();
                 let (stalls, recoveries) = super::stall_counters();
                 eprintln!(
-                    "soak: {i} sessions in {:.1}s (hardware {hardware_sessions}, software {software_sessions}; mf created {}, reused {}, retired {}, shut down {}; stalls {stalls}, recoveries {recoveries})",
+                    "soak: {i} sessions in {:.1}s (hardware {hardware_sessions}, software {software_sessions}; mf created {}, reused {}, retired {}, shut down {}; stalls {stalls}, recoveries {recoveries}, last stall {})",
                     started.elapsed().as_secs_f64(),
                     counters.created,
                     counters.reused,
                     counters.retired,
-                    counters.shut_down
+                    counters.shut_down,
+                    super::last_stall_phase()
                 );
             }
         }
@@ -2140,12 +2291,13 @@ mod media_foundation {
         let counters = super::encoder_counters();
         let (stalls, recoveries) = super::stall_counters();
         eprintln!(
-            "soak done: {i} sessions in {:.1}s (hardware {hardware_sessions}, software {software_sessions}; mf created {}, reused {}, retired {}, shut down {}; stalls {stalls}, recoveries {recoveries})",
+            "soak done: {i} sessions in {:.1}s (hardware {hardware_sessions}, software {software_sessions}; mf created {}, reused {}, retired {}, shut down {}; stalls {stalls}, recoveries {recoveries}, last stall {})",
             started.elapsed().as_secs_f64(),
             counters.created,
             counters.reused,
             counters.retired,
-            counters.shut_down
+            counters.shut_down,
+            super::last_stall_phase()
         );
         assert!(counters.shut_down >= counters.retired, "retirements still pending at exit: {counters:?}");
         assert!(i > 0, "soak produced no encoder sessions");
