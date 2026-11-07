@@ -82,15 +82,23 @@ fn save_clip(path: &Path, clip: &Clip, video: &VideoFormat, audio: Option<&[u8]>
         buf.extend_from_slice(&packet.data);
         Ok(())
     })
-    .and_then(|()| out.flush());
+    .and_then(|()| out.flush())
+    .and_then(|()| out.get_ref().sync_data());
     drop(out);
     if let Err(err) = written {
         let _ = std::fs::remove_file(&part);
         return Err(err);
     }
-    std::fs::rename(&part, path)?;
+    if let Err(err) = crate::persist::replace_file(&part, path) {
+        let _ = std::fs::remove_file(&part);
+        return Err(err);
+    }
     let last = clip.video.last().map_or(start, |p| p.time);
     Ok((last - start) as f64 / HNS_PER_SEC as f64)
+}
+
+pub fn write_clip(path: &Path, clip: &Clip, video: &VideoFormat, audio: Option<&[u8]>) -> std::io::Result<f64> {
+    save_clip(path, clip, video, audio)
 }
 
 /// Writes the clip on its own thread; the handle lets shutdown wait for the file to be complete.
@@ -229,7 +237,9 @@ impl Recording {
         let mut file = writer.finish()?;
         file.flush()?;
         file.inner.get_ref().sync_data()?;
-        std::fs::rename(part_path(&self.path), &self.path)?;
+        let part = part_path(&self.path);
+        drop(file);
+        crate::persist::replace_file(&part, &self.path)?;
         Ok((self.last_video - self.start) as f64 / HNS_PER_SEC as f64)
     }
 }

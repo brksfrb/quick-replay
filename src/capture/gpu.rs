@@ -58,4 +58,9 @@ impl Gpu {
         let winrt = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi)? }.cast()?;
         Ok(Gpu { device, context, luid, manager, winrt })
     }
+
+    /// Submits queued GPU work so the device isn't destroyed with commands still in flight.
+    pub fn flush(&self) {
+        unsafe { self.context.Flush() };
+    }
 }

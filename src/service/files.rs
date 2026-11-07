@@ -113,6 +113,29 @@ pub fn new_video_path(config: &Config, fallback: &str) -> PathBuf {
     paths::unique_path(&dir, &format!("{prefix} {}", timestamp()))
 }
 
+/// Moves a crash checkpoint into the video folder. The checkpoint is only on disk when the
+/// process didn't get to delete it (a crash or a power loss).
+pub fn publish_checkpoint(config: &Config) -> Option<PathBuf> {
+    let src = paths::checkpoint_path();
+    let len = std::fs::metadata(&src).ok()?.len();
+    if len < 1024 {
+        let _ = std::fs::remove_file(&src);
+        return None;
+    }
+    let dest = paths::unique_path(&paths::video_dir(config), &format!("Recovered replay {}", timestamp()));
+    if let Some(dir) = dest.parent() {
+        std::fs::create_dir_all(dir).ok()?;
+    }
+    match std::fs::rename(&src, &dest) {
+        Ok(()) => Some(dest),
+        Err(err) => {
+            log::warn!("could not publish the replay checkpoint: {err}");
+            let _ = std::fs::remove_file(&src);
+            None
+        }
+    }
+}
+
 /// After a crash or power loss: recordings left as `*.mp4.part` are repaired (cut at the last
 /// complete second) and renamed to `.mp4`. Unfinished replay saves can't be repaired and are
 /// removed. Returns the recovered files and their lengths in seconds.

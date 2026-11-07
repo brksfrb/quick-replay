@@ -491,6 +491,12 @@ fn general_section(ui: &mut Ui, config: &mut Config) -> SettingsAction {
         setting_row(ui, "Start with Windows", "Runs quietly in the tray after you sign in.", |ui| {
             toggle(ui, &mut config.general.start_with_windows)
         });
+        setting_row(
+            ui,
+            "Restart after a crash",
+            "Starts again on its own if QuickReplay is closed by a crash.",
+            |ui| toggle(ui, &mut config.general.restart_on_crash),
+        );
         setting_row(ui, "Open the window maximized", "Otherwise it opens centered on the screen.", |ui| {
             toggle(ui, &mut config.general.open_maximized)
         });

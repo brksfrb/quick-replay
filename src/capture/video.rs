@@ -47,6 +47,8 @@ static STALE_STREAK: AtomicU32 = AtomicU32::new(0);
 pub const STALE: &str = "screen capture went stale";
 /// How often to look at which app is in front.
 const FULLSCREEN_CHECK: i64 = HNS_PER_SEC;
+/// A hardware encoder that has produced output this long counts as healthy.
+const HARDWARE_HEALTHY: i64 = 30 * HNS_PER_SEC;
 
 pub struct VideoInfo {
     pub width: u32,
@@ -94,6 +96,16 @@ struct State {
     windowed_cap: bool,
 }
 
+impl Drop for State {
+    fn drop(&mut self) {
+        // Encoder worker first (it holds DXGI textures and the device manager), then the capture
+        // callback, and only then — when the fields below drop — the device itself.
+        self.encoder.shutdown();
+        self.capture.shutdown();
+        self.gpu.flush();
+    }
+}
+
 fn init(settings: &config::Video) -> Result<State, String> {
     let monitor = crate::win::monitors::find(&settings.monitor).ok_or("no monitor found")?;
     let gpu = Gpu::new().map_err(|e| format!("Direct3D 11 is unavailable: {e}"))?;
@@ -111,6 +123,7 @@ fn init(settings: &config::Video) -> Result<State, String> {
         fps,
         bitrate_kbps: settings.bitrate_kbps(width, height),
         fast_preset: settings.quality != config::Quality::High,
+        allow_hardware: !encoder::prefer_software(),
     };
     let encoder = VideoEncoder::new(&gpu, &encoder_settings)?;
     let windowed_cap = settings.full_rate_only_fullscreen && i64::from(fps) > WINDOWED_FPS;
@@ -170,6 +183,13 @@ pub fn spawn(
     Ok((handle, info))
 }
 
+fn encoder_error(encoder: &VideoEncoder, message: String) -> String {
+    if encoder.is_hardware() {
+        encoder::note_hardware_failure();
+    }
+    message
+}
+
 fn stale_restart_allowed() -> bool {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
     let last = LAST_STALE_RESTART_MS.load(Ordering::Relaxed);
@@ -206,8 +226,10 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
     let started = clock.now();
     let mut last_probe = started;
     let mut black_since: Option<i64> = None;
+    let mut hardware_ok = false;
 
     while !stop.load(Ordering::Relaxed) {
+        shared.beat();
         let target = tick * interval;
         let wait = target - clock.now();
         if wait > 0 {
@@ -219,9 +241,11 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
         if s.capture.is_closed() {
             return Err("the captured monitor was disconnected".into());
         }
-        if shared.take_capture_refresh() {
+        if !stop.load(Ordering::Relaxed) && shared.take_capture_refresh() {
             match ScreenCapture::new(&s.gpu, s.monitor, s.cursor, s.fps) {
                 Ok(fresh) if fresh.size() == s.capture.size() => {
+                    // Stop the old session's callback before its objects are freed.
+                    s.capture.shutdown();
                     s.capture = fresh;
                     black_since = None;
                     log::info!("screen capture session refreshed");
@@ -280,19 +304,22 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
         }
         if let (Some(frame), true) = (&current, wanted) {
             let force_key = pending_key || key_due;
-            let accepted = s
-                .encoder
-                .submit(&s.gpu, frame, target, interval, force_key)
-                .map_err(|e| format!("encoder failed: {e}"))?;
+            let accepted = match s.encoder.submit(&s.gpu, frame, target, interval, force_key) {
+                Ok(accepted) => accepted,
+                Err(err) => return Err(encoder_error(&s.encoder, format!("encoder failed: {err}"))),
+            };
             if accepted {
                 last_encoded = target;
                 pending_key = false;
                 pending_change = 0.0;
             } else if target - last_encoded.max(started) > STALL_LIMIT {
-                return Err("the video encoder stopped responding".into());
+                // Shut the wedged encoder down on the way out (State::drop). Returning the error
+                // restarts the pipeline; it must not free the MFT while its thread is still in it.
+                log::warn!("video encoder stopped responding; releasing it before restart");
+                return Err(encoder_error(&s.encoder, "the video encoder stopped responding".into()));
             }
-        } else {
-            s.encoder.poll().map_err(|e| format!("encoder failed: {e}"))?;
+        } else if let Err(err) = s.encoder.poll() {
+            return Err(encoder_error(&s.encoder, format!("encoder failed: {err}")));
         }
 
         for frame in s.encoder.take_output() {
@@ -315,7 +342,11 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
         }
 
         if !format_known && target - started > STALL_LIMIT {
-            return Err("the video encoder produced no usable output".into());
+            return Err(encoder_error(&s.encoder, "the video encoder produced no usable output".into()));
+        }
+        if !hardware_ok && format_known && s.encoder.is_hardware() && target - started >= HARDWARE_HEALTHY {
+            encoder::note_hardware_recovered();
+            hardware_ok = true;
         }
 
         tick += 1;

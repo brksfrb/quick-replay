@@ -1,8 +1,9 @@
 //! Whole-monitor capture with Windows.Graphics.Capture. Frames stay on the GPU.
 
 use super::gpu::Gpu;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use windows::core::Interface;
 use windows::Foundation::{TimeSpan, TypedEventHandler};
 use windows::Graphics::Capture::{
@@ -24,9 +25,15 @@ pub struct ScreenCapture {
     session: GraphicsCaptureSession,
     pool_size: SizeInt32,
     closed: Arc<AtomicBool>,
+    /// Closed callbacks currently on a thread-pool stack. Shutdown waits until this is zero.
+    callback_entered: Arc<AtomicU32>,
+    /// After this is set, a late callback only returns; it must not touch the capture objects.
+    callback_stop: Arc<AtomicBool>,
+    closed_token: i64,
     /// The newest frame, kept unconverted until the encoder actually needs it.
     held: Option<Direct3D11CaptureFrame>,
-    _item: GraphicsCaptureItem,
+    item: GraphicsCaptureItem,
+    stopped: bool,
 }
 
 impl ScreenCapture {
@@ -38,9 +45,20 @@ impl ScreenCapture {
         let session = pool.CreateCaptureSession(&item)?;
 
         let closed = Arc::new(AtomicBool::new(false));
+        let callback_entered = Arc::new(AtomicU32::new(0));
+        let callback_stop = Arc::new(AtomicBool::new(false));
         let flag = closed.clone();
-        item.Closed(&TypedEventHandler::new(move |_, _| {
-            flag.store(true, Ordering::Relaxed);
+        let entered = callback_entered.clone();
+        let stop = callback_stop.clone();
+        // The token has to be kept: dropping the item while this handler is still registered
+        // (or running on the thread pool) frees the event source under the callback and faults
+        // in ntdll.
+        let closed_token = item.Closed(&TypedEventHandler::new(move |_, _| {
+            entered.fetch_add(1, Ordering::AcqRel);
+            if !stop.load(Ordering::Acquire) {
+                flag.store(true, Ordering::Relaxed);
+            }
+            entered.fetch_sub(1, Ordering::Release);
             Ok(())
         }))?;
 
@@ -54,7 +72,45 @@ impl ScreenCapture {
         let _ = session.SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportOnly);
 
         session.StartCapture()?;
-        Ok(ScreenCapture { pool, session, pool_size: size, closed, held: None, _item: item })
+        Ok(ScreenCapture {
+            pool,
+            session,
+            pool_size: size,
+            closed,
+            callback_entered,
+            callback_stop,
+            closed_token,
+            held: None,
+            item,
+            stopped: false,
+        })
+    }
+
+    /// Unsubscribes the Closed callback, waits until any in-flight call has returned, then closes
+    /// the session and the frame pool. The D3D device must still be alive (the caller drops it
+    /// afterwards). Safe to call more than once.
+    pub fn shutdown(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
+        self.callback_stop.store(true, Ordering::Release);
+        let _ = self.item.RemoveClosed(self.closed_token);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while self.callback_entered.load(Ordering::Acquire) != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if let Some(frame) = self.held.take() {
+            let _ = frame.Close();
+        }
+        // Stop production first. The pool only has a couple of buffers; draining without
+        // closing the session can spin if a new frame arrives every iteration.
+        let _ = self.session.Close();
+        for _ in 0..8 {
+            let Ok(frame) = self.pool.TryGetNextFrame() else { break };
+            let _ = frame.Close();
+        }
+        let _ = self.pool.Close();
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -128,10 +184,6 @@ impl ScreenCapture {
 
 impl Drop for ScreenCapture {
     fn drop(&mut self) {
-        if let Some(frame) = self.held.take() {
-            let _ = frame.Close();
-        }
-        let _ = self.session.Close();
-        let _ = self.pool.Close();
+        self.shutdown();
     }
 }

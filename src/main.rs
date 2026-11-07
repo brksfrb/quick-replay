@@ -9,6 +9,8 @@ mod icon;
 mod logger;
 mod organize;
 mod paths;
+mod persist;
+mod safety;
 
 #[cfg(windows)]
 mod capture;
@@ -20,6 +22,8 @@ mod install;
 mod ipc;
 #[cfg(windows)]
 mod service;
+#[cfg(windows)]
+mod supervisor;
 #[cfg(windows)]
 mod update;
 #[cfg(windows)]
@@ -50,6 +54,10 @@ fn main() {
     let autostart = has("--autostart");
     if !autostart && install::install_if_needed() {
         // The installed copy has been started; this one is done.
+        return;
+    }
+    if !supervisor::is_child(&args) && supervisor::enabled() {
+        supervisor::run(&args);
         return;
     }
     service::run(service::StartMode {

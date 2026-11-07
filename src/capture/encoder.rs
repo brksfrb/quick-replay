@@ -1,10 +1,17 @@
 //! Hardware video encoding (NVENC / AMF / Quick Sync) through Media Foundation transforms.
 //! Falls back to the Windows software H.264 encoder when no hardware encoder is usable.
+//!
+//! Hardware encoders are asynchronous: they encode on their own thread. That thread has to be
+//! idle, and every interface into the encoder released, before the encoder is shut down.
+//! Shutting it down earlier frees a critical section the worker is still inside and the process
+//! dies in ntdll (access violation 0xc0000005) with no Rust panic.
 
 use super::gpu::Gpu;
 use super::mf;
 use crate::config::Codec;
 use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 use windows::core::{Interface, Result, GUID};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC,
@@ -27,7 +34,7 @@ enum Input {
 }
 
 pub struct VideoEncoder {
-    transform: IMFTransform,
+    transform: Option<IMFTransform>,
     activate: Option<IMFActivate>,
     codec_api: Option<ICodecAPI>,
     events: Option<IMFMediaEventGenerator>,
@@ -40,10 +47,16 @@ pub struct VideoEncoder {
     width: u32,
     height: u32,
     output: Vec<EncodedFrame>,
+    /// The encoder was given the DXGI device manager and must be told to drop it.
+    uses_d3d: bool,
+    hardware: bool,
+    /// `shutdown` has already released the native objects. Drop is then a no-op.
+    released: bool,
     pub codec: Codec,
     pub name: String,
 }
 
+#[derive(Clone, Copy)]
 pub struct Settings {
     pub codec: Codec,
     pub width: u32,
@@ -51,6 +64,40 @@ pub struct Settings {
     pub fps: u32,
     pub bitrate_kbps: u32,
     pub fast_preset: bool,
+    /// When false, skip NVENC/AMF/Quick Sync and use the software H.264 encoder.
+    pub allow_hardware: bool,
+}
+
+/// Runtime hardware-encoder failures in this process. After this many, later captures skip
+/// hardware and use the software H.264 encoder instead of constructing another NVENC session.
+const HW_FAILURES_BEFORE_SOFTWARE: u32 = 2;
+static HW_FAILURES: AtomicU32 = AtomicU32::new(0);
+
+fn fallback_after(failures: u32) -> bool {
+    failures >= HW_FAILURES_BEFORE_SOFTWARE
+}
+
+/// True once hardware encoding has failed repeatedly and should not be tried again.
+pub fn prefer_software() -> bool {
+    fallback_after(HW_FAILURES.load(Ordering::Relaxed))
+}
+
+pub fn note_hardware_failure() {
+    let count = HW_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    if fallback_after(count) {
+        log::warn!("hardware encoder has failed {count} times; the next capture will use the software H.264 encoder");
+    } else {
+        log::warn!("hardware encoder failed ({count} of {HW_FAILURES_BEFORE_SOFTWARE} before software fallback)");
+    }
+}
+
+/// A hardware encoder that has been producing pictures is healthy again. A streak that already
+/// crossed the fallback threshold stays there: don't go back to an encoder that kept dying.
+pub fn note_hardware_recovered() {
+    let current = HW_FAILURES.load(Ordering::Relaxed);
+    if current > 0 && !fallback_after(current) {
+        HW_FAILURES.store(0, Ordering::Relaxed);
+    }
 }
 
 fn subtype(codec: Codec) -> GUID {
@@ -133,19 +180,29 @@ fn video_type(sub: &GUID, s: &Settings) -> Result<IMFMediaType> {
 
 impl VideoEncoder {
     pub fn new(gpu: &Gpu, settings: &Settings) -> std::result::Result<VideoEncoder, String> {
-        for activate in hardware_encoders(gpu, settings.codec) {
-            let name = activate.cast::<IMFAttributes>().map(|a| mf::friendly_name(&a)).unwrap_or_default();
-            match Self::from_activate(gpu, &activate, settings, name.clone()) {
-                Ok(encoder) => return Ok(encoder),
-                Err(err) => {
-                    log::warn!("hardware encoder '{name}' failed: {err}");
-                    let _ = unsafe { activate.ShutdownObject() };
+        if settings.allow_hardware {
+            for activate in hardware_encoders(gpu, settings.codec) {
+                let name = activate.cast::<IMFAttributes>().map(|a| mf::friendly_name(&a)).unwrap_or_default();
+                match Self::from_activate(gpu, &activate, settings, name.clone()) {
+                    Ok(encoder) => return Ok(encoder),
+                    Err(err) => {
+                        log::warn!("hardware encoder '{name}' failed: {err}");
+                        // ActivateObject failed or configure released the transform already.
+                        // ShutdownObject drops the activation object's own reference.
+                        let _ = unsafe { activate.ShutdownObject() };
+                    }
                 }
             }
+            log::warn!("no usable hardware encoder for {:?}, using the software H.264 encoder", settings.codec);
+        } else {
+            log::warn!("using the software H.264 encoder after repeated hardware-encoder failures");
         }
-        log::warn!("no usable hardware encoder for {:?}, using the software H.264 encoder", settings.codec);
-        let software = Settings { codec: Codec::H264, ..*settings };
+        let software = Settings { codec: Codec::H264, allow_hardware: false, ..*settings };
         Self::software(gpu, &software).map_err(|err| format!("no video encoder available: {err}"))
+    }
+
+    pub fn is_hardware(&self) -> bool {
+        self.hardware
     }
 
     fn from_activate(gpu: &Gpu, activate: &IMFActivate, s: &Settings, name: String) -> Result<VideoEncoder> {
@@ -232,7 +289,7 @@ impl VideoEncoder {
             s.bitrate_kbps
         );
         Ok(VideoEncoder {
-            transform,
+            transform: Some(transform),
             activate: None,
             codec_api,
             events,
@@ -245,9 +302,16 @@ impl VideoEncoder {
             width: s.width,
             height: s.height,
             output: Vec::new(),
+            uses_d3d: d3d_aware,
+            hardware,
+            released: false,
             codec: s.codec,
             name,
         })
+    }
+
+    fn transform(&self) -> Result<IMFTransform> {
+        self.transform.clone().ok_or_else(|| windows::core::Error::from(MF_E_SHUTDOWN))
     }
 
     /// Feeds one frame. Returns false when the encoder is busy and the frame was dropped.
@@ -269,7 +333,8 @@ impl VideoEncoder {
                 set_codec_value(api, &CODECAPI_AVEncVideoForceKeyFrame, &mf::variant_u32(1));
             }
         }
-        match unsafe { self.transform.ProcessInput(self.input_id, &sample, 0) } {
+        let input = unsafe { self.transform()?.ProcessInput(self.input_id, &sample, 0) };
+        match input {
             Ok(()) => {}
             Err(err) if err.code() == MF_E_NOTACCEPTING => return Ok(false),
             Err(err) => return Err(err),
@@ -346,7 +411,7 @@ impl VideoEncoder {
             pEvents: ManuallyDrop::new(None),
         };
         let mut status = 0u32;
-        let result = unsafe { self.transform.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status) };
+        let result = unsafe { self.transform()?.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status) };
         let sample = ManuallyDrop::into_inner(buffer.pSample);
         drop(ManuallyDrop::into_inner(buffer.pEvents));
         match result {
@@ -361,11 +426,11 @@ impl VideoEncoder {
                 Ok(true)
             }
             Err(err) if err.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
-                unsafe {
-                    let new_type = self.transform.GetOutputAvailableType(self.output_id, 0)?;
-                    self.transform.SetOutputType(self.output_id, &new_type, 0)?;
-                    self.output_size = self.transform.GetOutputStreamInfo(self.output_id)?.cbSize.max(self.output_size);
-                }
+                let transform = self.transform()?;
+                let new_type = unsafe { transform.GetOutputAvailableType(self.output_id, 0)? };
+                unsafe { transform.SetOutputType(self.output_id, &new_type, 0)? };
+                let info = unsafe { transform.GetOutputStreamInfo(self.output_id)? };
+                self.output_size = info.cbSize.max(self.output_size);
                 Ok(true)
             }
             Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(false),
@@ -374,15 +439,95 @@ impl VideoEncoder {
     }
 }
 
-impl Drop for VideoEncoder {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-            let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
-            if let Some(activate) = &self.activate {
+/// Wait at most this long for the encoder thread to post its last events.
+const SHUTDOWN_LIMIT: Duration = Duration::from_millis(500);
+/// An empty event queue for this long means the worker has gone idle.
+const SHUTDOWN_QUIET: Duration = Duration::from_millis(100);
+
+impl VideoEncoder {
+    /// Stops the encoder thread and only then releases COM/D3D objects.
+    ///
+    /// Order matters. `IMFActivate::ShutdownObject` tears the MFT down; calling it while
+    /// `IMFTransform` / the event generator are still held, or while the async worker is inside
+    /// the Media Foundation event queue, frees that queue's lock out from under the worker.
+    /// The worker then faults at a fixed instruction in ntdll (0xc0000005). Flush is synchronous
+    /// (the MFT must drop in-flight samples before it returns). Interfaces are released before
+    /// `ShutdownObject`, which is what drops the activation object's own reference.
+    pub fn shutdown(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        if let Some(transform) = self.transform.clone() {
+            unsafe {
+                let _ = transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+                let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+                let _ = transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+            }
+            self.drain_shutdown_events();
+            if self.uses_d3d {
+                unsafe {
+                    let _ = transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
+                }
+            }
+            unsafe {
+                let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+                let _ = transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+            }
+            drop(transform);
+        }
+        // Drop our interfaces first so the worker can't be running inside them, then shut down.
+        self.events = None;
+        self.codec_api = None;
+        self.input = Input::Gpu;
+        self.transform = None;
+        self.output.clear();
+        if let Some(activate) = self.activate.take() {
+            unsafe {
                 let _ = activate.ShutdownObject();
             }
         }
+    }
+
+    fn drain_shutdown_events(&mut self) {
+        if self.events.is_none() {
+            return;
+        }
+        let deadline = Instant::now() + SHUTDOWN_LIMIT;
+        let mut quiet_since = Instant::now();
+        loop {
+            if Instant::now() >= deadline {
+                log::warn!("encoder shutdown timed out waiting for its worker; releasing it");
+                break;
+            }
+            let event = {
+                let Some(events) = self.events.as_ref() else { break };
+                match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                    Ok(event) => event,
+                    Err(err) if err.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                        if quiet_since.elapsed() >= SHUTDOWN_QUIET {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+            };
+            quiet_since = Instant::now();
+            let kind = unsafe { event.GetType() }.unwrap_or(0);
+            if kind == METransformHaveOutput.0 as u32 {
+                let _ = self.pull_output();
+            } else if kind == METransformDrainComplete.0 as u32 || kind == MEError.0 as u32 {
+                break;
+            }
+        }
+    }
+}
+
+impl Drop for VideoEncoder {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -427,4 +572,17 @@ fn read_nv12(
         gpu.context.Unmap(staging, 0);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fallback_after, HW_FAILURES_BEFORE_SOFTWARE};
+
+    #[test]
+    fn software_fallback_starts_after_repeated_hardware_failures() {
+        assert!(!fallback_after(0));
+        assert!(!fallback_after(HW_FAILURES_BEFORE_SOFTWARE - 1));
+        assert!(fallback_after(HW_FAILURES_BEFORE_SOFTWARE));
+        assert!(fallback_after(HW_FAILURES_BEFORE_SOFTWARE + 4));
+    }
 }

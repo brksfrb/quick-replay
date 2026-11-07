@@ -20,6 +20,12 @@ pub struct Clip {
 /// Keyframes come every second, so keep a little extra to always have a full-length clip.
 const SLACK_HNS: i64 = 2 * super::clock::HNS_PER_SEC;
 
+impl Clone for ReplayBuffer {
+    fn clone(&self) -> Self {
+        Self { video: self.video.clone(), audio: self.audio.clone(), keep_hns: self.keep_hns, bytes: self.bytes }
+    }
+}
+
 impl ReplayBuffer {
     pub fn new(seconds: u32) -> Self {
         Self { video: VecDeque::new(), audio: VecDeque::new(), keep_hns: Self::hns(seconds), bytes: 0 }
@@ -32,6 +38,35 @@ impl ReplayBuffer {
     pub fn set_seconds(&mut self, seconds: u32) {
         self.keep_hns = Self::hns(seconds);
         self.trim();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.video.is_empty()
+    }
+
+    /// How many seconds of video are actually buffered.
+    pub fn span_seconds(&self) -> f64 {
+        match (self.video.front(), self.video.back()) {
+            (Some(first), Some(last)) => (last.time - first.time).max(0) as f64 / super::clock::HNS_PER_SEC as f64,
+            _ => 0.0,
+        }
+    }
+
+    pub fn clear_audio(&mut self) {
+        while let Some(packet) = self.audio.pop_front() {
+            self.bytes = self.bytes.saturating_sub(packet.data.len());
+        }
+    }
+
+    /// Removes every packet, leaving the duration setting in place.
+    pub fn take_clip(&mut self) -> Option<Clip> {
+        if self.video.is_empty() {
+            return None;
+        }
+        let video = self.video.drain(..).collect();
+        let audio = self.audio.drain(..).collect();
+        self.bytes = 0;
+        Some(Clip { video, audio })
     }
 
     #[cfg(test)]
@@ -76,6 +111,15 @@ impl ReplayBuffer {
                 self.bytes -= packet.data.len();
             }
         }
+    }
+
+    /// Every buffered packet, for a checkpoint or a format-change recovery.
+    pub fn clip_all(&self) -> Option<Clip> {
+        let start = self.video.front()?.time;
+        Some(Clip {
+            video: self.video.iter().cloned().collect(),
+            audio: self.audio.iter().filter(|p| p.time >= start).cloned().collect(),
+        })
     }
 
     /// The last `seconds` (rounded back to the previous keyframe), or None if nothing is buffered yet.
@@ -130,6 +174,18 @@ mod tests {
         let length = clip.video.last().unwrap().time - clip.video[0].time;
         assert!((5 * HNS_PER_SEC - HNS_PER_SEC / 10..6 * HNS_PER_SEC + HNS_PER_SEC / 10).contains(&length));
         assert!(clip.audio.iter().all(|a| a.time >= clip.video[0].time));
+    }
+
+    #[test]
+    fn take_clip_empties_the_buffer_but_keeps_the_setting() {
+        let mut buffer = ReplayBuffer::new(5);
+        fill(&mut buffer, 30);
+        let clip = buffer.take_clip().unwrap();
+        assert_eq!(clip.video.len(), 30);
+        assert!(buffer.is_empty());
+        assert!(buffer.clip(5).is_none());
+        fill(&mut buffer, 10);
+        assert!(!buffer.is_empty());
     }
 
     #[test]
