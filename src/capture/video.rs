@@ -147,7 +147,35 @@ fn init(settings: &config::Video) -> Result<State, String> {
     })
 }
 
-fn replace_stalled_encoder(s: &mut State) -> Result<(), String> {
+struct LiveParser {
+    codec: VideoCodec,
+    params: ParamSets,
+    format_known: bool,
+    need_key: bool,
+    format_since: i64,
+}
+
+fn replace_stalled_encoder(
+    s: &mut State,
+    shared: &Shared,
+    parser: &mut LiveParser,
+    current: Option<&windows::Win32::Graphics::Direct3D11::ID3D11Texture2D>,
+    current_submitted: bool,
+    current_time: i64,
+    interval: i64,
+) -> Result<(), String> {
+    let mut pending = s.encoder.take_unacknowledged();
+    if !current_submitted {
+        if let Some(frame) = current {
+            if !pending.iter().any(|held| held.time == current_time) {
+                if let Ok(texture) = encoder::snapshot_texture(&s.gpu, frame) {
+                    pending.push(encoder::HeldInput { texture: Some(texture), time: current_time, duration: interval });
+                }
+            }
+        }
+    }
+    // The old bitstream is finished. A software H.264 fallback must not be parsed as HEVC.
+    shared.seal_for_new_encoder();
     let settings = encoder::Settings {
         codec: s.encoder.codec,
         width: s.width,
@@ -158,6 +186,26 @@ fn replace_stalled_encoder(s: &mut State) -> Result<(), String> {
         allow_hardware: !encoder::prefer_software(),
     };
     s.encoder = VideoEncoder::new(&s.gpu, &settings)?;
+    parser.codec = match s.encoder.codec {
+        Codec::H264 => VideoCodec::H264,
+        Codec::Hevc => VideoCodec::Hevc,
+    };
+    parser.params = ParamSets::default();
+    parser.format_known = false;
+    parser.need_key = true;
+    parser.format_since = current_time;
+    let mut first = true;
+    for input in pending {
+        let force_key = first || parser.need_key;
+        first = false;
+        let Some(texture) = input.texture.as_ref() else {
+            continue;
+        };
+        match s.encoder.submit(&s.gpu, texture, input.time, input.duration, force_key) {
+            Ok(_) => {}
+            Err(err) => return Err(format!("re-encode after a stall failed: {err}")),
+        }
+    }
     encoder::note_recovery();
     Ok(())
 }
@@ -230,12 +278,16 @@ fn stale_restart_allowed() -> bool {
 fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result<(), String> {
     let timer = Timer::new();
     let interval = HNS_PER_SEC / i64::from(s.fps);
-    let codec = match s.encoder.codec {
-        Codec::H264 => VideoCodec::H264,
-        Codec::Hevc => VideoCodec::Hevc,
+    let mut parser = LiveParser {
+        codec: match s.encoder.codec {
+            Codec::H264 => VideoCodec::H264,
+            Codec::Hevc => VideoCodec::Hevc,
+        },
+        params: ParamSets::default(),
+        format_known: false,
+        need_key: false,
+        format_since: clock.now(),
     };
-    let mut params = ParamSets::default();
-    let mut format_known = false;
     let mut current = None;
     let mut tick = clock.now() / interval + 1;
     let mut pending_key = false;
@@ -250,6 +302,8 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
     let mut last_probe = started;
     let mut black_since: Option<i64> = None;
     let mut hardware_ok = false;
+    let mut current_submitted = false;
+    let mut current_time = 0i64;
 
     while !stop.load(Ordering::Relaxed) {
         shared.beat();
@@ -302,6 +356,8 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
             s.capture
                 .take_frame(|texture, w, h| {
                     current = Some(converter.convert(gpu, texture, w, h)?);
+                    current_submitted = false;
+                    current_time = target;
                     Ok(())
                 })
                 .map_err(|e| format!("capture failed: {e}"))?;
@@ -327,22 +383,23 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
         }
         if let (Some(frame), true) = (&current, wanted) {
             let force_key = pending_key || key_due;
+            let mut recovered = false;
             let accepted = match s.encoder.submit(&s.gpu, frame, target, interval, force_key) {
                 Ok(accepted) => accepted,
-                Err(EncoderFault::Stalled) => match replace_stalled_encoder(&mut s) {
-                    Ok(()) => match s.encoder.submit(&s.gpu, frame, target, interval, force_key) {
-                        Ok(accepted) => accepted,
-                        Err(err) => {
-                            return Err(encoder_error(&mut s.encoder, format!("encoder failed after a stall: {err}")))
-                        }
-                    },
-                    Err(err) => return Err(err),
-                },
+                Err(EncoderFault::Stalled) => {
+                    // submit already kept this frame. Do not snapshot `current` again.
+                    current_submitted = true;
+                    replace_stalled_encoder(&mut s, shared, &mut parser, None, true, target, interval)?;
+                    recovered = true;
+                    true
+                }
                 Err(err) => return Err(encoder_error(&mut s.encoder, format!("encoder failed: {err}"))),
             };
             if accepted {
                 last_encoded = target;
-                pending_key = false;
+                current_submitted = true;
+                current_time = target;
+                pending_key = recovered;
                 pending_change = 0.0;
             } else if target - last_encoded.max(started) > STALL_LIMIT {
                 // Shut the wedged encoder down on the way out (State::drop). Returning the error
@@ -352,35 +409,65 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
             }
         } else if let Err(err) = s.encoder.poll() {
             if matches!(err, EncoderFault::Stalled) {
-                replace_stalled_encoder(&mut s)?;
+                replace_stalled_encoder(
+                    &mut s,
+                    shared,
+                    &mut parser,
+                    current.as_ref(),
+                    current_submitted,
+                    current_time,
+                    interval,
+                )?;
+                pending_key = true;
             } else {
                 return Err(encoder_error(&mut s.encoder, format!("encoder failed: {err}")));
             }
         }
 
-        for frame in s.encoder.take_output() {
-            let (sample, key) = qr_mp4::annexb_to_sample(codec, &frame.data, &mut params);
-            if !format_known && params.is_complete(codec) {
-                match VideoFormat::from_params(s.encoder.codec, s.width, s.height, &params) {
+        let output = match s.encoder.take_output() {
+            Ok(frames) => frames,
+            Err(EncoderFault::Stalled) => {
+                replace_stalled_encoder(
+                    &mut s,
+                    shared,
+                    &mut parser,
+                    current.as_ref(),
+                    current_submitted,
+                    current_time,
+                    interval,
+                )?;
+                pending_key = true;
+                Vec::new()
+            }
+            Err(err) => return Err(encoder_error(&mut s.encoder, format!("encoder failed: {err}"))),
+        };
+        for frame in output {
+            let (sample, key) = qr_mp4::annexb_to_sample(parser.codec, &frame.data, &mut parser.params);
+            if !parser.format_known && parser.params.is_complete(parser.codec) {
+                match VideoFormat::from_params(s.encoder.codec, s.width, s.height, &parser.params) {
                     Ok(format) => {
                         shared.set_video_format(format);
-                        format_known = true;
+                        parser.format_known = true;
                     }
                     Err(err) => return Err(format!("unexpected encoder output: {err}")),
                 }
             }
+            if parser.need_key && !key {
+                continue;
+            }
             if key {
+                parser.need_key = false;
                 last_key = frame.time;
             }
-            if !sample.is_empty() {
+            if parser.format_known && !sample.is_empty() {
                 shared.push_video(Packet { time: frame.time, data: sample.into(), key });
             }
         }
 
-        if !format_known && target - started > STALL_LIMIT {
+        if !parser.format_known && target - parser.format_since > STALL_LIMIT {
             return Err(encoder_error(&mut s.encoder, "the video encoder produced no usable output".into()));
         }
-        if !hardware_ok && format_known && s.encoder.is_hardware() && target - started >= HARDWARE_HEALTHY {
+        if !hardware_ok && parser.format_known && s.encoder.is_hardware() && target - started >= HARDWARE_HEALTHY {
             encoder::note_hardware_recovered();
             hardware_ok = true;
         }

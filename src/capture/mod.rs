@@ -193,6 +193,15 @@ impl Shared {
         self.heartbeat_ms.store(safety::now_ms(), Ordering::Relaxed);
     }
 
+    /// Closes the current replay segment so a replacement encoder cannot append onto it.
+    fn seal_for_new_encoder(&self) {
+        self.await_key.store(true, Ordering::Relaxed);
+        let old = lock(&self.video_format).take();
+        if let Some(old) = old {
+            self.recover_buffer(old);
+        }
+    }
+
     fn set_video_format(&self, format: VideoFormat) {
         let new = Arc::new(format);
         let old = lock(&self.video_format).clone();

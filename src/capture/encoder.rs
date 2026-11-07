@@ -9,6 +9,7 @@
 use super::gpu::Gpu;
 use super::mf;
 use crate::config::Codec;
+use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -17,7 +18,7 @@ use std::time::{Duration, Instant};
 use windows::core::{Interface, Result, GUID};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::MediaFoundation::*;
@@ -70,9 +71,23 @@ pub struct VideoEncoder {
     born: Instant,
     /// Hardware driver calls run here. Empty for the software encoder and for the copy that lives on the worker.
     remote: Option<Remote>,
+    /// Frames accepted by the driver since the last output it handed back.
+    /// Kept on the caller side so a stalled worker can be replaced without losing them.
+    inflight: VecDeque<HeldInput>,
     pub codec: Codec,
     pub name: String,
 }
+
+/// One submitted picture. The texture is a private copy, not the converter's ring buffer.
+pub struct HeldInput {
+    pub texture: Option<ID3D11Texture2D>,
+    pub time: i64,
+    pub duration: i64,
+}
+
+/// AddRef'd texture that may cross threads. The caller keeps using its own reference.
+struct SharedTexture(ID3D11Texture2D);
+unsafe impl Send for SharedTexture {}
 
 /// The windows crate does not mark COM pointers `Send`. One hardware encoder is owned by its
 /// driver thread; the capture thread only sends it commands.
@@ -98,8 +113,7 @@ impl std::fmt::Display for EncoderFault {
 
 enum Request {
     Submit {
-        gpu: usize,
-        frame: usize,
+        frame: SharedTexture,
         time: i64,
         duration: i64,
         force_key: bool,
@@ -112,14 +126,25 @@ enum Request {
         reply: Sender<Vec<EncodedFrame>>,
     },
     MarkBroken,
+    /// Last command. The worker shuts down and leaves the loop; it does not recv again.
     Shutdown {
         reply: Sender<()>,
+    },
+    /// Test-only. Park the worker so the caller can observe a deadline miss.
+    #[cfg(test)]
+    Stall,
+    /// Test-only. Put one encoded frame where `take_output` will find it.
+    #[cfg(test)]
+    SeedOutput {
+        time: i64,
     },
 }
 
 struct Remote {
     tx: Sender<Request>,
     join: Option<std::thread::JoinHandle<()>>,
+    /// Disconnects when `driver_loop` returns.
+    done: mpsc::Receiver<()>,
 }
 
 #[derive(Clone, Copy)]
@@ -433,6 +458,7 @@ impl VideoEncoder {
             sessions: 1,
             born: Instant::now(),
             remote: None,
+            inflight: VecDeque::new(),
             codec: s.codec,
             name,
         })
@@ -458,15 +484,30 @@ impl VideoEncoder {
         }
         let driver = self.remote.as_ref().map(|remote| remote.tx.clone());
         if let Some(driver) = driver {
-            let gpu = gpu as *const Gpu as usize;
-            let frame = frame as *const ID3D11Texture2D as usize;
-            let result = remote_call(&driver, |reply| Request::Submit { gpu, frame, time, duration, force_key, reply });
+            let owned = match snapshot_texture(gpu, frame) {
+                Ok(texture) => texture,
+                Err(err) => return Err(EncoderFault::Native(err)),
+            };
+            let result = remote_call(&driver, |reply| Request::Submit {
+                frame: SharedTexture(owned.clone()),
+                time,
+                duration,
+                force_key,
+                reply,
+            });
+            self.keep_if_outstanding(&result, owned, time, duration);
             if matches!(result, Err(EncoderFault::Stalled)) {
                 self.abandon_after_stall();
             }
             return result;
         }
-        self.submit_local(gpu, frame, time, duration, force_key).map_err(EncoderFault::Native)
+        let accepted = self.submit_local(gpu, frame, time, duration, force_key).map_err(EncoderFault::Native)?;
+        if accepted {
+            if let Ok(texture) = snapshot_texture(gpu, frame) {
+                self.inflight.push_back(HeldInput { texture: Some(texture), time, duration });
+            }
+        }
+        Ok(accepted)
     }
 
     fn submit_local(
@@ -523,34 +564,107 @@ impl VideoEncoder {
     }
 
     /// Encoded frames that have come out since the last call.
-    pub fn take_output(&mut self) -> Vec<EncodedFrame> {
-        if let Some(remote) = &self.remote {
-            let (tx, rx) = mpsc::channel();
-            if remote.tx.send(Request::TakeOutput { reply: tx }).is_err() {
-                return Vec::new();
-            }
-            return rx.recv_timeout(crate::safety::NATIVE_CALL_LIMIT).unwrap_or_default();
+    /// Each delivered frame acknowledges the oldest submitted input still in flight.
+    pub fn take_output(&mut self) -> std::result::Result<Vec<EncodedFrame>, EncoderFault> {
+        if self.poisoned {
+            return Err(EncoderFault::Stalled);
         }
-        std::mem::take(&mut self.output)
+        let frames = if let Some(remote) = &self.remote {
+            let driver = remote.tx.clone();
+            let (tx, rx) = mpsc::channel();
+            if driver.send(Request::TakeOutput { reply: tx }).is_err() {
+                self.abandon_after_stall();
+                return Err(EncoderFault::Stalled);
+            }
+            match rx.recv_timeout(native_call_limit()) {
+                Ok(frames) => frames,
+                Err(_) => {
+                    self.abandon_after_stall();
+                    return Err(EncoderFault::Stalled);
+                }
+            }
+        } else {
+            std::mem::take(&mut self.output)
+        };
+        for _ in 0..frames.len() {
+            self.inflight.pop_front();
+        }
+        Ok(frames)
+    }
+
+    /// Inputs accepted since the last delivered output, including a submit that stalled.
+    /// The caller re-encodes these on the replacement session.
+    pub fn take_unacknowledged(&mut self) -> Vec<HeldInput> {
+        self.inflight.drain(..).collect()
+    }
+
+    fn keep_if_outstanding(
+        &mut self,
+        result: &std::result::Result<bool, EncoderFault>,
+        texture: ID3D11Texture2D,
+        time: i64,
+        duration: i64,
+    ) {
+        let keep = matches!(result, Ok(true) | Err(EncoderFault::Stalled));
+        if keep {
+            self.inflight.push_back(HeldInput { texture: Some(texture), time, duration });
+        }
     }
 
     fn make_sample(&self, gpu: &Gpu, frame: &ID3D11Texture2D, time: i64, duration: i64) -> Result<IMFSample> {
         match &self.input {
-            Input::Gpu => unsafe {
-                let buffer = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, frame, 0, false)?;
-                let length = buffer.cast::<IMF2DBuffer>()?.GetContiguousLength()?;
-                buffer.SetCurrentLength(length)?;
-                let sample = MFCreateSample()?;
-                sample.AddBuffer(&buffer)?;
-                sample.SetSampleTime(time)?;
-                sample.SetSampleDuration(duration)?;
-                Ok(sample)
-            },
+            Input::Gpu => self.make_gpu_sample(frame, time, duration),
             Input::System { staging } => {
                 let bytes = read_nv12(gpu, staging, frame, self.width, self.height)?;
                 mf::sample_from_bytes(&bytes, time, duration)
             }
         }
+    }
+
+    fn make_gpu_sample(&self, frame: &ID3D11Texture2D, time: i64, duration: i64) -> Result<IMFSample> {
+        unsafe {
+            let buffer = MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, frame, 0, false)?;
+            let length = buffer.cast::<IMF2DBuffer>()?.GetContiguousLength()?;
+            buffer.SetCurrentLength(length)?;
+            let sample = MFCreateSample()?;
+            sample.AddBuffer(&buffer)?;
+            sample.SetSampleTime(time)?;
+            sample.SetSampleDuration(duration)?;
+            Ok(sample)
+        }
+    }
+
+    /// Hardware worker entry. The texture is the request's private copy.
+    fn submit_local_texture(
+        &mut self,
+        frame: &ID3D11Texture2D,
+        time: i64,
+        duration: i64,
+        force_key: bool,
+    ) -> Result<bool> {
+        self.pump()?;
+        if self.events.is_some() && self.need_input == 0 {
+            return Ok(false);
+        }
+        let sample = self.make_gpu_sample(frame, time, duration)?;
+        if force_key {
+            if let Some(api) = &self.codec_api {
+                set_codec_value(api, &CODECAPI_AVEncVideoForceKeyFrame, &mf::variant_u32(1));
+            }
+        }
+        let input = unsafe { self.transform()?.ProcessInput(self.input_id, &sample, 0) };
+        match input {
+            Ok(()) => {}
+            Err(err) if err.code() == MF_E_NOTACCEPTING => return Ok(false),
+            Err(err) => return Err(err),
+        }
+        if self.events.is_some() {
+            self.need_input -= 1;
+            self.pump()?;
+        } else {
+            while self.pull_output()? {}
+        }
+        Ok(true)
     }
 
     /// Handles queued events of an asynchronous (hardware) encoder.
@@ -648,27 +762,50 @@ impl VideoEncoder {
         if self.released || self.poisoned {
             return;
         }
-        let driver = self.remote.as_ref().map(|remote| remote.tx.clone());
-        if let Some(driver) = driver {
-            let (tx, rx) = mpsc::channel();
-            if driver.send(Request::Shutdown { reply: tx }).is_err() {
-                self.abandon_after_stall();
-                return;
-            }
-            if rx.recv_timeout(crate::safety::NATIVE_CALL_LIMIT).is_err() {
-                self.abandon_after_stall();
-                return;
-            }
-            self.released = true;
-            if let Some(remote) = self.remote.take() {
-                drop(remote.tx);
-                if let Some(join) = remote.join {
-                    let _ = join.join();
-                }
-            }
+        // Take the only long-lived sender. A cloned sender kept across `join` is what
+        // deadlocks: the worker finishes Shutdown, blocks in `recv`, and `join` waits for it.
+        let Some(remote) = self.remote.take() else {
+            self.shutdown_local();
+            return;
+        };
+        let (ack_tx, ack_rx) = mpsc::channel();
+        if remote.tx.send(Request::Shutdown { reply: ack_tx }).is_err() {
+            drop(remote.tx);
+            self.leak_worker(remote.join);
             return;
         }
-        self.shutdown_local();
+        drop(remote.tx);
+        if ack_rx.recv_timeout(native_call_limit()).is_err() {
+            self.leak_worker(remote.join);
+            return;
+        }
+        // The ack means shutdown_local returned. The worker must then leave the loop.
+        // `done` disconnects when that function returns. A timeout means it is stuck
+        // after the ack; leak the thread instead of joining it.
+        match remote.done.recv_timeout(native_call_limit()) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.leak_worker(remote.join);
+                return;
+            }
+        }
+        if let Some(join) = remote.join {
+            if !join_within(join, Duration::from_secs(1)) {
+                self.poisoned = true;
+                self.released = true;
+                note_stall();
+                return;
+            }
+        }
+        self.released = true;
+    }
+
+    fn leak_worker(&mut self, join: Option<std::thread::JoinHandle<()>>) {
+        self.poisoned = true;
+        self.released = true;
+        self.broken = true;
+        std::mem::forget(join);
+        note_stall();
     }
 
     fn shutdown_local(&mut self) {
@@ -768,7 +905,7 @@ fn remote_call<T: Send + 'static>(
     if driver.send(build(tx)).is_err() {
         return Err(EncoderFault::Stalled);
     }
-    match rx.recv_timeout(crate::safety::NATIVE_CALL_LIMIT) {
+    match rx.recv_timeout(native_call_limit()) {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(err)) => Err(EncoderFault::Native(err)),
         Err(_) => Err(EncoderFault::Stalled),
@@ -780,7 +917,11 @@ fn host_on_worker(encoder: VideoEncoder) -> VideoEncoder {
     let codec = encoder.codec;
     let name = encoder.name.clone();
     let (tx, rx) = mpsc::channel();
-    let spawned = std::thread::Builder::new().name("encoder-driver".into()).spawn(move || driver_loop(encoder, rx));
+    let (done_tx, done_rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new().name("encoder-driver".into()).spawn(move || {
+        driver_loop(encoder, rx);
+        drop(done_tx);
+    });
     let join = match spawned {
         Ok(join) => join,
         Err(err) => {
@@ -788,7 +929,7 @@ fn host_on_worker(encoder: VideoEncoder) -> VideoEncoder {
             return encoder_shell(codec, name, None);
         }
     };
-    encoder_shell(codec, name, Some(Remote { tx, join: Some(join) }))
+    encoder_shell(codec, name, Some(Remote { tx, join: Some(join), done: done_rx }))
 }
 
 fn encoder_shell(codec: Codec, name: String, remote: Option<Remote>) -> VideoEncoder {
@@ -820,27 +961,70 @@ fn encoder_shell(codec: Codec, name: String, remote: Option<Remote>) -> VideoEnc
         sessions: 0,
         born: Instant::now(),
         remote,
+        inflight: VecDeque::new(),
         codec,
         name,
     }
+}
+
+fn native_call_limit() -> Duration {
+    *CALL_LIMIT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+#[cfg(test)]
+fn set_native_call_limit_for_tests(limit: Duration) {
+    *CALL_LIMIT.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = limit;
+}
+
+fn join_within(handle: std::thread::JoinHandle<()>, limit: Duration) -> bool {
+    let (tx, rx) = mpsc::channel();
+    let watcher = match std::thread::Builder::new().name("encoder-join".into()).spawn(move || {
+        let _ = handle.join();
+        let _ = tx.send(());
+    }) {
+        Ok(watcher) => watcher,
+        Err(_) => return false,
+    };
+    if rx.recv_timeout(limit).is_ok() {
+        let _ = watcher.join();
+        true
+    } else {
+        std::mem::forget(watcher);
+        false
+    }
+}
+
+pub(crate) fn snapshot_texture(gpu: &Gpu, source: &ID3D11Texture2D) -> Result<ID3D11Texture2D> {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { source.GetDesc(&mut desc) };
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = 0;
+    desc.MiscFlags = 0;
+    let mut copy = None;
+    unsafe { gpu.device.CreateTexture2D(&desc, None, Some(&mut copy))? };
+    let Some(copy) = copy else {
+        return Err(windows::core::Error::empty());
+    };
+    unsafe { gpu.context.CopyResource(&copy, source) };
+    Ok(copy)
 }
 
 fn driver_loop(mut encoder: VideoEncoder, rx: mpsc::Receiver<Request>) {
     let _com = crate::win::ComGuard::mta();
     while let Ok(request) = rx.recv() {
         match request {
-            Request::Submit { gpu, frame, time, duration, force_key, reply } => {
-                let result = unsafe {
-                    let gpu = &*(gpu as *const Gpu);
-                    let frame = &*(frame as *const ID3D11Texture2D);
-                    encoder.submit_local(gpu, frame, time, duration, force_key)
-                };
+            Request::Submit { frame, time, duration, force_key, reply } => {
+                // Hardware input is a GPU texture. The system-memory path does not use this thread.
+                let result = encoder.submit_local_texture(&frame.0, time, duration, force_key);
                 if reply.send(result).is_err() {
                     log::error!(
                         "driver call finished after the deadline; leaking {} instead of releasing it",
                         encoder.name
                     );
                     encoder.leak_native();
+                    std::mem::forget(frame);
                     return;
                 }
             }
@@ -859,9 +1043,18 @@ fn driver_loop(mut encoder: VideoEncoder, rx: mpsc::Receiver<Request>) {
                 let _ = reply.send(std::mem::take(&mut encoder.output));
             }
             Request::MarkBroken => encoder.broken = true,
+            #[cfg(test)]
+            Request::SeedOutput { time } => {
+                encoder.output.push(EncodedFrame { time, data: vec![1] });
+            }
+            #[cfg(test)]
+            Request::Stall => loop {
+                std::thread::park();
+            },
             Request::Shutdown { reply } => {
                 encoder.shutdown_local();
                 let _ = reply.send(());
+                break;
             }
         }
     }
@@ -956,6 +1149,7 @@ impl NativeParts {
             sessions: self.sessions,
             born: self.born,
             remote: None,
+            inflight: VecDeque::new(),
             codec: self.codec,
             name: self.name,
         }
@@ -997,6 +1191,7 @@ static HW_RETIRED: AtomicU64 = AtomicU64::new(0);
 static HW_SHUTDOWN: AtomicU64 = AtomicU64::new(0);
 static STALLS: AtomicU64 = AtomicU64::new(0);
 static RECOVERIES: AtomicU64 = AtomicU64::new(0);
+static CALL_LIMIT: std::sync::Mutex<Duration> = std::sync::Mutex::new(crate::safety::NATIVE_CALL_LIMIT);
 
 pub fn note_stall() {
     STALLS.fetch_add(1, Ordering::Relaxed);
@@ -1600,6 +1795,52 @@ mod tests {
     use super::{fallback_after, HW_FAILURES_BEFORE_SOFTWARE};
 
     #[test]
+    fn worker_shutdown_returns_without_holding_a_sender() {
+        let mut encoder =
+            super::host_on_worker(super::encoder_shell(crate::config::Codec::H264, "shutdown".into(), None));
+        let started = std::time::Instant::now();
+        encoder.shutdown();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "worker shutdown deadlocked after {}ms",
+            started.elapsed().as_millis()
+        );
+        encoder.shutdown();
+    }
+
+    #[test]
+    fn stalled_worker_returns_unacknowledged_inputs() {
+        super::set_native_call_limit_for_tests(std::time::Duration::from_millis(200));
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                super::set_native_call_limit_for_tests(crate::safety::NATIVE_CALL_LIMIT);
+            }
+        }
+        let _restore = Restore;
+        let mut encoder = super::host_on_worker(super::encoder_shell(crate::config::Codec::H264, "stall".into(), None));
+        encoder.inflight.push_back(super::HeldInput { texture: None, time: 10, duration: 1 });
+        encoder.inflight.push_back(super::HeldInput { texture: None, time: 20, duration: 1 });
+        encoder.inflight.push_back(super::HeldInput { texture: None, time: 30, duration: 1 });
+        let remote = encoder.remote.as_ref().expect("worker").tx.clone();
+        remote.send(super::Request::SeedOutput { time: 10 }).expect("seed");
+        let delivered = encoder.take_output().expect("seeded output");
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(encoder.inflight.iter().map(|frame| frame.time).collect::<Vec<_>>(), vec![20, 30]);
+        remote.send(super::Request::Stall).expect("stall");
+        let started = std::time::Instant::now();
+        let err = encoder.poll().expect_err("the stalled worker must time out");
+        assert!(matches!(err, super::EncoderFault::Stalled));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let pending = encoder.take_unacknowledged();
+        assert_eq!(pending.iter().map(|frame| frame.time).collect::<Vec<_>>(), vec![20, 30]);
+        // Shutdown of a poisoned worker must not join the stuck thread.
+        let started = std::time::Instant::now();
+        encoder.shutdown();
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    }
+
+    #[test]
     fn software_fallback_starts_after_repeated_hardware_failures() {
         assert!(!fallback_after(0));
         assert!(!fallback_after(HW_FAILURES_BEFORE_SOFTWARE - 1));
@@ -1676,20 +1917,36 @@ mod media_foundation {
                 Ok(true) => stamp += step,
                 Ok(false) => {}
                 Err(super::EncoderFault::Stalled) => {
-                    eprintln!("hardware encoder stalled; abandoning it and re-encoding the frame");
+                    eprintln!("hardware encoder stalled; abandoning it and re-encoding unacknowledged frames");
+                    let pending = encoder.take_unacknowledged();
+                    let retry_current = pending.is_empty();
+                    let last_time = pending.last().map(|input| input.time);
                     let again = encoder.is_hardware() && !super::prefer_software();
                     encoder = VideoEncoder::new(gpu, &settings(width, height, again)).expect("replacement encoder");
                     super::note_recovery();
-                    match encoder.submit(gpu, &frame, stamp, step, force_key) {
-                        Ok(true) => stamp += step,
-                        Ok(false) => {}
-                        Err(err) => panic!("replacement encoder submit failed: {err}"),
+                    for (index, input) in pending.into_iter().enumerate() {
+                        let Some(texture) = input.texture.as_ref() else {
+                            continue;
+                        };
+                        match encoder.submit(gpu, texture, input.time, input.duration, index == 0) {
+                            Ok(_) => {}
+                            Err(err) => panic!("replacement encoder submit failed: {err}"),
+                        }
+                    }
+                    if retry_current {
+                        match encoder.submit(gpu, &frame, stamp, step, true) {
+                            Ok(true) => stamp += step,
+                            Ok(false) => {}
+                            Err(err) => panic!("replacement encoder submit failed: {err}"),
+                        }
+                    } else if let Some(last_time) = last_time {
+                        stamp = last_time + step;
                     }
                 }
                 Err(err) => panic!("{label} encoder submit failed: {err}"),
             }
             let _ = encoder.poll();
-            encoded.extend(encoder.take_output());
+            encoded.extend(encoder.take_output().unwrap_or_else(|err| panic!("{label} encoder output failed: {err}")));
             if encoded.len() >= 8 {
                 break;
             }
