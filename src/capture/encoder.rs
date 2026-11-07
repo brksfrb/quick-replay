@@ -439,20 +439,29 @@ impl VideoEncoder {
     }
 }
 
-/// Wait at most this long for the encoder thread to post its last events.
-const SHUTDOWN_LIMIT: Duration = Duration::from_millis(500);
-/// An empty event queue for this long means the worker has gone idle.
-const SHUTDOWN_QUIET: Duration = Duration::from_millis(100);
+/// How long to wait for `METransformDrainComplete` before giving up on a wedged driver.
+/// A healthy encoder posts that event as soon as the drain finishes; this bound is only the
+/// fallback described on [`VideoEncoder::shutdown`].
+const SHUTDOWN_LIMIT: Duration = Duration::from_millis(2_000);
 
 impl VideoEncoder {
     /// Stops the encoder thread and only then releases COM/D3D objects.
     ///
-    /// Order matters. `IMFActivate::ShutdownObject` tears the MFT down; calling it while
-    /// `IMFTransform` / the event generator are still held, or while the async worker is inside
-    /// the Media Foundation event queue, frees that queue's lock out from under the worker.
-    /// The worker then faults at a fixed instruction in ntdll (0xc0000005). Flush is synchronous
-    /// (the MFT must drop in-flight samples before it returns). Interfaces are released before
-    /// `ShutdownObject`, which is what drops the activation object's own reference.
+    /// Completion is a real signal from the MFT, not a guess that its queue looks idle:
+    ///
+    /// * Asynchronous (hardware) encoders are done when they post `METransformDrainComplete`
+    ///   after `MFT_MESSAGE_COMMAND_DRAIN`. Shutdown waits for that event.
+    /// * Synchronous encoders (the software H.264 MFT) are done when `ProcessOutput` returns
+    ///   `MF_E_TRANSFORM_NEED_MORE_INPUT` after the drain.
+    /// * A hardware driver that never posts either signal — device removed, TDR, a hung
+    ///   NVENC thread — cannot be waited on. After [`SHUTDOWN_LIMIT`] we `FLUSH` (the documented
+    ///   synchronous abort) and release anyway. Waiting forever would freeze capture. There is
+    ///   no Media Foundation API that turns `GetEvent` into a timed wait, so the deadline is
+    ///   polled; an empty queue does not count as the worker having finished.
+    ///
+    /// `IMFActivate::ShutdownObject` runs only after those interfaces are released. Calling it
+    /// while the worker is still inside the event queue frees that queue's lock and faults in
+    /// ntdll (`0xc0000005`).
     pub fn shutdown(&mut self) {
         if self.released {
             return;
@@ -460,11 +469,16 @@ impl VideoEncoder {
         self.released = true;
         if let Some(transform) = self.transform.clone() {
             unsafe {
-                let _ = transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
                 let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
                 let _ = transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
             }
-            self.drain_shutdown_events();
+            let signal = self.wait_for_worker();
+            if signal != crate::safety::WorkerSignal::Finished {
+                log::warn!("encoder drain ended with {signal:?}; flushing before release");
+                unsafe {
+                    let _ = transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+                }
+            }
             if self.uses_d3d {
                 unsafe {
                     let _ = transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
@@ -472,7 +486,6 @@ impl VideoEncoder {
             }
             unsafe {
                 let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
-                let _ = transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
             }
             drop(transform);
         }
@@ -489,39 +502,77 @@ impl VideoEncoder {
         }
     }
 
-    fn drain_shutdown_events(&mut self) {
-        if self.events.is_none() {
-            return;
+    fn wait_for_worker(&mut self) -> crate::safety::WorkerSignal {
+        if self.events.is_some() {
+            self.wait_for_drain_complete()
+        } else {
+            self.drain_synchronous()
         }
+    }
+
+    /// Blocks until `METransformDrainComplete` or `MEError`, or until [`SHUTDOWN_LIMIT`].
+    fn wait_for_drain_complete(&mut self) -> crate::safety::WorkerSignal {
         let deadline = Instant::now() + SHUTDOWN_LIMIT;
-        let mut quiet_since = Instant::now();
         loop {
             if Instant::now() >= deadline {
-                log::warn!("encoder shutdown timed out waiting for its worker; releasing it");
-                break;
+                log::warn!(
+                    "encoder did not post METransformDrainComplete within {}ms. A wedged hardware \
+                     MFT (device lost, driver hang) never sends that event; there is no timed \
+                     GetEvent, so this deadline is the only way out",
+                    SHUTDOWN_LIMIT.as_millis()
+                );
+                return crate::safety::WorkerSignal::TimedOut;
             }
             let event = {
-                let Some(events) = self.events.as_ref() else { break };
+                let Some(events) = self.events.as_ref() else {
+                    return crate::safety::WorkerSignal::Failed;
+                };
                 match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
                     Ok(event) => event,
                     Err(err) if err.code() == MF_E_NO_EVENTS_AVAILABLE => {
-                        if quiet_since.elapsed() >= SHUTDOWN_QUIET {
-                            break;
+                        // An empty queue is not the worker finishing. Only DrainComplete is.
+                        if crate::safety::worker_signal(crate::safety::DrainKind::Quiet)
+                            != crate::safety::WorkerSignal::StillWorking
+                        {
+                            return crate::safety::WorkerSignal::Finished;
                         }
-                        std::thread::sleep(Duration::from_millis(5));
+                        let pause = Duration::from_millis(10);
+                        std::thread::sleep(pause.min(deadline.saturating_duration_since(Instant::now())));
                         continue;
                     }
-                    Err(_) => break,
+                    Err(err) => {
+                        log::warn!("encoder event queue failed during shutdown: {err}");
+                        return crate::safety::worker_signal(crate::safety::DrainKind::Error);
+                    }
                 }
             };
-            quiet_since = Instant::now();
             let kind = unsafe { event.GetType() }.unwrap_or(0);
-            if kind == METransformHaveOutput.0 as u32 {
+            let signal = if kind == METransformDrainComplete.0 as u32 {
+                crate::safety::worker_signal(crate::safety::DrainKind::DrainComplete)
+            } else if kind == METransformHaveOutput.0 as u32 {
                 let _ = self.pull_output();
-            } else if kind == METransformDrainComplete.0 as u32 || kind == MEError.0 as u32 {
-                break;
+                crate::safety::worker_signal(crate::safety::DrainKind::Output)
+            } else if kind == MEError.0 as u32 {
+                crate::safety::worker_signal(crate::safety::DrainKind::Error)
+            } else {
+                crate::safety::worker_signal(crate::safety::DrainKind::Other)
+            };
+            if signal != crate::safety::WorkerSignal::StillWorking {
+                return signal;
             }
         }
+    }
+
+    /// Synchronous MFTs signal the end of a drain with `MF_E_TRANSFORM_NEED_MORE_INPUT`.
+    fn drain_synchronous(&mut self) -> crate::safety::WorkerSignal {
+        for _ in 0..256 {
+            match self.pull_output() {
+                Ok(true) => continue,
+                Ok(false) => return crate::safety::worker_signal(crate::safety::DrainKind::NeedMoreInput),
+                Err(_) => return crate::safety::worker_signal(crate::safety::DrainKind::Error),
+            }
+        }
+        crate::safety::WorkerSignal::TimedOut
     }
 }
 
@@ -584,5 +635,106 @@ mod tests {
         assert!(!fallback_after(HW_FAILURES_BEFORE_SOFTWARE - 1));
         assert!(fallback_after(HW_FAILURES_BEFORE_SOFTWARE));
         assert!(fallback_after(HW_FAILURES_BEFORE_SOFTWARE + 4));
+    }
+}
+
+/// Real Media Foundation encoder. `cargo test` skips these. Run them with
+/// `cargo test -- --ignored media_foundation` or `scripts/soak.ps1`.
+#[cfg(test)]
+mod media_foundation {
+    use super::VideoEncoder;
+    use crate::config::Codec;
+    use crate::win::ComGuard;
+    use windows::Win32::Graphics::Direct3D11::{ID3D11Texture2D, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
+
+    fn nv12_texture(gpu: &super::super::gpu::Gpu, width: u32, height: u32) -> ID3D11Texture2D {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_NV12,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: 0,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut tex = None;
+        unsafe { gpu.device.CreateTexture2D(&desc, None, Some(&mut tex)) }.expect("NV12 texture");
+        tex.expect("NV12 texture")
+    }
+
+    fn session(gpu: &super::super::gpu::Gpu, width: u32, height: u32, frames: i64) {
+        let settings = super::Settings {
+            codec: Codec::H264,
+            width,
+            height,
+            fps: 30,
+            bitrate_kbps: 800,
+            fast_preset: true,
+            allow_hardware: false,
+        };
+        let mut encoder = VideoEncoder::new(gpu, &settings).expect("software H.264 encoder");
+        let frame = nv12_texture(gpu, width, height);
+        let step = 10_000_000 / 30;
+        for i in 0..frames {
+            match encoder.submit(gpu, &frame, i * step, step, i % 15 == 0) {
+                Ok(_) => {
+                    let _ = encoder.poll();
+                    let _ = encoder.take_output();
+                }
+                Err(err) => panic!("encoder submit failed: {err}"),
+            }
+        }
+        encoder.shutdown();
+        encoder.shutdown();
+    }
+
+    #[test]
+    #[ignore = "needs Media Foundation and a D3D11 device; not run in CI"]
+    fn media_foundation_encoder_restarts() {
+        let _com = ComGuard::mta();
+        super::super::mf::startup();
+        let gpu = super::super::gpu::Gpu::new().expect("Direct3D 11");
+        for i in 0u32..12 {
+            let (width, height) = if i.is_multiple_of(3) { (320, 180) } else { (640, 360) };
+            if i.is_multiple_of(4) {
+                // Stand-in for the display going to sleep between sessions.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            session(&gpu, width, height, 8);
+        }
+    }
+
+    #[test]
+    #[ignore = "multi-hour soak; set QUICKREPLAY_SOAK_SECS and run scripts/soak.ps1"]
+    fn soak_media_foundation_encoder() {
+        let seconds: u64 = std::env::var("QUICKREPLAY_SOAK_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+        let _com = ComGuard::mta();
+        super::super::mf::startup();
+        let gpu = super::super::gpu::Gpu::new().expect("Direct3D 11");
+        let started = std::time::Instant::now();
+        let mut i = 0u64;
+        while started.elapsed().as_secs() < seconds {
+            let (width, height) = match i % 5 {
+                0 => (640, 360),
+                1 => (1280, 720),
+                2 => (960, 540),
+                3 => (1920, 1080),
+                _ => (320, 180),
+            };
+            if i.is_multiple_of(6) {
+                // Simulated sleep: the capture thread would be frozen, then wake into a new encoder.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            session(&gpu, width, height, 15);
+            i += 1;
+            if i.is_multiple_of(25) {
+                eprintln!("soak: {i} encoder sessions in {:.1}s", started.elapsed().as_secs_f64());
+            }
+        }
+        assert!(i > 0, "soak produced no encoder sessions");
     }
 }

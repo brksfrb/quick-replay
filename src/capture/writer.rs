@@ -51,6 +51,23 @@ fn part_path(path: &Path) -> PathBuf {
 }
 
 fn save_clip(path: &Path, clip: &Clip, video: &VideoFormat, audio: Option<&[u8]>) -> std::io::Result<f64> {
+    let part = part_path(path);
+    let seconds = write_clip_to(&part, clip, video, audio)?;
+    if let Err(err) = crate::persist::replace_file(&part, path) {
+        let _ = std::fs::remove_file(&part);
+        return Err(err);
+    }
+    Ok(seconds)
+}
+
+/// Writes a finished clip to `part` and fsyncs it. Does not publish `part` over a destination,
+/// so callers can give every attempt its own file name.
+pub(crate) fn write_clip_to(
+    part: &Path,
+    clip: &Clip,
+    video: &VideoFormat,
+    audio: Option<&[u8]>,
+) -> std::io::Result<f64> {
     let start = clip.video.first().ok_or_else(|| std::io::Error::other("empty clip"))?.time;
     let video_samples = clip
         .video
@@ -71,11 +88,10 @@ fn save_clip(path: &Path, clip: &Clip, video: &VideoFormat, audio: Option<&[u8]>
             .collect();
         tracks.push((audio_track(entry, offset), samples));
     }
-    if let Some(dir) = path.parent() {
+    if let Some(dir) = part.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let part = part_path(path);
-    let mut out = BufWriter::with_capacity(WRITE_BUFFER, File::create(&part)?);
+    let mut out = BufWriter::with_capacity(WRITE_BUFFER, File::create(part)?);
     let written = qr_mp4::write_faststart(&mut out, &tracks, |track, index, buf| {
         let packet = if track == 0 { &clip.video[index] } else { &clip.audio[index] };
         buf.clear();
@@ -86,11 +102,7 @@ fn save_clip(path: &Path, clip: &Clip, video: &VideoFormat, audio: Option<&[u8]>
     .and_then(|()| out.get_ref().sync_data());
     drop(out);
     if let Err(err) = written {
-        let _ = std::fs::remove_file(&part);
-        return Err(err);
-    }
-    if let Err(err) = crate::persist::replace_file(&part, path) {
-        let _ = std::fs::remove_file(&part);
+        let _ = std::fs::remove_file(part);
         return Err(err);
     }
     let last = clip.video.last().map_or(start, |p| p.time);

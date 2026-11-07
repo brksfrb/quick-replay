@@ -12,6 +12,7 @@ pub struct ReplayBuffer {
 }
 
 /// Packets for one saved replay, starting on a video keyframe.
+#[derive(Clone)]
 pub struct Clip {
     pub video: Vec<Packet>,
     pub audio: Vec<Packet>,

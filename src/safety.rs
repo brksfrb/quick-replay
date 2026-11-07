@@ -60,6 +60,48 @@ pub fn should_restart_process(clean_exit: bool, enabled: bool) -> bool {
     enabled && !clean_exit
 }
 
+/// What an encoder worker can report while it is shutting down.
+///
+/// An empty queue is not completion. Async hardware encoders finish by posting
+/// `METransformDrainComplete`. Synchronous ones finish by returning "need more input"
+/// after a drain. A driver that never sends either signal is the only case where a
+/// timeout is used, and that path must not pretend the worker is idle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainKind {
+    Output,
+    /// The event queue had nothing in it. The worker has not said it is done.
+    Quiet,
+    Other,
+    DrainComplete,
+    NeedMoreInput,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerSignal {
+    StillWorking,
+    Finished,
+    Failed,
+    /// No completion signal arrived. Documented fallback for a wedged driver.
+    TimedOut,
+}
+
+pub fn worker_signal(kind: DrainKind) -> WorkerSignal {
+    match kind {
+        DrainKind::Output | DrainKind::Quiet | DrainKind::Other => WorkerSignal::StillWorking,
+        DrainKind::DrainComplete | DrainKind::NeedMoreInput => WorkerSignal::Finished,
+        DrainKind::Error => WorkerSignal::Failed,
+    }
+}
+
+/// Run `write` while `clip` is still owned. The frames are dropped only after `Ok`.
+pub fn release_after_write<T, E>(clip: T, write: impl FnOnce(&T) -> Result<(), E>) -> Result<(), (T, E)> {
+    match write(&clip) {
+        Ok(()) => Ok(()),
+        Err(err) => Err((clip, err)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +214,40 @@ mod tests {
         assert!(same_encoding(same, same));
         assert!(!same_encoding(same, Encoding { width: 1280, ..same }));
         assert!(!same_encoding(same, Encoding { sample_entry: &[9, 9], ..same }));
+    }
+
+    #[test]
+    fn an_empty_encoder_queue_is_not_a_finished_worker() {
+        assert_eq!(worker_signal(DrainKind::Quiet), WorkerSignal::StillWorking);
+        assert_eq!(worker_signal(DrainKind::Output), WorkerSignal::StillWorking);
+        assert_eq!(worker_signal(DrainKind::DrainComplete), WorkerSignal::Finished);
+        assert_eq!(worker_signal(DrainKind::NeedMoreInput), WorkerSignal::Finished);
+        assert_eq!(worker_signal(DrainKind::Error), WorkerSignal::Failed);
+        // A run of quiet polls must not be treated as "the worker exited".
+        let mut saw_finish = false;
+        for kind in [DrainKind::Quiet, DrainKind::Quiet, DrainKind::Output, DrainKind::Quiet] {
+            if worker_signal(kind) == WorkerSignal::Finished {
+                saw_finish = true;
+            }
+        }
+        assert!(!saw_finish);
+        assert_eq!(worker_signal(DrainKind::DrainComplete), WorkerSignal::Finished);
+    }
+
+    #[test]
+    fn format_change_keeps_frames_until_the_write_succeeds() {
+        let frames = vec![1u8, 2, 3, 4];
+        let (frames, err) = release_after_write(frames, |_| Err("disk full")).unwrap_err();
+        assert_eq!(err, "disk full");
+        assert_eq!(frames, vec![1, 2, 3, 4], "a failed write must hand the frames back");
+        // A writer thread that never starts is the same: the caller still holds them.
+        let frames = match false {
+            true => release_after_write(frames, |_| Ok(())),
+            false => Err((frames, "spawn failed")),
+        };
+        let (frames, _) = frames.unwrap_err();
+        assert_eq!(frames, vec![1, 2, 3, 4]);
+        assert!(release_after_write(frames, |_| Ok::<(), &str>(())).is_ok());
     }
 
     #[test]

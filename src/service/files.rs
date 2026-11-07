@@ -119,18 +119,14 @@ pub fn publish_checkpoint(config: &Config) -> Option<PathBuf> {
     let src = paths::checkpoint_path();
     let len = std::fs::metadata(&src).ok()?.len();
     if len < 1024 {
-        let _ = std::fs::remove_file(&src);
+        log::warn!("replay checkpoint {} is only {len} bytes; leaving it in place", src.display());
         return None;
     }
     let dest = paths::unique_path(&paths::video_dir(config), &format!("Recovered replay {}", timestamp()));
-    if let Some(dir) = dest.parent() {
-        std::fs::create_dir_all(dir).ok()?;
-    }
-    match std::fs::rename(&src, &dest) {
+    match crate::persist::publish_preserving(&src, &dest) {
         Ok(()) => Some(dest),
         Err(err) => {
-            log::warn!("could not publish the replay checkpoint: {err}");
-            let _ = std::fs::remove_file(&src);
+            log::warn!("could not publish the replay checkpoint ({err}); keeping {}", src.display());
             None
         }
     }
