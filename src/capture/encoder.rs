@@ -128,7 +128,7 @@ enum Request {
     MarkBroken,
     /// Last command. The worker shuts down and leaves the loop; it does not recv again.
     Shutdown {
-        reply: Sender<()>,
+        reply: Sender<Vec<EncodedFrame>>,
     },
     /// Test-only. Park the worker so the caller can observe a deadline miss.
     #[cfg(test)]
@@ -344,6 +344,14 @@ impl VideoEncoder {
         if let Some(remote) = &self.remote {
             let _ = remote.tx.send(Request::MarkBroken);
         }
+    }
+
+    /// The session is already shut down. A later recovery pass has to open a replacement
+    /// instead of submitting to this one.
+    pub fn abandon_for_recovery(&mut self) {
+        self.broken = true;
+        self.released = true;
+        self.poisoned = true;
     }
 
     fn from_activate(gpu: &Gpu, activate: &IMFActivate, s: &Settings, name: String) -> Result<VideoEncoder> {
@@ -568,38 +576,46 @@ impl VideoEncoder {
     }
 
     /// Encoded frames that have come out since the last call.
-    /// Each delivered frame acknowledges the oldest submitted input still in flight.
+    /// Each frame the worker produced acknowledges the oldest submitted input still in flight.
+    /// Samples carried from the previous stream are delivered too, and they do not acknowledge a new input.
     pub fn take_output(&mut self) -> std::result::Result<Vec<EncodedFrame>, EncoderFault> {
         if self.poisoned {
             return Err(EncoderFault::Stalled);
         }
-        let frames = if let Some(remote) = &self.remote {
-            let driver = remote.tx.clone();
-            let (tx, rx) = mpsc::channel();
-            if driver.send(Request::TakeOutput { reply: tx }).is_err() {
+        let mut carried = std::mem::take(&mut self.output);
+        let Some(remote) = &self.remote else {
+            self.acknowledge(carried.len());
+            return Ok(carried);
+        };
+        let driver = remote.tx.clone();
+        let (tx, rx) = mpsc::channel();
+        if driver.send(Request::TakeOutput { reply: tx }).is_err() {
+            self.output = carried;
+            self.abandon_after_stall(StallPhase::ProcessOutput);
+            return Err(EncoderFault::Stalled);
+        }
+        let produced = match rx.recv_timeout(native_call_limit()) {
+            Ok(frames) => frames,
+            Err(_) => {
+                self.output = carried;
                 self.abandon_after_stall(StallPhase::ProcessOutput);
                 return Err(EncoderFault::Stalled);
             }
-            match rx.recv_timeout(native_call_limit()) {
-                Ok(frames) => frames,
-                Err(_) => {
-                    self.abandon_after_stall(StallPhase::ProcessOutput);
-                    return Err(EncoderFault::Stalled);
-                }
-            }
-        } else {
-            std::mem::take(&mut self.output)
         };
-        for _ in 0..frames.len() {
-            self.inflight.pop_front();
-        }
-        Ok(frames)
+        self.acknowledge(produced.len());
+        carried.extend(produced);
+        Ok(carried)
     }
 
     /// Inputs accepted since the last delivered output, including a submit that stalled.
     /// The caller re-encodes these on the replacement session.
     pub fn take_unacknowledged(&mut self) -> Vec<HeldInput> {
         self.inflight.drain(..).collect()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn has_unacknowledged(&self) -> bool {
+        !self.inflight.is_empty()
     }
 
     fn keep_if_outstanding(
@@ -762,27 +778,32 @@ impl VideoEncoder {
     ///
     /// The synchronous software encoder has no `RTWorkQ` thread. It is drained until
     /// `MF_E_TRANSFORM_NEED_MORE_INPUT` and released on this thread.
-    pub fn shutdown(&mut self) {
+    pub fn shutdown(&mut self) -> Vec<EncodedFrame> {
         if self.released || self.poisoned {
-            return;
+            return std::mem::take(&mut self.output);
         }
         // Take the only long-lived sender. A cloned sender kept across `join` is what
         // deadlocks: the worker finishes Shutdown, blocks in `recv`, and `join` waits for it.
         let Some(remote) = self.remote.take() else {
-            self.shutdown_local();
-            return;
+            let frames = self.shutdown_local();
+            return self.finish_shutdown(frames);
         };
+        // Samples carried on the shell are not sitting in the worker, and they are not new inputs.
+        let carried = std::mem::take(&mut self.output);
         let (ack_tx, ack_rx) = mpsc::channel();
         if remote.tx.send(Request::Shutdown { reply: ack_tx }).is_err() {
             drop(remote.tx);
             self.leak_worker(remote.join, StallPhase::Shutdown);
-            return;
+            return carried;
         }
         drop(remote.tx);
-        if ack_rx.recv_timeout(native_call_limit()).is_err() {
-            self.leak_worker(remote.join, StallPhase::Drain);
-            return;
-        }
+        let frames = match ack_rx.recv_timeout(native_call_limit()) {
+            Ok(frames) => frames,
+            Err(_) => {
+                self.leak_worker(remote.join, StallPhase::Drain);
+                return carried;
+            }
+        };
         // The ack means shutdown_local returned. The worker must then leave the loop.
         // `done` disconnects when that function returns. A timeout means it is stuck
         // after the ack; leak the thread instead of joining it.
@@ -790,7 +811,9 @@ impl VideoEncoder {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.leak_worker(remote.join, StallPhase::Shutdown);
-                return;
+                let mut all = carried;
+                all.extend(self.finish_shutdown(frames));
+                return all;
             }
         }
         if let Some(join) = remote.join {
@@ -798,10 +821,30 @@ impl VideoEncoder {
                 self.poisoned = true;
                 self.released = true;
                 note_stall(StallPhase::Shutdown);
-                return;
+                let mut all = carried;
+                all.extend(self.finish_shutdown(frames));
+                return all;
             }
         }
+        let mut all = carried;
+        all.extend(self.finish_shutdown(frames));
+        all
+    }
+
+    /// Counts delivered samples against in-flight inputs. Anything still in flight was accepted
+    /// and never came back, so the session is poisoned and the caller re-encodes those inputs.
+    fn finish_shutdown(&mut self, frames: Vec<EncodedFrame>) -> Vec<EncodedFrame> {
         self.released = true;
+        self.acknowledge(frames.len());
+        if !self.inflight.is_empty() {
+            self.poisoned = true;
+            log::warn!(
+                "{} drain left {} input(s) without a sample; keeping them for recovery",
+                self.name,
+                self.inflight.len()
+            );
+        }
+        frames
     }
 
     fn leak_worker(&mut self, join: Option<std::thread::JoinHandle<()>>, phase: StallPhase) {
@@ -812,24 +855,41 @@ impl VideoEncoder {
         note_stall(phase);
     }
 
-    fn shutdown_local(&mut self) {
+    fn shutdown_local(&mut self) -> Vec<EncodedFrame> {
         if self.released {
-            return;
+            return std::mem::take(&mut self.output);
         }
         self.released = true;
+        let mut frames = std::mem::take(&mut self.output);
         let Some(mut parts) = self.detach() else {
-            return;
+            return frames;
         };
-        if parts.hardware && !parts.broken {
-            match park_hardware(parts) {
-                Ok(()) => return,
-                Err(returned) => parts = returned,
-            }
-        }
         if parts.hardware {
-            bury(parts);
+            match park_hardware(parts) {
+                Ok(tail) => {
+                    frames.extend(tail);
+                    return frames;
+                }
+                Err(mut returned) => {
+                    frames.extend(std::mem::take(&mut returned.tail));
+                    parts = returned;
+                }
+            }
+            frames.extend(bury(parts));
         } else {
+            let (drained, tail) = end_stream(&mut parts);
+            frames.extend(tail);
+            if !drained {
+                log::warn!("{} software drain did not finish; keeping {} sample(s)", parts.name, frames.len());
+            }
             release_software(parts);
+        }
+        frames
+    }
+
+    fn acknowledge(&mut self, count: usize) {
+        for _ in 0..count {
+            self.inflight.pop_front();
         }
     }
 
@@ -862,6 +922,7 @@ impl VideoEncoder {
             born: self.born,
             codec: self.codec,
             name: std::mem::take(&mut self.name),
+            tail: Vec::new(),
         })
     }
 
@@ -976,7 +1037,6 @@ fn native_call_limit() -> Duration {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 fn set_native_call_limit_for_tests(limit: Duration) {
     *CALL_LIMIT.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = limit;
 }
@@ -1056,8 +1116,8 @@ fn driver_loop(mut encoder: VideoEncoder, rx: mpsc::Receiver<Request>) {
                 std::thread::park();
             },
             Request::Shutdown { reply } => {
-                encoder.shutdown_local();
-                let _ = reply.send(());
+                let frames = encoder.shutdown_local();
+                let _ = reply.send(frames);
                 break;
             }
         }
@@ -1109,6 +1169,7 @@ struct NativeParts {
     born: Instant,
     codec: Codec,
     name: String,
+    tail: Vec<EncodedFrame>,
 }
 
 impl NativeParts {
@@ -1138,7 +1199,7 @@ impl NativeParts {
             output_id: self.output_id,
             width: self.width,
             height: self.height,
-            output: Vec::new(),
+            output: self.tail,
             uses_d3d: self.uses_d3d,
             hardware: self.hardware,
             broken: false,
@@ -1371,7 +1432,8 @@ fn acquire_hardware_slot() -> bool {
                         "hardware session budget is {budget}; retiring parked {} and waiting for it to release",
                         old.name
                     );
-                    bury(old);
+                    let name = old.name.clone();
+                    log_undelivered(&name, &bury(old));
                 }
                 None => {
                     log::warn!("hardware session budget is {budget} with no parked encoder to retire");
@@ -1425,15 +1487,17 @@ fn reclaim_hardware(gpu: &Gpu, settings: &Settings) -> Option<VideoEncoder> {
         Ok(encoder) => Some(encoder),
         Err(parts) => {
             log::warn!("could not restart parked encoder {}; releasing it later", parts.name);
-            bury(parts);
+            let name = parts.name.clone();
+            log_undelivered(&name, &bury(parts));
             None
         }
     }
 }
 
-/// End the current stream, drop every queued event, and return true only after
-/// `METransformDrainComplete`. Stale `METransformNeedInput` events are not input credit.
-fn end_stream(parts: &mut NativeParts) -> bool {
+/// End the current stream and keep every sample. Flush runs only after the drain
+/// completes; flushing earlier drops a tail frame that has not been pulled yet.
+/// An empty output batch is not completion.
+fn end_stream(parts: &mut NativeParts) -> (bool, Vec<EncodedFrame>) {
     unsafe {
         // Async MFTs: NOTIFY_END_OF_STREAM, then COMMAND_DRAIN, then HaveOutput until
         // METransformDrainComplete. DrainComplete is not posted if COMMAND_DRAIN is skipped.
@@ -1441,18 +1505,26 @@ fn end_stream(parts: &mut NativeParts) -> bool {
         let _ = parts.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
         let _ = parts.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
     }
-    let drained = wait_for_drain_complete(parts);
-    unsafe {
-        let _ = parts.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-        let _ = parts.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+    let (drained, mut frames) = wait_for_drain_complete(parts);
+    if drained {
+        unsafe {
+            let _ = parts.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+            let _ = parts.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+        }
+        // Flush can leave NeedInput. Any sample that is still queued is kept.
+        frames.extend(take_queued_samples(parts));
+    } else {
+        log::warn!("{}: drain deadline hit; not flushing, so buffered samples stay available", parts.name);
     }
-    // Flush can leave NeedInput / HaveOutput from the old stream in the generator.
-    discard_queued_events(parts);
-    drained
+    (drained, frames)
 }
 
 fn begin_stream(parts: &mut NativeParts) -> bool {
-    discard_queued_events(parts);
+    let leftover = take_queued_samples(parts);
+    if !leftover.is_empty() {
+        log::warn!("{} sample(s) were still queued at restart; delivering them with the next session", leftover.len());
+        parts.tail.extend(leftover);
+    }
     unsafe {
         if let Err(err) = parts.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0) {
             log::warn!("{}: BEGIN_STREAMING failed: {err}", parts.name);
@@ -1466,71 +1538,120 @@ fn begin_stream(parts: &mut NativeParts) -> bool {
     true
 }
 
-fn wait_for_drain_complete(parts: &mut NativeParts) -> bool {
+fn wait_for_drain_complete(parts: &mut NativeParts) -> (bool, Vec<EncodedFrame>) {
+    let mut frames = Vec::new();
     let Some(events) = parts.events.clone() else {
-        for _ in 0..64 {
-            if !pull_and_discard(parts) {
-                return true;
+        let deadline = Instant::now() + SHUTDOWN_LIMIT;
+        while Instant::now() < deadline {
+            match pull_sample(parts) {
+                Pull::Sample(frame) => frames.push(frame),
+                Pull::NeedMore => {
+                    let finished = matches!(
+                        crate::safety::sync_drain_step(crate::safety::DrainKind::NeedMoreInput),
+                        crate::safety::DrainStep::Done
+                    );
+                    return (finished, frames);
+                }
+                Pull::Again => {}
+                Pull::Failed => return (false, frames),
             }
         }
-        return false;
+        log::warn!("{}: sync drain did not finish within {}ms", parts.name, SHUTDOWN_LIMIT.as_millis());
+        return (false, frames);
     };
     let deadline = Instant::now() + REUSE_DRAIN;
     loop {
         if Instant::now() >= deadline {
             log::warn!("{}: drain did not finish within {}ms", parts.name, REUSE_DRAIN.as_millis());
-            return false;
+            return (false, frames);
         }
         match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
             Ok(event) => {
                 let kind = unsafe { event.GetType() }.unwrap_or(0);
-                if kind == METransformDrainComplete.0 as u32 {
-                    let _ = crate::safety::worker_signal(crate::safety::DrainKind::DrainComplete);
-                    return true;
+                let drain_kind = if kind == METransformDrainComplete.0 as u32 {
+                    crate::safety::DrainKind::DrainComplete
                 } else if kind == METransformHaveOutput.0 as u32 {
-                    let _ = crate::safety::worker_signal(crate::safety::DrainKind::Output);
-                    pull_and_discard(parts);
+                    crate::safety::DrainKind::Output
                 } else if kind == MEError.0 as u32 {
-                    let _ = crate::safety::worker_signal(crate::safety::DrainKind::Error);
-                    log::warn!("{}: MEError during drain", parts.name);
-                    return false;
+                    crate::safety::DrainKind::Error
+                } else if kind == METransformNeedInput.0 as u32 {
+                    crate::safety::DrainKind::NeedMoreInput
                 } else {
-                    // Includes METransformNeedInput. That credit belongs to the old stream.
-                    let _ = crate::safety::worker_signal(crate::safety::DrainKind::Quiet);
+                    crate::safety::DrainKind::Quiet
+                };
+                let _ = crate::safety::worker_signal(drain_kind);
+                match crate::safety::async_drain_step(drain_kind) {
+                    crate::safety::DrainStep::KeepSample => {
+                        let mut pulled = false;
+                        for _ in 0..4 {
+                            match pull_sample(parts) {
+                                Pull::Sample(frame) => {
+                                    frames.push(frame);
+                                    pulled = true;
+                                    break;
+                                }
+                                Pull::Again => {}
+                                Pull::NeedMore => break,
+                                Pull::Failed => return (false, frames),
+                            }
+                        }
+                        if !pulled {
+                            log::warn!("{}: HaveOutput during drain produced no sample", parts.name);
+                        }
+                    }
+                    crate::safety::DrainStep::KeepWaiting => {}
+                    crate::safety::DrainStep::Done => return (true, frames),
+                    crate::safety::DrainStep::Failed => {
+                        log::warn!("{}: MEError during drain", parts.name);
+                        return (false, frames);
+                    }
                 }
             }
             Err(err) if err.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                // An empty batch is not METransformDrainComplete.
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(err) => {
                 log::warn!("{}: event queue failed during drain: {err}", parts.name);
-                return false;
+                return (false, frames);
             }
         }
     }
 }
 
-/// Drop queued events. `HaveOutput` is pulled so the MFT is not left holding a sample.
-/// `NeedInput` is discarded and not counted.
-fn discard_queued_events(parts: &mut NativeParts) {
+/// Pull queued samples. `NeedInput` is ignored. Samples are returned, never dropped.
+fn take_queued_samples(parts: &mut NativeParts) -> Vec<EncodedFrame> {
     let Some(events) = parts.events.clone() else {
-        return;
+        return Vec::new();
     };
+    let mut frames = Vec::new();
     for _ in 0..64 {
         match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
             Ok(event) => {
                 let kind = unsafe { event.GetType() }.unwrap_or(0);
                 if kind == METransformHaveOutput.0 as u32 {
-                    pull_and_discard(parts);
+                    if let Pull::Sample(frame) = pull_sample(parts) {
+                        frames.push(frame);
+                    }
                 }
             }
             Err(_) => break,
         }
     }
+    frames
 }
 
-/// Returns true when a sample (or a format change) was pulled.
-fn pull_and_discard(parts: &mut NativeParts) -> bool {
+enum Pull {
+    Sample(EncodedFrame),
+    /// Sync drain is finished.
+    NeedMore,
+    /// Format change or a transient empty pull. Keep draining.
+    Again,
+    Failed,
+}
+
+/// Returns the sample bytes when `ProcessOutput` produced one.
+fn pull_sample(parts: &mut NativeParts) -> Pull {
     let sample = if parts.provides_samples { None } else { mf::empty_sample(parts.output_size).ok() };
     let mut buffer = MFT_OUTPUT_DATA_BUFFER {
         dwStreamID: parts.output_id,
@@ -1540,13 +1661,23 @@ fn pull_and_discard(parts: &mut NativeParts) -> bool {
     };
     let mut status = 0u32;
     let result = unsafe { parts.transform.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status) };
-    drop(ManuallyDrop::into_inner(buffer.pSample));
+    let sample = ManuallyDrop::into_inner(buffer.pSample);
     drop(ManuallyDrop::into_inner(buffer.pEvents));
     match result {
-        Ok(()) => true,
+        Ok(()) => {
+            let Some(sample) = sample else {
+                return Pull::Again;
+            };
+            let time = unsafe { sample.GetSampleTime() }.unwrap_or(0);
+            match mf::sample_bytes(&sample) {
+                Ok(data) if !data.is_empty() => Pull::Sample(EncodedFrame { time, data }),
+                Ok(_) => Pull::Again,
+                Err(_) => Pull::Failed,
+            }
+        }
         Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
             let _ = crate::safety::worker_signal(crate::safety::DrainKind::NeedMoreInput);
-            false
+            Pull::NeedMore
         }
         Err(err) if err.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
             if let Ok(new_type) = unsafe { parts.transform.GetOutputAvailableType(parts.output_id, 0) } {
@@ -1556,9 +1687,9 @@ fn pull_and_discard(parts: &mut NativeParts) -> bool {
                     }
                 }
             }
-            true
+            Pull::Again
         }
-        Err(_) => false,
+        Err(_) => Pull::Failed,
     }
 }
 
@@ -1571,42 +1702,56 @@ fn revive(mut parts: NativeParts) -> std::result::Result<VideoEncoder, NativePar
         log::warn!("could not restart parked encoder {}", parts.name);
         return Err(parts);
     }
-    Ok(host_on_worker(parts.into_encoder()))
+    // Deliver leftovers on the shell. They must not acknowledge inputs of the new stream.
+    let carried = std::mem::take(&mut parts.tail);
+    let mut encoder = host_on_worker(parts.into_encoder());
+    encoder.output = carried;
+    Ok(encoder)
 }
 
 #[allow(clippy::result_large_err)]
-fn park_hardware(mut parts: NativeParts) -> std::result::Result<(), NativeParts> {
-    if FORCE_RETIRE.load(Ordering::Relaxed) || parts.broken || !parts.hardware {
+fn park_hardware(mut parts: NativeParts) -> std::result::Result<Vec<EncodedFrame>, NativeParts> {
+    if !parts.hardware {
         return Err(parts);
     }
-    if crate::safety::retire_reused_encoder(parts.sessions, parts.born.elapsed()) {
+    let forced = FORCE_RETIRE.load(Ordering::Relaxed) || parts.broken;
+    let aged_out = crate::safety::retire_reused_encoder(parts.sessions, parts.born.elapsed());
+    if aged_out && !forced {
         log::info!(
             "retiring {} after {} sessions ({:.0}s old)",
             parts.name,
             parts.sessions,
             parts.born.elapsed().as_secs_f64()
         );
-        return Err(parts);
     }
-    if !end_stream(&mut parts) {
-        log::warn!("not reusing {}; the drain did not finish", parts.name);
+    // Drain before park, flush, or release. The collected samples go back to the caller.
+    let (drained, tail) = end_stream(&mut parts);
+    if !drained || forced || aged_out {
+        if !drained {
+            log::warn!("not reusing {}; the drain did not finish", parts.name);
+            parts.broken = true;
+        }
+        parts.tail.extend(tail);
         return Err(parts);
     }
     let mut pool = pool_lock();
     if pool.sessions.iter().any(|existing| existing.key() == parts.key()) {
+        drop(pool);
+        parts.tail.extend(tail);
         return Err(parts);
     }
     if pool.sessions.len() >= POOL_LIMIT {
         let old = pool.sessions.remove(0);
+        let old_name = old.name.clone();
         drop(pool);
-        log::info!("hardware encoder pool is full; delaying release of {}", old.name);
-        bury(old);
+        log::info!("hardware encoder pool is full; delaying release of {old_name}");
+        log_undelivered(&old_name, &bury(old));
         pool_lock().sessions.push(parts);
-        return Ok(());
+        return Ok(tail);
     }
     log::info!("parking hardware encoder {} for reuse", parts.name);
     pool.sessions.push(parts);
-    Ok(())
+    Ok(tail)
 }
 
 struct Buried {
@@ -1652,21 +1797,33 @@ pub fn shutdown_pooled_encoders() {
     }
     log::info!("retiring {} parked hardware encoder(s) on the graveyard thread", sessions.len());
     for parts in sessions {
-        bury(parts);
+        let name = parts.name.clone();
+        log_undelivered(&name, &bury(parts));
     }
 }
 
-fn bury(mut parts: NativeParts) {
+fn log_undelivered(name: &str, frames: &[EncodedFrame]) {
+    if frames.is_empty() {
+        return;
+    }
+    log::error!(
+        "{name} still held {} encoded sample(s) at release: {}",
+        frames.len(),
+        frames.iter().map(|frame| frame.time.to_string()).collect::<Vec<_>>().join(", ")
+    );
+}
+
+fn bury(mut parts: NativeParts) -> Vec<EncodedFrame> {
     // The MFT leaves the live set and stays in the graveyard count until it is released.
     release_live_slot();
-    // Ask the MFT to stop, but do not release it. NVIDIA may still have an RTWorkQ item queued.
-    // We pull with GetEvent, never BeginGetEvent, so there is no app callback to cancel.
-    unsafe {
-        let _ = parts.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-        let _ = parts.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
-        let _ = parts.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+    // end_stream already sent EOS and COMMAND_DRAIN. Do not flush, and do not pull samples
+    // just to drop them. A non-blocking read keeps a sample that arrived after the deadline.
+    let mut frames = std::mem::take(&mut parts.tail);
+    let late = take_queued_samples(&mut parts);
+    if !late.is_empty() {
+        log::warn!("{} late sample(s) arrived while retiring {}", late.len(), parts.name);
+        frames.extend(late);
     }
-    discard_queued_events(&mut parts);
     HW_RETIRED.fetch_add(1, Ordering::Relaxed);
     log::info!("delaying release of hardware encoder {} by {}s", parts.name, crate::safety::GRAVEYARD_DELAY.as_secs());
     start_graveyard();
@@ -1687,6 +1844,7 @@ fn bury(mut parts: NativeParts) {
             std::mem::forget(buried);
         }
     }
+    frames
 }
 
 fn graveyard_loop(rx: mpsc::Receiver<Buried>) {
@@ -1750,38 +1908,7 @@ fn release_buried(parts: NativeParts) {
 }
 
 fn release_software(parts: NativeParts) {
-    unsafe {
-        let _ = parts.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-        let _ = parts.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
-    }
-    let deadline = Instant::now() + SHUTDOWN_LIMIT;
-    while Instant::now() < deadline {
-        let mut buffer = MFT_OUTPUT_DATA_BUFFER {
-            dwStreamID: parts.output_id,
-            pSample: std::mem::ManuallyDrop::new(if parts.provides_samples {
-                None
-            } else {
-                mf::empty_sample(parts.output_size).ok()
-            }),
-            dwStatus: 0,
-            pEvents: std::mem::ManuallyDrop::new(None),
-        };
-        let mut status = 0u32;
-        let result = unsafe { parts.transform.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status) };
-        drop(std::mem::ManuallyDrop::into_inner(buffer.pSample));
-        drop(std::mem::ManuallyDrop::into_inner(buffer.pEvents));
-        match result {
-            Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
-                let _ = crate::safety::worker_signal(crate::safety::DrainKind::NeedMoreInput);
-                break;
-            }
-            Err(_) => {
-                let _ = crate::safety::worker_signal(crate::safety::DrainKind::Error);
-                break;
-            }
-            Ok(()) => continue,
-        }
-    }
+    // end_stream already collected the samples. Pulling again here used to drop the bytes.
     unsafe {
         let _ = parts.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
     }
@@ -1940,7 +2067,7 @@ mod media_foundation {
         accepted: &mut Vec<i64>,
         width: u32,
         height: u32,
-        allow_hardware: bool,
+        mut allow_hardware: bool,
     ) {
         let mut pending: VecDeque<super::HeldInput> = encoder.take_unacknowledged().into();
         eprintln!(
@@ -1965,6 +2092,7 @@ mod media_foundation {
             let encoder_ptr = encoder as *mut VideoEncoder;
             let result = crate::safety::replay_until_accepted(
                 &mut pending,
+                crate::safety::REPLAY_DEADLINE,
                 |input: &super::HeldInput, force_key| {
                     let encoder = unsafe { &mut *encoder_ptr };
                     let Some(texture) = input.texture.as_ref() else {
@@ -1987,8 +2115,9 @@ mod media_foundation {
                     match encoder.poll() {
                         Ok(()) => match encoder.take_output() {
                             Ok(frames) => {
+                                let produced = !frames.is_empty();
                                 encoded.extend(frames);
-                                Ok(())
+                                Ok(produced)
                             }
                             Err(super::EncoderFault::Stalled) => Err("stall".into()),
                             Err(err) => Err(err.to_string()),
@@ -2003,7 +2132,23 @@ mod media_foundation {
                     super::note_recovery();
                     return;
                 }
-                Err(err) if err == "stall" => {
+                Err(crate::safety::ReplayStop::BusyTimeout) => {
+                    eprintln!(
+                        "recovery made no progress for {}s at {width}x{height}; falling back to software, queued {:?}",
+                        crate::safety::REPLAY_DEADLINE.as_secs(),
+                        times_of(&pending)
+                    );
+                    if !allow_hardware {
+                        panic!("software recovery made no progress; queued {:?}", times_of(&pending));
+                    }
+                    encoder.mark_broken();
+                    encoded.extend(encoder.shutdown());
+                    *encoder = VideoEncoder::new(gpu, &settings(width, height, false)).unwrap_or_else(|err| {
+                        panic!("software encoder failed ({err}); queued {:?}", times_of(&pending))
+                    });
+                    allow_hardware = false;
+                }
+                Err(crate::safety::ReplayStop::Stopped(err)) if err == "stall" => {
                     let mut again: VecDeque<super::HeldInput> = encoder.take_unacknowledged().into();
                     again.retain(|frame| !pending.iter().any(|kept| kept.time == frame.time));
                     again.append(&mut pending);
@@ -2014,7 +2159,9 @@ mod media_foundation {
                         pending.len()
                     );
                 }
-                Err(err) => panic!("replay failed ({err}); queued {:?}", times_of(&pending)),
+                Err(crate::safety::ReplayStop::Stopped(err)) => {
+                    panic!("replay failed ({err}); queued {:?}", times_of(&pending))
+                }
             }
         }
     }
@@ -2072,28 +2219,33 @@ mod media_foundation {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        for _ in 0..40 {
-            if encoded.len() >= accepted.len() {
-                break;
-            }
-            if let Err(super::EncoderFault::Stalled) = encoder.poll() {
-                replay_after_stall(gpu, &mut encoder, &mut encoded, &mut accepted, width, height, allow_hardware);
-            }
-            match encoder.take_output() {
-                Ok(frames) if frames.is_empty() => break,
-                Ok(frames) => encoded.extend(frames),
-                Err(super::EncoderFault::Stalled) => {
-                    replay_after_stall(gpu, &mut encoder, &mut encoded, &mut accepted, width, height, allow_hardware);
-                }
-                Err(err) => panic!("{label} encoder output failed: {err}"),
-            }
+        // Empty polls are not the end of an async drain. Shutdown collects until
+        // METransformDrainComplete (or the sync drain finishes) and returns those samples.
+        let tail = encoder.shutdown();
+        if !tail.is_empty() {
+            eprintln!(
+                "{label} drain delivered {} tail frame(s) at {width}x{height}: {}",
+                tail.len(),
+                tail.iter().map(|frame| frame.time.to_string()).collect::<Vec<_>>().join(", ")
+            );
         }
-        encoder.shutdown();
+        encoded.extend(tail);
+        if encoder.has_unacknowledged() {
+            replay_after_stall(gpu, &mut encoder, &mut encoded, &mut accepted, width, height, allow_hardware);
+            encoded.extend(encoder.shutdown());
+        }
         assert!(encoded.len() >= 8, "{label} encoder produced {} frames", encoded.len());
+        if encoded.len() != accepted.len() {
+            let output_times: Vec<i64> = encoded.iter().map(|frame| frame.time).collect();
+            let missing: Vec<i64> = accepted.iter().copied().filter(|time| !output_times.contains(time)).collect();
+            eprintln!("{label} {width}x{height}: accepted {accepted:?}");
+            eprintln!("{label} {width}x{height}: output {output_times:?}");
+            eprintln!("{label} {width}x{height}: missing {missing:?}");
+        }
         assert_eq!(
             encoded.len(),
             accepted.len(),
-            "{label} encoded {} frames but accepted {}; missing timestamps",
+            "{label} {width}x{height} encoded {} frames but accepted {}; missing timestamps",
             encoded.len(),
             accepted.len()
         );

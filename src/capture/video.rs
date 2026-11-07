@@ -192,9 +192,10 @@ fn flush_recovery(s: &mut State, shared: &Shared, parser: &mut LiveParser, curre
     if s.recovery.is_empty() {
         return Ok(());
     }
+    let mut used_software = false;
     loop {
         if s.encoder.is_poisoned() {
-            if let Err(err) = open_replacement(s) {
+            if let Err(err) = open_replacement(s, false) {
                 log::error!(
                     "replacement encoder was not created ({err}); keeping {} recovery frames",
                     s.recovery.len()
@@ -213,12 +214,27 @@ fn flush_recovery(s: &mut State, shared: &Shared, parser: &mut LiveParser, curre
                 encoder::note_recovery();
                 return Ok(());
             }
-            Err(err) if err == "stall" => {
+            Err(crate::safety::ReplayStop::BusyTimeout) => {
+                log::error!(
+                    "recovery made no progress for {}s; falling back to software with {} frames still queued",
+                    crate::safety::REPLAY_DEADLINE.as_secs(),
+                    s.recovery.len()
+                );
+                if used_software {
+                    return Err("recovery made no progress on the software encoder".into());
+                }
+                used_software = true;
+                s.encoder.mark_broken();
+                let _ = s.encoder.shutdown();
+                open_replacement(s, true)?;
+                reset_parser(s, shared, parser, current_time);
+            }
+            Err(crate::safety::ReplayStop::Stopped(err)) if err == "stall" => {
                 let mut again: VecDeque<encoder::HeldInput> = s.encoder.take_unacknowledged().into();
                 again.retain(|frame| !s.recovery.iter().any(|kept| kept.time == frame.time));
                 again.append(&mut s.recovery);
                 s.recovery = again;
-                if let Err(open_err) = open_replacement(s) {
+                if let Err(open_err) = open_replacement(s, false) {
                     log::error!(
                         "replacement encoder was not created ({open_err}); keeping {} recovery frames",
                         s.recovery.len()
@@ -227,12 +243,12 @@ fn flush_recovery(s: &mut State, shared: &Shared, parser: &mut LiveParser, curre
                 }
                 reset_parser(s, shared, parser, current_time);
             }
-            Err(err) => return Err(err),
+            Err(crate::safety::ReplayStop::Stopped(err)) => return Err(err),
         }
     }
 }
 
-fn open_replacement(s: &mut State) -> Result<(), String> {
+fn open_replacement(s: &mut State, force_software: bool) -> Result<(), String> {
     let settings = encoder::Settings {
         codec: s.encoder.codec,
         width: s.width,
@@ -240,7 +256,7 @@ fn open_replacement(s: &mut State) -> Result<(), String> {
         fps: s.fps,
         bitrate_kbps: s.bitrate_kbps,
         fast_preset: s.fast_preset,
-        allow_hardware: !encoder::prefer_software(),
+        allow_hardware: !force_software && !encoder::prefer_software(),
     };
     s.encoder = VideoEncoder::new(&s.gpu, &settings)?;
     Ok(())
@@ -266,11 +282,12 @@ fn replay_held(
     gpu: &Gpu,
     recovery: &mut VecDeque<encoder::HeldInput>,
     publish: &mut PublishFrames<'_>,
-) -> Result<(), String> {
+) -> Result<(), crate::safety::ReplayStop<String>> {
     // The two callbacks run one at a time. A shared reference would make that illegal to express.
     let encoder = encoder as *mut VideoEncoder;
     crate::safety::replay_until_accepted(
         recovery,
+        crate::safety::REPLAY_DEADLINE,
         |input, force_key| {
             let encoder = unsafe { &mut *encoder };
             let Some(texture) = input.texture.as_ref() else {
@@ -286,7 +303,11 @@ fn replay_held(
             let encoder = unsafe { &mut *encoder };
             match encoder.poll() {
                 Ok(()) => match encoder.take_output() {
-                    Ok(frames) => publish(encoder, frames),
+                    Ok(frames) => {
+                        let produced = !frames.is_empty();
+                        publish(encoder, frames)?;
+                        Ok(produced)
+                    }
                     Err(EncoderFault::Stalled) => Err("stall".into()),
                     Err(err) => Err(err.to_string()),
                 },
@@ -395,6 +416,76 @@ fn stale_restart_allowed() -> bool {
     true
 }
 
+fn publish_drained(s: &State, shared: &Shared, parser: &mut LiveParser, frames: Vec<encoder::EncodedFrame>) {
+    if frames.is_empty() {
+        return;
+    }
+    log::info!(
+        "publishing {} drained frame(s): {}",
+        frames.len(),
+        frames.iter().map(|frame| frame.time.to_string()).collect::<Vec<_>>().join(", ")
+    );
+    if let Err(err) = publish_frames(&s.encoder, s.width, s.height, shared, parser, frames) {
+        log::error!("could not publish drained frames: {err}");
+    }
+}
+
+fn publish_shutdown_tail(s: &mut State, shared: &Shared, parser: &mut LiveParser) {
+    // Shutdown collects until the drain completes. A deadline leaves the missing inputs
+    // in flight and poisons the session; those are re-encoded before this function returns.
+    // One extra pass collects the replacement encoder's own tail, which State::drop would drop.
+    for attempt in 0..2 {
+        let frames = s.encoder.shutdown();
+        publish_drained(s, shared, parser, frames);
+        let pending = s.encoder.take_unacknowledged();
+        if !pending.is_empty() {
+            log::warn!(
+                "drain left {} input(s) for recovery: {}",
+                pending.len(),
+                pending.iter().map(|input| input.time.to_string()).collect::<Vec<_>>().join(", ")
+            );
+        }
+        for input in pending {
+            if !s.recovery.iter().any(|kept| kept.time == input.time) {
+                s.recovery.push_back(input);
+            }
+        }
+        if s.recovery.is_empty() {
+            return;
+        }
+        if attempt == 1 {
+            break;
+        }
+        // The session we just drained is finished. Recovery has to open another encoder.
+        if !s.encoder.is_poisoned() {
+            s.encoder.abandon_for_recovery();
+        }
+        if let Err(err) = flush_recovery(s, shared, parser, parser.format_since) {
+            log::error!(
+                "drain left {} frame(s) unrecovered ({err}): {}",
+                s.recovery.len(),
+                s.recovery.iter().map(|input| input.time.to_string()).collect::<Vec<_>>().join(", ")
+            );
+            return;
+        }
+    }
+    let frames = s.encoder.shutdown();
+    publish_drained(s, shared, parser, frames);
+    let pending = s.encoder.take_unacknowledged();
+    for input in pending {
+        if !s.recovery.iter().any(|kept| kept.time == input.time) {
+            s.recovery.push_back(input);
+        }
+    }
+    if !s.recovery.is_empty() {
+        log::error!(
+            "stopping with {} frame(s) still not encoded: {}",
+            s.recovery.len(),
+            s.recovery.iter().map(|input| input.time.to_string()).collect::<Vec<_>>().join(", ")
+        );
+    }
+}
+
 fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result<(), String> {
     let timer = Timer::new();
     let interval = HNS_PER_SEC / i64::from(s.fps);
@@ -425,169 +516,179 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
     let mut current_submitted = false;
     let mut current_time = 0i64;
 
-    while !stop.load(Ordering::Relaxed) {
-        shared.beat();
-        if !s.recovery.is_empty() {
-            if let Err(err) = flush_recovery(&mut s, shared, &mut parser, current_time) {
-                log::error!("replay still holding {} frames after {err}", s.recovery.len());
-            }
-        }
-        let target = tick * interval;
-        let wait = target - clock.now();
-        if wait > 0 {
-            match &timer {
-                Some(timer) => timer.sleep_hns(wait),
-                None => std::thread::sleep(std::time::Duration::from_nanos(wait as u64 * 100)),
-            }
-        }
-        if s.capture.is_closed() {
-            return Err("the captured monitor was disconnected".into());
-        }
-        if !stop.load(Ordering::Relaxed) && shared.take_capture_refresh() {
-            match ScreenCapture::new(&s.gpu, s.monitor, s.cursor, s.fps) {
-                Ok(fresh) if fresh.size() == s.capture.size() => {
-                    // Stop the old session's callback before its objects are freed.
-                    s.capture.shutdown();
-                    s.capture = fresh;
-                    black_since = None;
-                    log::info!("screen capture session refreshed");
+    let result = (|| {
+        while !stop.load(Ordering::Relaxed) {
+            shared.beat();
+            if !s.recovery.is_empty() {
+                if let Err(err) = flush_recovery(&mut s, shared, &mut parser, current_time) {
+                    log::error!("replay still holding {} frames after {err}", s.recovery.len());
                 }
-                Ok(_) => return Err(STALE.into()),
-                Err(err) => log::warn!("couldn't refresh the screen capture: {err}"),
-            }
-        }
-
-        let change = s.capture.poll(&s.gpu).map_err(|e| format!("capture failed: {e}"))?;
-        if s.windowed_cap && target - last_fullscreen_check >= FULLSCREEN_CHECK {
-            last_fullscreen_check = target;
-            full_rate = crate::win::monitors::fullscreen_app_on(s.monitor);
-        }
-        // Outside fullscreen apps, even big changes are encoded at most WINDOWED_FPS times a second.
-        let min_gap = if full_rate { 0 } else { HNS_PER_SEC / WINDOWED_FPS - interval / 2 };
-
-        // Only encode when the screen changed, plus a refresh at least every second: an idle
-        // desktop costs next to nothing, and replays can still start on any second.
-        pending_key |= shared.take_keyframe_request();
-        pending_change += change.unwrap_or(0.0);
-        let big_change = pending_change >= SMALL_CHANGE && target - last_encoded >= min_gap;
-        let small_change_due = pending_change > 0.0 && target - last_encoded >= HNS_PER_SEC / SMALL_CHANGE_FPS;
-        let dirty = big_change || small_change_due;
-        let key_due = target - parser.last_key >= HNS_PER_SEC - interval / 2;
-        let refresh_due = target - last_encoded >= HNS_PER_SEC - interval / 2;
-        let wanted = dirty || refresh_due || pending_key;
-        if wanted && s.capture.has_frame() {
-            // Convert only frames that will actually be encoded.
-            let (gpu, converter) = (&s.gpu, &mut s.converter);
-            s.capture
-                .take_frame(|texture, w, h| {
-                    current = Some(converter.convert(gpu, texture, w, h)?);
-                    current_submitted = false;
-                    current_time = target;
-                    Ok(())
-                })
-                .map_err(|e| format!("capture failed: {e}"))?;
-            if target - last_probe >= PROBE_EVERY {
-                last_probe = target;
-                if s.converter.looks_black(&s.gpu) {
-                    black_since.get_or_insert(target);
-                } else {
-                    black_since = None;
+                if !s.recovery.is_empty() {
+                    // Older queued inputs keep their order. Do not submit a new picture in front of them.
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    continue;
                 }
             }
-        }
-        // A capture session that came back broken after sleep shows black or stops updating while
-        // the user is clearly working: start over with a fresh one.
-        let black = black_since.is_some_and(|since| target - since > BLACK_LIMIT);
-        // While the monitor is off, black is expected.
-        if black
-            && crate::win::display_on()
-            && crate::win::input_idle_ms() < PRESENT_WITHIN_MS
-            && stale_restart_allowed()
-        {
-            return Err(STALE.into());
-        }
-        if let (Some(frame), true) = (&current, wanted) {
-            let force_key = pending_key || key_due;
-            let mut recovered = false;
-            let accepted = match s.encoder.submit(&s.gpu, frame, target, interval, force_key) {
-                Ok(accepted) => accepted,
-                Err(EncoderFault::Stalled) => {
-                    // submit already kept this frame. Do not snapshot `current` again.
+            let target = tick * interval;
+            let wait = target - clock.now();
+            if wait > 0 {
+                match &timer {
+                    Some(timer) => timer.sleep_hns(wait),
+                    None => std::thread::sleep(std::time::Duration::from_nanos(wait as u64 * 100)),
+                }
+            }
+            if s.capture.is_closed() {
+                return Err("the captured monitor was disconnected".into());
+            }
+            if !stop.load(Ordering::Relaxed) && shared.take_capture_refresh() {
+                match ScreenCapture::new(&s.gpu, s.monitor, s.cursor, s.fps) {
+                    Ok(fresh) if fresh.size() == s.capture.size() => {
+                        // Stop the old session's callback before its objects are freed.
+                        s.capture.shutdown();
+                        s.capture = fresh;
+                        black_since = None;
+                        log::info!("screen capture session refreshed");
+                    }
+                    Ok(_) => return Err(STALE.into()),
+                    Err(err) => log::warn!("couldn't refresh the screen capture: {err}"),
+                }
+            }
+
+            let change = s.capture.poll(&s.gpu).map_err(|e| format!("capture failed: {e}"))?;
+            if s.windowed_cap && target - last_fullscreen_check >= FULLSCREEN_CHECK {
+                last_fullscreen_check = target;
+                full_rate = crate::win::monitors::fullscreen_app_on(s.monitor);
+            }
+            // Outside fullscreen apps, even big changes are encoded at most WINDOWED_FPS times a second.
+            let min_gap = if full_rate { 0 } else { HNS_PER_SEC / WINDOWED_FPS - interval / 2 };
+
+            // Only encode when the screen changed, plus a refresh at least every second: an idle
+            // desktop costs next to nothing, and replays can still start on any second.
+            pending_key |= shared.take_keyframe_request();
+            pending_change += change.unwrap_or(0.0);
+            let big_change = pending_change >= SMALL_CHANGE && target - last_encoded >= min_gap;
+            let small_change_due = pending_change > 0.0 && target - last_encoded >= HNS_PER_SEC / SMALL_CHANGE_FPS;
+            let dirty = big_change || small_change_due;
+            let key_due = target - parser.last_key >= HNS_PER_SEC - interval / 2;
+            let refresh_due = target - last_encoded >= HNS_PER_SEC - interval / 2;
+            let wanted = dirty || refresh_due || pending_key;
+            if wanted && s.capture.has_frame() {
+                // Convert only frames that will actually be encoded.
+                let (gpu, converter) = (&s.gpu, &mut s.converter);
+                s.capture
+                    .take_frame(|texture, w, h| {
+                        current = Some(converter.convert(gpu, texture, w, h)?);
+                        current_submitted = false;
+                        current_time = target;
+                        Ok(())
+                    })
+                    .map_err(|e| format!("capture failed: {e}"))?;
+                if target - last_probe >= PROBE_EVERY {
+                    last_probe = target;
+                    if s.converter.looks_black(&s.gpu) {
+                        black_since.get_or_insert(target);
+                    } else {
+                        black_since = None;
+                    }
+                }
+            }
+            // A capture session that came back broken after sleep shows black or stops updating while
+            // the user is clearly working: start over with a fresh one.
+            let black = black_since.is_some_and(|since| target - since > BLACK_LIMIT);
+            // While the monitor is off, black is expected.
+            if black
+                && crate::win::display_on()
+                && crate::win::input_idle_ms() < PRESENT_WITHIN_MS
+                && stale_restart_allowed()
+            {
+                return Err(STALE.into());
+            }
+            if let (Some(frame), true) = (&current, wanted) {
+                let force_key = pending_key || key_due;
+                let mut recovered = false;
+                let accepted = match s.encoder.submit(&s.gpu, frame, target, interval, force_key) {
+                    Ok(accepted) => accepted,
+                    Err(EncoderFault::Stalled) => {
+                        // submit already kept this frame. Do not snapshot `current` again.
+                        current_submitted = true;
+                        if let Err(err) =
+                            replace_stalled_encoder(&mut s, shared, &mut parser, None, true, target, interval)
+                        {
+                            log::error!("replay paused: {err}; {} frames still queued", s.recovery.len());
+                        }
+                        recovered = true;
+                        true
+                    }
+                    Err(err) => return Err(encoder_error(&mut s.encoder, format!("encoder failed: {err}"))),
+                };
+                if accepted {
+                    last_encoded = target;
                     current_submitted = true;
-                    if let Err(err) = replace_stalled_encoder(&mut s, shared, &mut parser, None, true, target, interval)
-                    {
+                    current_time = target;
+                    pending_key = recovered;
+                    pending_change = 0.0;
+                } else if target - last_encoded.max(started) > STALL_LIMIT {
+                    // Shut the wedged encoder down on the way out (State::drop). Returning the error
+                    // restarts the pipeline; it must not free the MFT while its thread is still in it.
+                    log::warn!("video encoder stopped responding; releasing it before restart");
+                    return Err(encoder_error(&mut s.encoder, "the video encoder stopped responding".into()));
+                }
+            } else if let Err(err) = s.encoder.poll() {
+                if matches!(err, EncoderFault::Stalled) {
+                    if let Err(err) = replace_stalled_encoder(
+                        &mut s,
+                        shared,
+                        &mut parser,
+                        current.as_ref(),
+                        current_submitted,
+                        current_time,
+                        interval,
+                    ) {
                         log::error!("replay paused: {err}; {} frames still queued", s.recovery.len());
                     }
-                    recovered = true;
-                    true
+                    pending_key = true;
+                } else {
+                    return Err(encoder_error(&mut s.encoder, format!("encoder failed: {err}")));
+                }
+            }
+
+            let output = match s.encoder.take_output() {
+                Ok(frames) => frames,
+                Err(EncoderFault::Stalled) => {
+                    if let Err(err) = replace_stalled_encoder(
+                        &mut s,
+                        shared,
+                        &mut parser,
+                        current.as_ref(),
+                        current_submitted,
+                        current_time,
+                        interval,
+                    ) {
+                        log::error!("replay paused: {err}; {} frames still queued", s.recovery.len());
+                    }
+                    pending_key = true;
+                    Vec::new()
                 }
                 Err(err) => return Err(encoder_error(&mut s.encoder, format!("encoder failed: {err}"))),
             };
-            if accepted {
-                last_encoded = target;
-                current_submitted = true;
-                current_time = target;
-                pending_key = recovered;
-                pending_change = 0.0;
-            } else if target - last_encoded.max(started) > STALL_LIMIT {
-                // Shut the wedged encoder down on the way out (State::drop). Returning the error
-                // restarts the pipeline; it must not free the MFT while its thread is still in it.
-                log::warn!("video encoder stopped responding; releasing it before restart");
-                return Err(encoder_error(&mut s.encoder, "the video encoder stopped responding".into()));
+            publish_frames(&s.encoder, s.width, s.height, shared, &mut parser, output)?;
+
+            if !parser.format_known && target - parser.format_since > STALL_LIMIT {
+                return Err(encoder_error(&mut s.encoder, "the video encoder produced no usable output".into()));
             }
-        } else if let Err(err) = s.encoder.poll() {
-            if matches!(err, EncoderFault::Stalled) {
-                if let Err(err) = replace_stalled_encoder(
-                    &mut s,
-                    shared,
-                    &mut parser,
-                    current.as_ref(),
-                    current_submitted,
-                    current_time,
-                    interval,
-                ) {
-                    log::error!("replay paused: {err}; {} frames still queued", s.recovery.len());
-                }
-                pending_key = true;
-            } else {
-                return Err(encoder_error(&mut s.encoder, format!("encoder failed: {err}")));
+            if !hardware_ok && parser.format_known && s.encoder.is_hardware() && target - started >= HARDWARE_HEALTHY {
+                encoder::note_hardware_recovered();
+                hardware_ok = true;
+            }
+
+            tick += 1;
+            let now_tick = clock.now() / interval;
+            if now_tick > tick + MAX_LAG_FRAMES {
+                tick = now_tick + 1;
             }
         }
-
-        let output = match s.encoder.take_output() {
-            Ok(frames) => frames,
-            Err(EncoderFault::Stalled) => {
-                if let Err(err) = replace_stalled_encoder(
-                    &mut s,
-                    shared,
-                    &mut parser,
-                    current.as_ref(),
-                    current_submitted,
-                    current_time,
-                    interval,
-                ) {
-                    log::error!("replay paused: {err}; {} frames still queued", s.recovery.len());
-                }
-                pending_key = true;
-                Vec::new()
-            }
-            Err(err) => return Err(encoder_error(&mut s.encoder, format!("encoder failed: {err}"))),
-        };
-        publish_frames(&s.encoder, s.width, s.height, shared, &mut parser, output)?;
-
-        if !parser.format_known && target - parser.format_since > STALL_LIMIT {
-            return Err(encoder_error(&mut s.encoder, "the video encoder produced no usable output".into()));
-        }
-        if !hardware_ok && parser.format_known && s.encoder.is_hardware() && target - started >= HARDWARE_HEALTHY {
-            encoder::note_hardware_recovered();
-            hardware_ok = true;
-        }
-
-        tick += 1;
-        let now_tick = clock.now() / interval;
-        if now_tick > tick + MAX_LAG_FRAMES {
-            tick = now_tick + 1;
-        }
-    }
-    Ok(())
+        Ok(())
+    })();
+    publish_shutdown_tail(&mut s, shared, &mut parser);
+    result
 }

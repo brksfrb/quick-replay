@@ -214,28 +214,111 @@ pub fn capture_through_stall(frames: &[u32], stall_at: Option<u32>) -> Vec<u32> 
     encoded
 }
 
+/// Why [`replay_until_accepted`] stopped before the queue was empty.
+#[derive(Debug)]
+pub enum ReplayStop<E> {
+    /// `Ok(false)` kept coming back and `service_output` produced nothing until `deadline`.
+    BusyTimeout,
+    Stopped(E),
+}
+
+/// How long a replay may sit on `Ok(false)` with empty polls before it gives up on that encoder.
+/// The clock starts over when a frame is accepted or a sample comes out.
+pub const REPLAY_DEADLINE: Duration = Duration::from_secs(2);
+
 /// Submit every queued input. `Ok(false)` means the encoder did not accept the frame:
 /// the same item stays at the front, `service_output` runs, and the call retries.
-/// `Err` leaves the unaccepted tail, including the frame in hand, in `pending`.
+/// Backs off while polls stay empty so a stuck encoder cannot spin forever.
+/// `deadline` is how long that empty stretch may last. Accepting a frame or pulling a
+/// sample starts it over, so a long queue that is making progress is not cut off.
+/// [`ReplayStop::BusyTimeout`] and [`ReplayStop::Stopped`] both leave the unaccepted tail in `pending`.
 pub fn replay_until_accepted<T, E>(
     pending: &mut VecDeque<T>,
+    deadline: Duration,
     mut submit: impl FnMut(&T, bool) -> Result<bool, E>,
-    mut service_output: impl FnMut() -> Result<(), E>,
-) -> Result<(), E> {
+    mut service_output: impl FnMut() -> Result<bool, E>,
+) -> Result<(), ReplayStop<E>> {
+    let mut started = std::time::Instant::now();
+    let mut pause = Duration::from_millis(1);
     let mut force_key = true;
     while !pending.is_empty() {
+        if started.elapsed() >= deadline {
+            return Err(ReplayStop::BusyTimeout);
+        }
         let accepted = {
             let item = pending.front().expect("replay queue is non-empty");
-            submit(item, force_key)?
+            match submit(item, force_key) {
+                Ok(accepted) => accepted,
+                Err(err) => return Err(ReplayStop::Stopped(err)),
+            }
         };
         if accepted {
             pending.pop_front();
             force_key = false;
+            pause = Duration::from_millis(1);
+            started = std::time::Instant::now();
         } else {
-            service_output()?;
+            let produced = match service_output() {
+                Ok(produced) => produced,
+                Err(err) => return Err(ReplayStop::Stopped(err)),
+            };
+            if produced {
+                pause = Duration::from_millis(1);
+                started = std::time::Instant::now();
+            } else {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(20));
+            }
         }
     }
     Ok(())
+}
+
+/// What one step of an encoder drain means. An empty batch is [`DrainStep::KeepWaiting`],
+/// not completion. Async MFTs finish on `METransformDrainComplete`; sync MFTs finish when
+/// the drain says it needs more input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainStep {
+    KeepWaiting,
+    KeepSample,
+    Done,
+    Failed,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn async_drain_step(kind: DrainKind) -> DrainStep {
+    match kind {
+        DrainKind::Output => DrainStep::KeepSample,
+        DrainKind::Quiet | DrainKind::NeedMoreInput => DrainStep::KeepWaiting,
+        DrainKind::DrainComplete => DrainStep::Done,
+        DrainKind::Error => DrainStep::Failed,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn sync_drain_step(kind: DrainKind) -> DrainStep {
+    match kind {
+        DrainKind::Output => DrainStep::KeepSample,
+        DrainKind::NeedMoreInput | DrainKind::DrainComplete => DrainStep::Done,
+        DrainKind::Quiet => DrainStep::KeepWaiting,
+        DrainKind::Error => DrainStep::Failed,
+    }
+}
+
+/// Walk a scripted drain. Empty steps do not stop the walk or drop later samples.
+/// `done` is false when the script ends without a completion event: the tail is not finished.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn collect_drain_events(events: &[DrainKind], async_mft: bool) -> (Vec<usize>, bool) {
+    let mut samples = Vec::new();
+    for (index, kind) in events.iter().copied().enumerate() {
+        match if async_mft { async_drain_step(kind) } else { sync_drain_step(kind) } {
+            DrainStep::KeepSample => samples.push(index),
+            DrainStep::KeepWaiting => {}
+            DrainStep::Done => return (samples, true),
+            DrainStep::Failed => return (samples, false),
+        }
+    }
+    (samples, false)
 }
 
 /// Same device and same output format: flush and reconfigure, do not destroy the MFT.
@@ -491,6 +574,7 @@ mod tests {
         loop {
             let result = replay_until_accepted(
                 &mut pending,
+                Duration::from_secs(2),
                 |frame, _force_key| match script.pop_front().expect("script") {
                     Ok(true) => {
                         accepted.push(frame.clone());
@@ -501,12 +585,12 @@ mod tests {
                 },
                 || {
                     services += 1;
-                    Ok(())
+                    Ok(false)
                 },
             );
             match result {
                 Ok(()) => break,
-                Err("stall") if !stalled => {
+                Err(ReplayStop::Stopped("stall")) if !stalled => {
                     stalled = true;
                     let held: Vec<_> = pending.iter().cloned().collect();
                     assert_eq!(held.iter().map(|frame| frame.id).collect::<Vec<_>>(), vec![2, 3, 4]);
@@ -516,13 +600,49 @@ mod tests {
                         assert_eq!(pending.iter().cloned().collect::<Vec<_>>(), held);
                     }
                 }
-                Err(err) => panic!("recovery dropped frames: {err}; still held {pending:?}"),
+                Err(err) => panic!("recovery dropped frames: {err:?}; still held {pending:?}"),
             }
         }
         assert!(stalled, "the scripted second stall did not run");
         assert!(services >= 3, "busy submits must service output before retrying");
         assert_eq!(accepted, frames);
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn replay_deadline_keeps_the_queue_when_the_encoder_stays_busy() {
+        let mut pending = VecDeque::from([10i64, 20, 30]);
+        let started = std::time::Instant::now();
+        let result = replay_until_accepted(
+            &mut pending,
+            Duration::from_millis(40),
+            |_frame, _force_key| Ok::<bool, &str>(false),
+            || Ok(false),
+        );
+        assert!(matches!(result, Err(ReplayStop::BusyTimeout)));
+        assert_eq!(pending, VecDeque::from([10, 20, 30]));
+        assert!(started.elapsed() < Duration::from_secs(2), "busy replay spun without a deadline");
+    }
+
+    #[test]
+    fn empty_drain_batch_keeps_the_delayed_tail() {
+        let events = [
+            DrainKind::Quiet,
+            DrainKind::Quiet,
+            DrainKind::Output,
+            DrainKind::Quiet,
+            DrainKind::Output,
+            DrainKind::DrainComplete,
+        ];
+        let (samples, done) = collect_drain_events(&events, true);
+        assert!(done, "DrainComplete is what finishes an async drain, not an empty batch");
+        assert_eq!(samples, vec![2, 4], "the sample after the empty batch has to be kept");
+        let (early, done) = collect_drain_events(&events[..5], true);
+        assert!(!done);
+        assert_eq!(early, vec![2, 4]);
+        let (sync_samples, sync_done) = collect_drain_events(&[DrainKind::Output, DrainKind::NeedMoreInput], false);
+        assert!(sync_done);
+        assert_eq!(sync_samples, vec![0]);
     }
 
     #[test]
