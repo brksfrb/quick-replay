@@ -855,6 +855,9 @@ impl Service {
         } else {
             let _ = std::fs::remove_file(paths::checkpoint_path());
         }
+        // `static` pools are not dropped at exit. Move parked MFTs to the graveyard thread.
+        // Quit does not wait out the delay: if this process ends first, the OS reclaims them.
+        crate::capture::encoder::shutdown_pooled_encoders();
         unsafe { PostQuitMessage(0) };
     }
 
@@ -1032,6 +1035,7 @@ pub fn run(mode: StartMode) {
         return;
     };
     crate::update::cleanup();
+    crate::capture::encoder::start_graveyard();
     let _com = ComGuard::sta();
     log::info!("QuickReplay {} starting ({})", env!("CARGO_PKG_VERSION"), paths::current_exe().display());
     let config = load_config();

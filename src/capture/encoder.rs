@@ -10,9 +10,9 @@ use super::gpu::Gpu;
 use super::mf;
 use crate::config::Codec;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::OnceLock;
+use std::sync::Once;
 use std::time::{Duration, Instant};
 use windows::core::{Interface, Result, GUID};
 use windows::Win32::Graphics::Direct3D11::{
@@ -191,8 +191,10 @@ fn video_type(sub: &GUID, s: &Settings) -> Result<IMFMediaType> {
 
 impl VideoEncoder {
     pub fn new(gpu: &Gpu, settings: &Settings) -> std::result::Result<VideoEncoder, String> {
+        start_graveyard();
         if settings.allow_hardware {
             if let Some(encoder) = reclaim_hardware(gpu, settings) {
+                HW_REUSED.fetch_add(1, Ordering::Relaxed);
                 log::info!("reusing hardware encoder {} ({}x{})", encoder.name, encoder.width, encoder.height);
                 return Ok(encoder);
             }
@@ -202,7 +204,10 @@ impl VideoEncoder {
                 for activate in hardware_encoders(gpu, settings.codec) {
                     let name = activate.cast::<IMFAttributes>().map(|a| mf::friendly_name(&a)).unwrap_or_default();
                     match Self::from_activate(gpu, &activate, settings, name.clone()) {
-                        Ok(encoder) => return Ok(encoder),
+                        Ok(encoder) => {
+                            HW_CREATED.fetch_add(1, Ordering::Relaxed);
+                            return Ok(encoder);
+                        }
                         Err(err) => {
                             log::warn!("hardware encoder '{name}' failed: {err}");
                             // ActivateObject failed or configure released the transform already.
@@ -476,15 +481,19 @@ impl VideoEncoder {
     }
 }
 
-/// How long a synchronous drain waits for `METransformDrainComplete` when we are about to
-/// bury a session. Reused sessions are not drained here.
+/// How long a synchronous software drain waits for `MF_E_TRANSFORM_NEED_MORE_INPUT`.
 const SHUTDOWN_LIMIT: Duration = Duration::from_millis(400);
+/// How long a reuse drain waits for `METransformDrainComplete` before the session is retired
+/// instead of parked. A reused NVIDIA MFT that did not finish draining rejects the next input.
+const REUSE_DRAIN: Duration = Duration::from_secs(2);
 
 impl VideoEncoder {
     /// Stops using this encoder.
     ///
-    /// A healthy hardware encoder is flushed and parked, one per format and D3D device, and
-    /// the next `new` with the same key restarts streaming on it. Destroying NVIDIA's MFT
+    /// A healthy hardware encoder is drained, flushed, and parked, one per format and D3D
+    /// device. The next `new` with the same key sends `BEGIN_STREAMING` and `START_OF_STREAM`
+    /// and accepts input only after a fresh `METransformNeedInput`. NeedInput events left
+    /// over from the previous stream are discarded, not counted. Destroying NVIDIA's MFT
     /// (`nvEncMFTH264x`) while an `RTWorkQ` item is still queued faults in ntdll
     /// (`RtlEnterCriticalSection` on NULL+0x24, offset `0x1a12d`). `METransformDrainComplete`
     /// does **not** mean those driver work items have finished.
@@ -662,33 +671,80 @@ struct Pool {
     sessions: Vec<NativeParts>,
 }
 
-impl Drop for Pool {
-    fn drop(&mut self) {
-        if self.sessions.is_empty() {
-            return;
-        }
-        let count = self.sessions.len();
-        for parts in self.sessions.drain(..) {
-            bury(parts);
-        }
-        // The process is exiting. Stay alive until the graveyard thread has released the MFTs;
-        // freeing them on this thread is the ntdll crash.
-        log::info!("waiting for {count} hardware encoder(s) to finish shutting down");
-        std::thread::sleep(crate::safety::GRAVEYARD_DELAY + Duration::from_secs(1));
+/// Parked hardware encoders.
+///
+/// Rust does not drop `static` items when the process exits, so a `Drop` impl here would
+/// never run. [`shutdown_pooled_encoders`] is what a normal quit calls. It moves the MFTs
+/// to the graveyard thread and does not wait for the delay: if the process ends first, this
+/// thread does not `Release` them and the OS reclaims the memory. Releasing them inline on
+/// the way out is the ntdll crash.
+static POOL: std::sync::Mutex<Pool> = std::sync::Mutex::new(Pool { sessions: Vec::new() });
+static LAST_HARDWARE_CREATE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+static CREATE_GAP: std::sync::Mutex<Duration> = std::sync::Mutex::new(crate::safety::HARDWARE_CREATE_GAP);
+static FORCE_RETIRE: AtomicBool = AtomicBool::new(false);
+static HW_CREATED: AtomicU64 = AtomicU64::new(0);
+static HW_REUSED: AtomicU64 = AtomicU64::new(0);
+static HW_RETIRED: AtomicU64 = AtomicU64::new(0);
+static HW_SHUTDOWN: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
+pub struct EncoderCounters {
+    pub created: u64,
+    pub reused: u64,
+    pub retired: u64,
+    pub shut_down: u64,
+}
+
+#[cfg(test)]
+pub fn encoder_counters() -> EncoderCounters {
+    EncoderCounters {
+        created: HW_CREATED.load(Ordering::Relaxed),
+        reused: HW_REUSED.load(Ordering::Relaxed),
+        retired: HW_RETIRED.load(Ordering::Relaxed),
+        shut_down: HW_SHUTDOWN.load(Ordering::Relaxed),
     }
 }
 
-static POOL: std::sync::Mutex<Pool> = std::sync::Mutex::new(Pool { sessions: Vec::new() });
-static LAST_HARDWARE_CREATE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+/// Test hook. Production keeps [`crate::safety::HARDWARE_CREATE_GAP`]. The soak sets this
+/// to zero so a tight loop still constructs hardware encoders instead of falling back.
+#[cfg(test)]
+pub fn set_hardware_create_gap_for_tests(gap: Duration) {
+    *CREATE_GAP.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = gap;
+}
+
+/// Test hook. When set, every hardware shutdown is buried instead of parked, so the
+/// graveyard path runs even when the format pool is not full.
+#[cfg(test)]
+pub fn set_force_retire_hardware_for_tests(enabled: bool) {
+    FORCE_RETIRE.store(enabled, Ordering::Relaxed);
+}
+
+/// Blocks until every encoder handed to the graveyard has been released, or `timeout` elapses.
+#[cfg(test)]
+pub fn wait_for_graveyard_shutdown(timeout: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        let counters = encoder_counters();
+        if counters.retired > 0 && counters.shut_down >= counters.retired {
+            return true;
+        }
+        if started.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
 
 fn pool_lock() -> std::sync::MutexGuard<'static, Pool> {
     POOL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn hardware_create_allowed_now() -> bool {
+    let gap = *CREATE_GAP.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut last = LAST_HARDWARE_CREATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let now = Instant::now();
-    if !crate::safety::hardware_create_allowed(*last, now, crate::safety::HARDWARE_CREATE_GAP) {
+    if !crate::safety::hardware_create_allowed(*last, now, gap) {
         return false;
     }
     *last = Some(now);
@@ -718,27 +774,151 @@ fn reclaim_hardware(gpu: &Gpu, settings: &Settings) -> Option<VideoEncoder> {
     }
 }
 
-/// Flush and start streaming again. On failure the parts are returned so the caller can bury them.
-fn revive(parts: NativeParts) -> std::result::Result<VideoEncoder, NativeParts> {
-    let transform = parts.transform.clone();
-    let restart = unsafe {
-        let _ = transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-        let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
-        transform
-            .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
-            .and_then(|()| transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0))
+/// End the current stream, drop every queued event, and return true only after
+/// `METransformDrainComplete`. Stale `METransformNeedInput` events are not input credit.
+fn end_stream(parts: &mut NativeParts) -> bool {
+    unsafe {
+        // Async MFTs complete this with METransformDrainComplete. COMMAND_DRAIN is the
+        // synchronous-MFT message and is not part of the reuse sequence.
+        let _ = parts.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+    }
+    let drained = wait_for_drain_complete(parts);
+    unsafe {
+        let _ = parts.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+        let _ = parts.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+    }
+    // Flush can leave NeedInput / HaveOutput from the old stream in the generator.
+    discard_queued_events(parts);
+    drained
+}
+
+fn begin_stream(parts: &mut NativeParts) -> bool {
+    discard_queued_events(parts);
+    unsafe {
+        if let Err(err) = parts.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0) {
+            log::warn!("{}: BEGIN_STREAMING failed: {err}", parts.name);
+            return false;
+        }
+        if let Err(err) = parts.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0) {
+            log::warn!("{}: START_OF_STREAM failed: {err}", parts.name);
+            return false;
+        }
+    }
+    true
+}
+
+fn wait_for_drain_complete(parts: &mut NativeParts) -> bool {
+    let Some(events) = parts.events.clone() else {
+        for _ in 0..64 {
+            if !pull_and_discard(parts) {
+                return true;
+            }
+        }
+        return false;
     };
-    match restart {
-        Ok(()) => Ok(parts.into_encoder()),
-        Err(err) => {
-            log::warn!("parked encoder refused to restart: {err}");
-            Err(parts)
+    let deadline = Instant::now() + REUSE_DRAIN;
+    loop {
+        if Instant::now() >= deadline {
+            log::warn!("{}: drain did not finish within {}ms", parts.name, REUSE_DRAIN.as_millis());
+            return false;
+        }
+        match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+            Ok(event) => {
+                let kind = unsafe { event.GetType() }.unwrap_or(0);
+                if kind == METransformDrainComplete.0 as u32 {
+                    let _ = crate::safety::worker_signal(crate::safety::DrainKind::DrainComplete);
+                    return true;
+                } else if kind == METransformHaveOutput.0 as u32 {
+                    let _ = crate::safety::worker_signal(crate::safety::DrainKind::Output);
+                    pull_and_discard(parts);
+                } else if kind == MEError.0 as u32 {
+                    let _ = crate::safety::worker_signal(crate::safety::DrainKind::Error);
+                    log::warn!("{}: MEError during drain", parts.name);
+                    return false;
+                } else {
+                    // Includes METransformNeedInput. That credit belongs to the old stream.
+                    let _ = crate::safety::worker_signal(crate::safety::DrainKind::Quiet);
+                }
+            }
+            Err(err) if err.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => {
+                log::warn!("{}: event queue failed during drain: {err}", parts.name);
+                return false;
+            }
         }
     }
 }
 
-fn park_hardware(parts: NativeParts) -> std::result::Result<(), NativeParts> {
-    if parts.broken || !parts.hardware {
+/// Drop queued events. `HaveOutput` is pulled so the MFT is not left holding a sample.
+/// `NeedInput` is discarded and not counted.
+fn discard_queued_events(parts: &mut NativeParts) {
+    let Some(events) = parts.events.clone() else {
+        return;
+    };
+    for _ in 0..64 {
+        match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+            Ok(event) => {
+                let kind = unsafe { event.GetType() }.unwrap_or(0);
+                if kind == METransformHaveOutput.0 as u32 {
+                    pull_and_discard(parts);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Returns true when a sample (or a format change) was pulled.
+fn pull_and_discard(parts: &mut NativeParts) -> bool {
+    let sample = if parts.provides_samples { None } else { mf::empty_sample(parts.output_size).ok() };
+    let mut buffer = MFT_OUTPUT_DATA_BUFFER {
+        dwStreamID: parts.output_id,
+        pSample: ManuallyDrop::new(sample),
+        dwStatus: 0,
+        pEvents: ManuallyDrop::new(None),
+    };
+    let mut status = 0u32;
+    let result = unsafe { parts.transform.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status) };
+    drop(ManuallyDrop::into_inner(buffer.pSample));
+    drop(ManuallyDrop::into_inner(buffer.pEvents));
+    match result {
+        Ok(()) => true,
+        Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
+            let _ = crate::safety::worker_signal(crate::safety::DrainKind::NeedMoreInput);
+            false
+        }
+        Err(err) if err.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+            if let Ok(new_type) = unsafe { parts.transform.GetOutputAvailableType(parts.output_id, 0) } {
+                if unsafe { parts.transform.SetOutputType(parts.output_id, &new_type, 0) }.is_ok() {
+                    if let Ok(info) = unsafe { parts.transform.GetOutputStreamInfo(parts.output_id) } {
+                        parts.output_size = info.cbSize.max(parts.output_size);
+                    }
+                }
+            }
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Restart a parked async MFT. `into_encoder` starts `need_input` at 0, so only a
+/// `METransformNeedInput` posted after `START_OF_STREAM` can authorize `ProcessInput`.
+fn revive(mut parts: NativeParts) -> std::result::Result<VideoEncoder, NativeParts> {
+    if !begin_stream(&mut parts) {
+        log::warn!("could not restart parked encoder {}", parts.name);
+        return Err(parts);
+    }
+    Ok(parts.into_encoder())
+}
+
+fn park_hardware(mut parts: NativeParts) -> std::result::Result<(), NativeParts> {
+    if FORCE_RETIRE.load(Ordering::Relaxed) || parts.broken || !parts.hardware {
+        return Err(parts);
+    }
+    if !end_stream(&mut parts) {
+        log::warn!("not reusing {}; the drain did not finish", parts.name);
         return Err(parts);
     }
     let mut pool = pool_lock();
@@ -763,51 +943,80 @@ struct Buried {
     parts: NativeParts,
 }
 
-fn bury(parts: NativeParts) {
+/// Starts the process-lifetime graveyard thread. Safe to call more than once.
+/// A failed spawn is remembered: later retires leak the MFT instead of releasing it here.
+pub fn start_graveyard() {
+    static START: Once = Once::new();
+    START.call_once(|| {
+        let (tx, rx) = mpsc::channel();
+        match std::thread::Builder::new().name("encoder-graveyard".into()).spawn(move || graveyard_loop(rx)) {
+            Ok(_) => {
+                *graveyard_slot() = Some(tx);
+                log::info!("encoder graveyard thread started");
+            }
+            Err(err) => {
+                log::error!(
+                    "encoder graveyard thread failed to start: {err}. Hardware encoders will be leaked instead of released"
+                );
+            }
+        }
+    });
+}
+
+fn graveyard_slot() -> std::sync::MutexGuard<'static, Option<Sender<Buried>>> {
+    static SLOT: std::sync::Mutex<Option<Sender<Buried>>> = std::sync::Mutex::new(None);
+    SLOT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Moves parked hardware encoders to the graveyard. Called on a normal quit because a
+/// `static` pool is not destroyed at process exit. Does not wait for [`crate::safety::GRAVEYARD_DELAY`].
+pub fn shutdown_pooled_encoders() {
+    start_graveyard();
+    let sessions = {
+        let mut pool = pool_lock();
+        std::mem::take(&mut pool.sessions)
+    };
+    if sessions.is_empty() {
+        return;
+    }
+    log::info!(
+        "retiring {} parked hardware encoder(s); if the process exits before the graveyard delay, the OS reclaims them",
+        sessions.len()
+    );
+    for parts in sessions {
+        bury(parts);
+    }
+}
+
+fn bury(mut parts: NativeParts) {
     // Ask the MFT to stop, but do not release it. NVIDIA may still have an RTWorkQ item queued.
+    // We pull with GetEvent, never BeginGetEvent, so there is no app callback to cancel.
     unsafe {
         let _ = parts.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
         let _ = parts.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
         let _ = parts.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
     }
-    if let Some(events) = &parts.events {
-        // Synchronous GetEvent only. There is no BeginGetEvent callback of ours to cancel.
-        // DrainComplete here still does not mean NVIDIA's RTWorkQ items have finished.
-        for _ in 0..8 {
-            match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
-                Ok(event) => {
-                    let kind = unsafe { event.GetType() }.unwrap_or(0);
-                    let signal = if kind == METransformDrainComplete.0 as u32 {
-                        crate::safety::worker_signal(crate::safety::DrainKind::DrainComplete)
-                    } else if kind == MEError.0 as u32 {
-                        crate::safety::worker_signal(crate::safety::DrainKind::Error)
-                    } else {
-                        crate::safety::worker_signal(crate::safety::DrainKind::Output)
-                    };
-                    if signal == crate::safety::WorkerSignal::StillWorking {
-                        continue;
-                    }
-                }
-                Err(_) => {
-                    let _ = crate::safety::worker_signal(crate::safety::DrainKind::Quiet);
-                    break;
-                }
+    discard_queued_events(&mut parts);
+    HW_RETIRED.fetch_add(1, Ordering::Relaxed);
+    log::info!("delaying release of hardware encoder {} by {}s", parts.name, crate::safety::GRAVEYARD_DELAY.as_secs());
+    start_graveyard();
+    let sender = graveyard_slot().clone();
+    let buried = Buried { not_before: Instant::now() + crate::safety::GRAVEYARD_DELAY, parts };
+    match sender {
+        Some(tx) => {
+            if let Err(err) = tx.send(buried) {
+                log::error!(
+                    "graveyard thread is gone; leaking {} so this thread does not Release it",
+                    err.0.parts.name
+                );
+                std::mem::forget(err.0);
             }
         }
+        None => {
+            log::error!("no graveyard thread; leaking the hardware encoder instead of releasing it on this thread");
+            std::mem::forget(buried);
+        }
     }
-    log::info!("delaying release of hardware encoder {} by {}s", parts.name, crate::safety::GRAVEYARD_DELAY.as_secs());
-    let _ = graveyard_sender().send(Buried { not_before: Instant::now() + crate::safety::GRAVEYARD_DELAY, parts });
-}
-
-fn graveyard_sender() -> Sender<Buried> {
-    static SENDER: OnceLock<Sender<Buried>> = OnceLock::new();
-    SENDER
-        .get_or_init(|| {
-            let (tx, rx) = mpsc::channel();
-            let _ = std::thread::Builder::new().name("encoder-graveyard".into()).spawn(move || graveyard_loop(rx));
-            tx
-        })
-        .clone()
 }
 
 fn graveyard_loop(rx: mpsc::Receiver<Buried>) {
@@ -822,7 +1031,14 @@ fn graveyard_loop(rx: mpsc::Receiver<Buried>) {
         match rx.recv_timeout(wait.max(Duration::from_millis(50))) {
             Ok(item) => pending.push(item),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // The sender is gone. Dropping these parts would Release them on this thread
+                // without the delay. Leak them; the process is already going away.
+                for item in pending.drain(..) {
+                    std::mem::forget(item);
+                }
+                return;
+            }
         }
         let now = Instant::now();
         let mut i = 0;
@@ -860,6 +1076,7 @@ fn release_buried(parts: NativeParts) {
     }
     drop(parts.manager);
     drop(parts.device);
+    HW_SHUTDOWN.fetch_add(1, Ordering::Relaxed);
 }
 
 fn release_software(parts: NativeParts) {
@@ -965,6 +1182,7 @@ mod media_foundation {
     use crate::win::ComGuard;
     use qr_mp4::{annexb_to_sample, ParamSets, VideoCodec};
     use std::sync::Arc;
+    use std::time::Duration;
     use windows::Win32::Graphics::Direct3D11::{ID3D11Texture2D, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT};
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 
@@ -1081,12 +1299,36 @@ mod media_foundation {
         }
     }
 
+    /// Lets ignored tests create hardware encoders back to back, and puts the production
+    /// gap and retire flag back even if the test panics.
+    struct HardwarePolicy;
+    impl HardwarePolicy {
+        fn open() -> Self {
+            super::set_hardware_create_gap_for_tests(Duration::ZERO);
+            Self
+        }
+    }
+    impl Drop for HardwarePolicy {
+        fn drop(&mut self) {
+            super::set_hardware_create_gap_for_tests(crate::safety::HARDWARE_CREATE_GAP);
+            super::set_force_retire_hardware_for_tests(false);
+        }
+    }
+
     #[test]
     #[ignore = "needs Media Foundation and a D3D11 device; not run in CI"]
     fn media_foundation_encoder_restarts() {
         let _com = ComGuard::mta();
+        let _policy = HardwarePolicy::open();
         let gpu = gpu();
         let mut hardware = encode_mp4(&gpu, 640, 360, true).is_some();
+        if hardware {
+            let before = super::encoder_counters();
+            encode_mp4(&gpu, 640, 360, true).expect("reused hardware encoder");
+            let after = super::encoder_counters();
+            assert!(after.reused > before.reused, "second session did not reuse the hardware encoder: {after:?}");
+            assert_eq!(after.created, before.created, "second session created a new hardware MFT: {after:?}");
+        }
         for i in 0u32..4 {
             let (width, height) = if i.is_multiple_of(2) { (320, 240) } else { (640, 360) };
             if i.is_multiple_of(2) {
@@ -1101,36 +1343,86 @@ mod media_foundation {
     }
 
     #[test]
+    #[ignore = "needs a hardware H.264 MFT; waits out the graveyard delay"]
+    fn media_foundation_graveyard_releases_hardware_encoder() {
+        let _com = ComGuard::mta();
+        let _policy = HardwarePolicy::open();
+        super::start_graveyard();
+        super::set_force_retire_hardware_for_tests(true);
+        let gpu = gpu();
+        let before = super::encoder_counters();
+        if encode_mp4(&gpu, 640, 360, true).is_none() {
+            eprintln!("skipping: no hardware H.264 encoder on this PC");
+            return;
+        }
+        let retired = super::encoder_counters();
+        assert!(retired.retired > before.retired, "forced retirement did not bury the encoder: {retired:?}");
+        let wait = crate::safety::GRAVEYARD_DELAY + Duration::from_secs(4);
+        assert!(
+            super::wait_for_graveyard_shutdown(wait),
+            "graveyard did not finish releasing the encoder: {:?}",
+            super::encoder_counters()
+        );
+    }
+
+    #[test]
     #[ignore = "timed soak; set QUICKREPLAY_SOAK_SECS and run scripts/soak.ps1"]
     fn soak_media_foundation_encoder() {
         let _com = ComGuard::mta();
+        let _policy = HardwarePolicy::open();
         let seconds: u64 = std::env::var("QUICKREPLAY_SOAK_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
         let gpu = gpu();
         let hardware = encode_mp4(&gpu, 640, 360, true).is_some();
         eprintln!("soak encoders: software{}", if hardware { " + hardware" } else { " only (no hardware MFT)" });
+        // Five formats is more than the park pool, and every 12th session retires whatever
+        // is parked, so the graveyard path runs. Hardware is the common case.
+        let formats = [(640u32, 360u32), (1280, 720), (960, 540), (320, 240), (800, 600)];
         let started = std::time::Instant::now();
         let mut i = 0u64;
+        let mut hardware_sessions = 0u64;
+        let mut software_sessions = 0u64;
         while started.elapsed().as_secs() < seconds {
-            let (width, height) = match i % 4 {
-                0 => (640, 360),
-                1 => (1280, 720),
-                2 => (960, 540),
-                _ => (320, 240),
-            };
+            let (width, height) = formats[(i % formats.len() as u64) as usize];
             if i.is_multiple_of(6) {
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
-            let allow_hardware = hardware && i % 2 == 1;
-            if allow_hardware {
-                encode_mp4(&gpu, width, height, true);
+            if i.is_multiple_of(12) && i > 0 {
+                super::shutdown_pooled_encoders();
+            }
+            let allow_hardware = hardware && !i.is_multiple_of(5);
+            if allow_hardware && encode_mp4(&gpu, width, height, true).is_some() {
+                hardware_sessions += 1;
             } else {
                 encode_mp4(&gpu, width, height, false).expect("software encoder");
+                software_sessions += 1;
             }
             i += 1;
             if i.is_multiple_of(10) {
-                eprintln!("soak: {i} encoder sessions in {:.1}s", started.elapsed().as_secs_f64());
+                let counters = super::encoder_counters();
+                eprintln!(
+                    "soak: {i} sessions in {:.1}s (hardware {hardware_sessions}, software {software_sessions}; mf created {}, reused {}, retired {}, shut down {})",
+                    started.elapsed().as_secs_f64(),
+                    counters.created,
+                    counters.reused,
+                    counters.retired,
+                    counters.shut_down
+                );
             }
         }
+        super::shutdown_pooled_encoders();
+        let counters = super::encoder_counters();
+        eprintln!(
+            "soak done: {i} sessions in {:.1}s (hardware {hardware_sessions}, software {software_sessions}; mf created {}, reused {}, retired {}, shut down {})",
+            started.elapsed().as_secs_f64(),
+            counters.created,
+            counters.reused,
+            counters.retired,
+            counters.shut_down
+        );
         assert!(i > 0, "soak produced no encoder sessions");
+        if hardware {
+            assert!(hardware_sessions > software_sessions, "soak did not keep hardware as the common path");
+            assert!(counters.retired > 0, "soak never retired a hardware encoder");
+        }
     }
 }

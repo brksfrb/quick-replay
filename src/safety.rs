@@ -106,8 +106,6 @@ pub fn release_after_write<T, E>(clip: T, write: impl FnOnce(&T) -> Result<(), E
     }
 }
 
-/// Append `item`. When the queue is already at `limit`, try to spill the oldest to disk first.
-/// A failed spill keeps that oldest segment and still appends `item`. Nothing is overwritten.
 /// A brand-new hardware MFT, not a reused one. Bursts of wake/monitor restarts must not
 /// construct dozens of NVIDIA sessions.
 pub fn hardware_create_allowed(last: Option<std::time::Instant>, now: std::time::Instant, gap: Duration) -> bool {
@@ -127,6 +125,8 @@ pub fn keep_blocked_checkpoint(blocked: bool) -> bool {
     blocked
 }
 
+/// Append `item`. When the queue is already at `limit`, try to spill the oldest to disk first.
+/// A failed spill keeps that oldest segment and still appends `item`. Nothing is overwritten.
 pub fn enqueue_unsaved<T, E>(
     queue: &mut VecDeque<T>,
     item: T,
