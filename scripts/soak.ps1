@@ -3,9 +3,10 @@
 # Each iteration builds an H.264 encoder, submits frames, checks that an MP4
 # parses, shuts the encoder down, then starts another. Resolution changes and a
 # short sleep stand in for a monitor mode switch and a display sleep/wake.
-# The creation throttle is held open so most sessions stay on hardware.
-# Every 12th session retires parked encoders (graveyard). The log line counts
-# hardware MFTs created, reused, retired, and shut down.
+# Most sessions reuse a parked hardware encoder. A new hardware MFT is created
+# at most about once every 2 seconds. Encoders still in the graveyard count
+# against the NVENC session budget, so a full budget waits instead of falling
+# back to software. The log line counts created, reused, retired, and shut down.
 #
 # Usage (from the repo root):
 #   powershell -ExecutionPolicy Bypass -File scripts/soak.ps1 -Minutes 15

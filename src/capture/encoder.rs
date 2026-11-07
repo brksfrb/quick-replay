@@ -118,16 +118,21 @@ fn subtype(codec: Codec) -> GUID {
     }
 }
 
+fn hresult_text(err: &windows::core::Error) -> String {
+    let raw = err.code().0 as u32;
+    format!("{err} (HRESULT 0x{raw:08X})")
+}
+
 fn hardware_encoders(gpu: &Gpu, codec: Codec) -> Vec<IMFActivate> {
     let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_NV12 };
     let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: subtype(codec) };
     let mut attributes = None;
-    unsafe {
-        if MFCreateAttributes(&mut attributes, 1).is_err() {
-            return Vec::new();
-        }
+    if let Err(err) = unsafe { MFCreateAttributes(&mut attributes, 1) } {
+        log::warn!("MFCreateAttributes failed: {}", hresult_text(&err));
+        return Vec::new();
     }
     let Some(attributes) = attributes else {
+        log::warn!("MFCreateAttributes returned no attribute store");
         return Vec::new();
     };
     let luid = gpu.luid;
@@ -146,8 +151,12 @@ fn hardware_encoders(gpu: &Gpu, codec: Codec) -> Vec<IMFActivate> {
             &mut count,
         )
     };
-    if result.is_err() {
+    if let Err(err) = result {
+        log::warn!("MFTEnum2 for a hardware {codec:?} encoder failed: {}", hresult_text(&err));
         return Vec::new();
+    }
+    if count == 0 {
+        log::warn!("MFTEnum2 returned no hardware {codec:?} encoder (HRESULT 0x00000000)");
     }
     mf::collect_activates(array, count)
 }
@@ -198,26 +207,44 @@ impl VideoEncoder {
                 log::info!("reusing hardware encoder {} ({}x{})", encoder.name, encoder.width, encoder.height);
                 return Ok(encoder);
             }
-            if !hardware_create_allowed_now() {
-                log::warn!("not creating another hardware encoder yet; using software until the gap passes");
-            } else {
-                for activate in hardware_encoders(gpu, settings.codec) {
-                    let name = activate.cast::<IMFAttributes>().map(|a| mf::friendly_name(&a)).unwrap_or_default();
-                    match Self::from_activate(gpu, &activate, settings, name.clone()) {
-                        Ok(encoder) => {
-                            HW_CREATED.fetch_add(1, Ordering::Relaxed);
-                            return Ok(encoder);
-                        }
-                        Err(err) => {
-                            log::warn!("hardware encoder '{name}' failed: {err}");
-                            // ActivateObject failed or configure released the transform already.
-                            // ShutdownObject drops the activation object's own reference.
-                            let _ = unsafe { activate.ShutdownObject() };
+            if !acquire_hardware_slot() {
+                return Err(
+                    "hardware encoder session budget is full; not falling back to software because of our own churn"
+                        .into(),
+                );
+            }
+            wait_for_hardware_create_gap();
+            let mut activated = false;
+            for activate in hardware_encoders(gpu, settings.codec) {
+                let name = activate.cast::<IMFAttributes>().map(|a| mf::friendly_name(&a)).unwrap_or_default();
+                match Self::from_activate(gpu, &activate, settings, name.clone()) {
+                    Ok(encoder) => {
+                        HW_LIVE.fetch_add(1, Ordering::Relaxed);
+                        HW_CREATED.fetch_add(1, Ordering::Relaxed);
+                        return Ok(encoder);
+                    }
+                    Err(err) => {
+                        activated = true;
+                        log::warn!("hardware encoder '{name}' failed: {}", hresult_text(&err));
+                        // ActivateObject failed or configure released the transform already.
+                        // ShutdownObject drops the activation object's own reference.
+                        if let Err(shutdown_err) = unsafe { activate.ShutdownObject() } {
+                            log::warn!(
+                                "ShutdownObject after '{name}' failed to activate: {}",
+                                hresult_text(&shutdown_err)
+                            );
                         }
                     }
                 }
             }
-            log::warn!("no usable hardware encoder for {:?}, using the software H.264 encoder", settings.codec);
+            if activated {
+                log::warn!(
+                    "no usable hardware encoder for {:?}; using software after an activation failure",
+                    settings.codec
+                );
+            } else {
+                log::warn!("no hardware encoder for {:?} was enumerated; using software", settings.codec);
+            }
         } else {
             log::warn!("using the software H.264 encoder after repeated hardware-encoder failures");
         }
@@ -681,6 +708,7 @@ static POOL: std::sync::Mutex<Pool> = std::sync::Mutex::new(Pool { sessions: Vec
 static LAST_HARDWARE_CREATE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
 static CREATE_GAP: std::sync::Mutex<Duration> = std::sync::Mutex::new(crate::safety::HARDWARE_CREATE_GAP);
 static FORCE_RETIRE: AtomicBool = AtomicBool::new(false);
+static HW_LIVE: AtomicU64 = AtomicU64::new(0);
 static HW_CREATED: AtomicU64 = AtomicU64::new(0);
 static HW_REUSED: AtomicU64 = AtomicU64::new(0);
 static HW_RETIRED: AtomicU64 = AtomicU64::new(0);
@@ -705,8 +733,8 @@ pub fn encoder_counters() -> EncoderCounters {
     }
 }
 
-/// Test hook. Production keeps [`crate::safety::HARDWARE_CREATE_GAP`]. The soak sets this
-/// to zero so a tight loop still constructs hardware encoders instead of falling back.
+/// Test hook. Production keeps [`crate::safety::HARDWARE_CREATE_GAP`]. The soak uses a
+/// 2s gap so hardware creation stays near a real restart rate. Reuse does not wait.
 #[cfg(test)]
 pub fn set_hardware_create_gap_for_tests(gap: Duration) {
     *CREATE_GAP.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = gap;
@@ -762,15 +790,84 @@ fn pool_lock() -> std::sync::MutexGuard<'static, Pool> {
     POOL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn hardware_create_allowed_now() -> bool {
-    let gap = *CREATE_GAP.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut last = LAST_HARDWARE_CREATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let now = Instant::now();
-    if !crate::safety::hardware_create_allowed(*last, now, gap) {
-        return false;
+fn graveyard_pending() -> u64 {
+    HW_RETIRED.load(Ordering::Relaxed).saturating_sub(HW_SHUTDOWN.load(Ordering::Relaxed))
+}
+
+fn hardware_sessions_held() -> u64 {
+    HW_LIVE.load(Ordering::Relaxed).saturating_add(graveyard_pending())
+}
+
+fn release_live_slot() {
+    let mut live = HW_LIVE.load(Ordering::Relaxed);
+    while live > 0 {
+        match HW_LIVE.compare_exchange_weak(live, live - 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(current) => live = current,
+        }
     }
-    *last = Some(now);
-    true
+}
+
+/// Blocks until a new hardware MFT would fit under the session cap, retiring one parked
+/// encoder into the graveyard if every slot is a session we are still holding.
+fn acquire_hardware_slot() -> bool {
+    let budget = crate::safety::HARDWARE_SESSION_BUDGET;
+    let timeout = crate::safety::GRAVEYARD_DELAY + Duration::from_secs(2);
+    let started = Instant::now();
+    loop {
+        if crate::safety::hardware_slot_free(HW_LIVE.load(Ordering::Relaxed), graveyard_pending(), budget) {
+            return true;
+        }
+        if graveyard_pending() == 0 {
+            let oldest = {
+                let mut pool = pool_lock();
+                if pool.sessions.is_empty() {
+                    None
+                } else {
+                    Some(pool.sessions.remove(0))
+                }
+            };
+            match oldest {
+                Some(old) => {
+                    log::info!(
+                        "hardware session budget is {budget}; retiring parked {} and waiting for it to release",
+                        old.name
+                    );
+                    bury(old);
+                }
+                None => {
+                    log::warn!("hardware session budget is {budget} with no parked encoder to retire");
+                    return false;
+                }
+            }
+        }
+        if started.elapsed() >= timeout {
+            log::warn!(
+                "timed out waiting for a hardware encoder slot ({} held, budget {budget}, {} still in the graveyard)",
+                hardware_sessions_held(),
+                graveyard_pending()
+            );
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Spaces *new* hardware MFTs. Reuse does not call this. A gap is a wait, not a software fallback.
+fn wait_for_hardware_create_gap() {
+    loop {
+        let gap = *CREATE_GAP.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut last = LAST_HARDWARE_CREATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        if crate::safety::hardware_create_allowed(*last, now, gap) {
+            *last = Some(now);
+            return;
+        }
+        let previous = last.expect("a refused create has a previous timestamp");
+        drop(last);
+        let remain = gap.saturating_sub(now.saturating_duration_since(previous));
+        std::thread::sleep(remain.min(Duration::from_millis(200)).max(Duration::from_millis(10)));
+    }
 }
 
 fn reclaim_hardware(gpu: &Gpu, settings: &Settings) -> Option<VideoEncoder> {
@@ -1010,6 +1107,8 @@ pub fn shutdown_pooled_encoders() {
 }
 
 fn bury(mut parts: NativeParts) {
+    // The MFT leaves the live set and stays in the graveyard count until it is released.
+    release_live_slot();
     // Ask the MFT to stop, but do not release it. NVIDIA may still have an RTWorkQ item queued.
     // We pull with GetEvent, never BeginGetEvent, so there is no app callback to cancel.
     unsafe {
@@ -1320,12 +1419,20 @@ mod media_foundation {
         }
     }
 
-    /// Lets ignored tests create hardware encoders back to back, and puts the production
-    /// gap and retire flag back even if the test panics.
+    /// Lets ignored tests choose a create gap, and puts the production gap and retire flag
+    /// back even if the test panics.
     struct HardwarePolicy;
     impl HardwarePolicy {
         fn open() -> Self {
-            super::set_hardware_create_gap_for_tests(Duration::ZERO);
+            Self::with_gap(Duration::ZERO)
+        }
+
+        fn paced() -> Self {
+            Self::with_gap(Duration::from_secs(2))
+        }
+
+        fn with_gap(gap: Duration) -> Self {
+            super::set_hardware_create_gap_for_tests(gap);
             Self
         }
     }
@@ -1390,25 +1497,26 @@ mod media_foundation {
     #[ignore = "timed soak; set QUICKREPLAY_SOAK_SECS and run scripts/soak.ps1"]
     fn soak_media_foundation_encoder() {
         let _com = ComGuard::mta();
-        let _policy = HardwarePolicy::open();
+        // One new hardware MFT at most every 2s. Most iterations reuse a parked session.
+        let _policy = HardwarePolicy::paced();
         let seconds: u64 = std::env::var("QUICKREPLAY_SOAK_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
         let gpu = gpu();
-        let hardware = encode_mp4(&gpu, 640, 360, true).is_some();
+        let hardware = encode_mp4(&gpu, 1280, 720, true).is_some();
         eprintln!("soak encoders: software{}", if hardware { " + hardware" } else { " only (no hardware MFT)" });
-        // Five formats is more than the park pool, and every 12th session retires whatever
-        // is parked, so the graveyard path runs. Hardware is the common case.
+        // The steady size is reused. Every 8th session switches format. A fifth distinct
+        // size is past the session budget, so that one retires a parked encoder and waits
+        // for the graveyard instead of creating an extra NVENC session.
+        let steady = (1280u32, 720u32);
         let formats = [(640u32, 360u32), (1280, 720), (960, 540), (320, 240), (800, 600)];
         let started = std::time::Instant::now();
         let mut i = 0u64;
         let mut hardware_sessions = 0u64;
         let mut software_sessions = 0u64;
         while started.elapsed().as_secs() < seconds {
-            let (width, height) = formats[(i % formats.len() as u64) as usize];
+            let (width, height) =
+                if i.is_multiple_of(8) { formats[((i / 8) % formats.len() as u64) as usize] } else { steady };
             if i.is_multiple_of(6) {
                 std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-            if i.is_multiple_of(12) && i > 0 {
-                super::shutdown_pooled_encoders();
             }
             let allow_hardware = hardware && !i.is_multiple_of(5);
             if allow_hardware && encode_mp4(&gpu, width, height, true).is_some() {

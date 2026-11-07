@@ -14,6 +14,10 @@ pub const JOIN_LIMIT: Duration = Duration::from_secs(3);
 pub const GRAVEYARD_DELAY: Duration = Duration::from_secs(8);
 /// Minimum gap between *new* hardware encoder objects. Reusing one does not count.
 pub const HARDWARE_CREATE_GAP: Duration = Duration::from_secs(3);
+/// Parked, in-use, and not-yet-released graveyard encoders all hold an NVENC session.
+/// Consumer GeForce drivers reject new sessions past a small cap (8 on current drivers).
+/// Staying at 4 leaves room for the one being started while others are still draining.
+pub const HARDWARE_SESSION_BUDGET: u64 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WakeSchedule {
@@ -113,6 +117,11 @@ pub fn hardware_create_allowed(last: Option<std::time::Instant>, now: std::time:
         Some(previous) => now.saturating_duration_since(previous) >= gap,
         None => true,
     }
+}
+
+/// A new hardware MFT is allowed only while parked, in-use, and graveyard sessions are under the cap.
+pub fn hardware_slot_free(live: u64, graveyard_pending: u64, budget: u64) -> bool {
+    live.saturating_add(graveyard_pending) < budget
 }
 
 /// Same device and same output format: flush and reconfigure, do not destroy the MFT.
@@ -323,6 +332,10 @@ mod tests {
         assert!(!hardware_create_allowed(Some(t0), t0, HARDWARE_CREATE_GAP));
         assert!(hardware_create_allowed(Some(t0), t0 + HARDWARE_CREATE_GAP, HARDWARE_CREATE_GAP));
         assert!(GRAVEYARD_DELAY >= Duration::from_secs(5) && GRAVEYARD_DELAY <= Duration::from_secs(10));
+        assert!(hardware_slot_free(3, 0, HARDWARE_SESSION_BUDGET));
+        assert!(!hardware_slot_free(3, 1, HARDWARE_SESSION_BUDGET), "a graveyard encoder still holds a session");
+        assert!(!hardware_slot_free(0, HARDWARE_SESSION_BUDGET, HARDWARE_SESSION_BUDGET));
+        assert_eq!(HARDWARE_SESSION_BUDGET, 4);
     }
 
     #[test]
