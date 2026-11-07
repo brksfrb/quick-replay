@@ -11,11 +11,13 @@ use super::mf;
 use crate::config::Codec;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use windows::core::{Interface, Result, GUID};
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_STAGING,
+    ID3D11Device, ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::MediaFoundation::*;
@@ -50,7 +52,16 @@ pub struct VideoEncoder {
     /// The encoder was given the DXGI device manager and must be told to drop it.
     uses_d3d: bool,
     hardware: bool,
-    /// `shutdown` has already released the native objects. Drop is then a no-op.
+    /// A fatal encoder error: do not put this session back in the reuse pool.
+    broken: bool,
+    fps: u32,
+    bitrate_kbps: u32,
+    fast_preset: bool,
+    /// Held so a parked or buried MFT outlives the pipeline's `Gpu` clone.
+    device: Option<ID3D11Device>,
+    manager: Option<IMFDXGIDeviceManager>,
+    device_ptr: usize,
+    /// `shutdown` has already handed the native objects off. Drop is then a no-op.
     released: bool,
     pub codec: Codec,
     pub name: String,
@@ -181,15 +192,23 @@ fn video_type(sub: &GUID, s: &Settings) -> Result<IMFMediaType> {
 impl VideoEncoder {
     pub fn new(gpu: &Gpu, settings: &Settings) -> std::result::Result<VideoEncoder, String> {
         if settings.allow_hardware {
-            for activate in hardware_encoders(gpu, settings.codec) {
-                let name = activate.cast::<IMFAttributes>().map(|a| mf::friendly_name(&a)).unwrap_or_default();
-                match Self::from_activate(gpu, &activate, settings, name.clone()) {
-                    Ok(encoder) => return Ok(encoder),
-                    Err(err) => {
-                        log::warn!("hardware encoder '{name}' failed: {err}");
-                        // ActivateObject failed or configure released the transform already.
-                        // ShutdownObject drops the activation object's own reference.
-                        let _ = unsafe { activate.ShutdownObject() };
+            if let Some(encoder) = reclaim_hardware(gpu, settings) {
+                log::info!("reusing hardware encoder {} ({}x{})", encoder.name, encoder.width, encoder.height);
+                return Ok(encoder);
+            }
+            if !hardware_create_allowed_now() {
+                log::warn!("not creating another hardware encoder yet; using software until the gap passes");
+            } else {
+                for activate in hardware_encoders(gpu, settings.codec) {
+                    let name = activate.cast::<IMFAttributes>().map(|a| mf::friendly_name(&a)).unwrap_or_default();
+                    match Self::from_activate(gpu, &activate, settings, name.clone()) {
+                        Ok(encoder) => return Ok(encoder),
+                        Err(err) => {
+                            log::warn!("hardware encoder '{name}' failed: {err}");
+                            // ActivateObject failed or configure released the transform already.
+                            // ShutdownObject drops the activation object's own reference.
+                            let _ = unsafe { activate.ShutdownObject() };
+                        }
                     }
                 }
             }
@@ -203,6 +222,11 @@ impl VideoEncoder {
 
     pub fn is_hardware(&self) -> bool {
         self.hardware
+    }
+
+    /// The next drop must not return this session to the reuse pool.
+    pub fn mark_broken(&mut self) {
+        self.broken = true;
     }
 
     fn from_activate(gpu: &Gpu, activate: &IMFActivate, s: &Settings, name: String) -> Result<VideoEncoder> {
@@ -309,6 +333,13 @@ impl VideoEncoder {
             output: Vec::new(),
             uses_d3d: d3d_aware,
             hardware,
+            broken: false,
+            fps: s.fps,
+            bitrate_kbps: s.bitrate_kbps,
+            fast_preset: s.fast_preset,
+            device: d3d_aware.then(|| gpu.device.clone()),
+            manager: d3d_aware.then(|| gpu.manager.clone()),
+            device_ptr: gpu.device.as_raw() as usize,
             released: false,
             codec: s.codec,
             name,
@@ -400,6 +431,7 @@ impl VideoEncoder {
                 self.pull_output()?;
             } else if kind == MEError.0 as u32 {
                 // e.g. the GPU was reset: surface it so the pipeline restarts.
+                self.broken = true;
                 let status = unsafe { event.GetStatus()? };
                 return Err(windows::core::Error::from(status));
             }
@@ -444,146 +476,427 @@ impl VideoEncoder {
     }
 }
 
-/// How long to wait for `METransformDrainComplete` before giving up on a wedged driver.
-/// A healthy encoder posts that event as soon as the drain finishes; this bound is only the
-/// fallback described on [`VideoEncoder::shutdown`].
-const SHUTDOWN_LIMIT: Duration = Duration::from_millis(2_000);
+/// How long a synchronous drain waits for `METransformDrainComplete` when we are about to
+/// bury a session. Reused sessions are not drained here.
+const SHUTDOWN_LIMIT: Duration = Duration::from_millis(400);
 
 impl VideoEncoder {
-    /// Stops the encoder thread and only then releases COM/D3D objects.
+    /// Stops using this encoder.
     ///
-    /// Completion is a real signal from the MFT, not a guess that its queue looks idle:
+    /// A healthy hardware encoder is flushed and parked, one per format and D3D device, and
+    /// the next `new` with the same key restarts streaming on it. Destroying NVIDIA's MFT
+    /// (`nvEncMFTH264x`) while an `RTWorkQ` item is still queued faults in ntdll
+    /// (`RtlEnterCriticalSection` on NULL+0x24, offset `0x1a12d`). `METransformDrainComplete`
+    /// does **not** mean those driver work items have finished.
     ///
-    /// * Asynchronous (hardware) encoders are done when they post `METransformDrainComplete`
-    ///   after `MFT_MESSAGE_COMMAND_DRAIN`. Shutdown waits for that event.
-    /// * Synchronous encoders (the software H.264 MFT) are done when `ProcessOutput` returns
-    ///   `MF_E_TRANSFORM_NEED_MORE_INPUT` after the drain.
-    /// * A hardware driver that never posts either signal — device removed, TDR, a hung
-    ///   NVENC thread — cannot be waited on. After [`SHUTDOWN_LIMIT`] we `FLUSH` (the documented
-    ///   synchronous abort) and release anyway. Waiting forever would freeze capture. There is
-    ///   no Media Foundation API that turns `GetEvent` into a timed wait, so the deadline is
-    ///   polled; an empty queue does not count as the worker having finished.
+    /// When a session really has to go (broken, or a duplicate of one already parked):
     ///
-    /// `IMFActivate::ShutdownObject` runs only after those interfaces are released. Calling it
-    /// while the worker is still inside the event queue frees that queue's lock and faults in
-    /// ntdll (`0xc0000005`).
+    /// * This thread does not release the transform, the event generator, or the DXGI device.
+    /// * Those references move to a graveyard thread, which waits [`crate::safety::GRAVEYARD_DELAY`]
+    ///   and only then calls [`IMFShutdown::Shutdown`] — the final method on the MFT — followed
+    ///   by `IMFActivate::ShutdownObject`, and only after that drops the device manager and device.
+    /// * We pull events with `GetEvent`, never `BeginGetEvent`, so this process has no outstanding
+    ///   event callback of its own. The delay is for NVIDIA's callbacks, which we cannot observe.
+    ///
+    /// The synchronous software encoder has no `RTWorkQ` thread. It is drained until
+    /// `MF_E_TRANSFORM_NEED_MORE_INPUT` and released on this thread.
     pub fn shutdown(&mut self) {
         if self.released {
             return;
         }
         self.released = true;
-        if let Some(transform) = self.transform.clone() {
-            unsafe {
-                let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-                let _ = transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
-            }
-            let signal = self.wait_for_worker();
-            if signal != crate::safety::WorkerSignal::Finished {
-                log::warn!("encoder drain ended with {signal:?}; flushing before release");
-                unsafe {
-                    let _ = transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-                }
-            }
-            if self.uses_d3d {
-                unsafe {
-                    let _ = transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
-                }
-            }
-            unsafe {
-                let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
-            }
-            drop(transform);
-        }
-        // Drop our interfaces first so the worker can't be running inside them, then shut down.
-        self.events = None;
-        self.codec_api = None;
-        self.input = Input::Gpu;
-        self.transform = None;
-        self.output.clear();
-        if let Some(activate) = self.activate.take() {
-            unsafe {
-                let _ = activate.ShutdownObject();
+        let Some(mut parts) = self.detach() else {
+            return;
+        };
+        if parts.hardware && !parts.broken {
+            match park_hardware(parts) {
+                Ok(()) => return,
+                Err(returned) => parts = returned,
             }
         }
-    }
-
-    fn wait_for_worker(&mut self) -> crate::safety::WorkerSignal {
-        if self.events.is_some() {
-            self.wait_for_drain_complete()
+        if parts.hardware {
+            bury(parts);
         } else {
-            self.drain_synchronous()
+            release_software(parts);
         }
     }
 
-    /// Blocks until `METransformDrainComplete` or `MEError`, or until [`SHUTDOWN_LIMIT`].
-    fn wait_for_drain_complete(&mut self) -> crate::safety::WorkerSignal {
-        let deadline = Instant::now() + SHUTDOWN_LIMIT;
-        loop {
-            if Instant::now() >= deadline {
-                log::warn!(
-                    "encoder did not post METransformDrainComplete within {}ms. A wedged hardware \
-                     MFT (device lost, driver hang) never sends that event; there is no timed \
-                     GetEvent, so this deadline is the only way out",
-                    SHUTDOWN_LIMIT.as_millis()
-                );
-                return crate::safety::WorkerSignal::TimedOut;
-            }
-            let event = {
-                let Some(events) = self.events.as_ref() else {
-                    return crate::safety::WorkerSignal::Failed;
-                };
-                match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
-                    Ok(event) => event,
-                    Err(err) if err.code() == MF_E_NO_EVENTS_AVAILABLE => {
-                        // An empty queue is not the worker finishing. Only DrainComplete is.
-                        if crate::safety::worker_signal(crate::safety::DrainKind::Quiet)
-                            != crate::safety::WorkerSignal::StillWorking
-                        {
-                            return crate::safety::WorkerSignal::Finished;
-                        }
-                        let pause = Duration::from_millis(10);
-                        std::thread::sleep(pause.min(deadline.saturating_duration_since(Instant::now())));
-                        continue;
-                    }
-                    Err(err) => {
-                        log::warn!("encoder event queue failed during shutdown: {err}");
-                        return crate::safety::worker_signal(crate::safety::DrainKind::Error);
-                    }
-                }
-            };
-            let kind = unsafe { event.GetType() }.unwrap_or(0);
-            let signal = if kind == METransformDrainComplete.0 as u32 {
-                crate::safety::worker_signal(crate::safety::DrainKind::DrainComplete)
-            } else if kind == METransformHaveOutput.0 as u32 {
-                let _ = self.pull_output();
-                crate::safety::worker_signal(crate::safety::DrainKind::Output)
-            } else if kind == MEError.0 as u32 {
-                crate::safety::worker_signal(crate::safety::DrainKind::Error)
-            } else {
-                crate::safety::worker_signal(crate::safety::DrainKind::Other)
-            };
-            if signal != crate::safety::WorkerSignal::StillWorking {
-                return signal;
-            }
-        }
-    }
-
-    /// Synchronous MFTs signal the end of a drain with `MF_E_TRANSFORM_NEED_MORE_INPUT`.
-    fn drain_synchronous(&mut self) -> crate::safety::WorkerSignal {
-        for _ in 0..256 {
-            match self.pull_output() {
-                Ok(true) => continue,
-                Ok(false) => return crate::safety::worker_signal(crate::safety::DrainKind::NeedMoreInput),
-                Err(_) => return crate::safety::worker_signal(crate::safety::DrainKind::Error),
-            }
-        }
-        crate::safety::WorkerSignal::TimedOut
+    fn detach(&mut self) -> Option<NativeParts> {
+        let transform = self.transform.take()?;
+        // Drop the staging texture while the device is still certainly alive.
+        let _ = std::mem::replace(&mut self.input, Input::Gpu);
+        self.output.clear();
+        Some(NativeParts {
+            device: self.device.take(),
+            manager: self.manager.take(),
+            codec_api: self.codec_api.take(),
+            events: self.events.take(),
+            activate: self.activate.take(),
+            transform,
+            input_id: self.input_id,
+            output_id: self.output_id,
+            provides_samples: self.provides_samples,
+            output_size: self.output_size,
+            uses_d3d: self.uses_d3d,
+            hardware: self.hardware,
+            broken: self.broken,
+            width: self.width,
+            height: self.height,
+            fps: self.fps,
+            bitrate_kbps: self.bitrate_kbps,
+            fast_preset: self.fast_preset,
+            device_ptr: self.device_ptr,
+            codec: self.codec,
+            name: std::mem::take(&mut self.name),
+        })
     }
 }
 
 impl Drop for VideoEncoder {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SessionKey {
+    codec: Codec,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_kbps: u32,
+    fast_preset: bool,
+    device: usize,
+}
+
+/// COM objects for one encoder. `release_buried` drops the MFT before `manager` and `device`;
+/// do not rely on field order.
+///
+/// The windows crate does not mark these pointers `Send`. Each session is owned by one thread
+/// at a time (the capture thread, then only the graveyard thread) and the objects are MTA/free-threaded.
+unsafe impl Send for NativeParts {}
+
+struct NativeParts {
+    device: Option<ID3D11Device>,
+    manager: Option<IMFDXGIDeviceManager>,
+    codec_api: Option<ICodecAPI>,
+    events: Option<IMFMediaEventGenerator>,
+    activate: Option<IMFActivate>,
+    transform: IMFTransform,
+    input_id: u32,
+    output_id: u32,
+    provides_samples: bool,
+    output_size: u32,
+    uses_d3d: bool,
+    hardware: bool,
+    broken: bool,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_kbps: u32,
+    fast_preset: bool,
+    device_ptr: usize,
+    codec: Codec,
+    name: String,
+}
+
+impl NativeParts {
+    fn key(&self) -> SessionKey {
+        SessionKey {
+            codec: self.codec,
+            width: self.width,
+            height: self.height,
+            fps: self.fps,
+            bitrate_kbps: self.bitrate_kbps,
+            fast_preset: self.fast_preset,
+            device: self.device_ptr,
+        }
+    }
+
+    fn into_encoder(self) -> VideoEncoder {
+        VideoEncoder {
+            transform: Some(self.transform),
+            activate: self.activate,
+            codec_api: self.codec_api,
+            events: self.events,
+            need_input: 0,
+            provides_samples: self.provides_samples,
+            output_size: self.output_size,
+            input: Input::Gpu,
+            input_id: self.input_id,
+            output_id: self.output_id,
+            width: self.width,
+            height: self.height,
+            output: Vec::new(),
+            uses_d3d: self.uses_d3d,
+            hardware: self.hardware,
+            broken: false,
+            fps: self.fps,
+            bitrate_kbps: self.bitrate_kbps,
+            fast_preset: self.fast_preset,
+            device: self.device,
+            manager: self.manager,
+            device_ptr: self.device_ptr,
+            released: false,
+            codec: self.codec,
+            name: self.name,
+        }
+    }
+}
+
+fn session_key(gpu: &Gpu, settings: &Settings) -> SessionKey {
+    SessionKey {
+        codec: settings.codec,
+        width: settings.width,
+        height: settings.height,
+        fps: settings.fps,
+        bitrate_kbps: settings.bitrate_kbps,
+        fast_preset: settings.fast_preset,
+        device: gpu.device.as_raw() as usize,
+    }
+}
+
+const POOL_LIMIT: usize = 4;
+
+struct Pool {
+    sessions: Vec<NativeParts>,
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        let count = self.sessions.len();
+        for parts in self.sessions.drain(..) {
+            bury(parts);
+        }
+        // The process is exiting. Stay alive until the graveyard thread has released the MFTs;
+        // freeing them on this thread is the ntdll crash.
+        log::info!("waiting for {count} hardware encoder(s) to finish shutting down");
+        std::thread::sleep(crate::safety::GRAVEYARD_DELAY + Duration::from_secs(1));
+    }
+}
+
+static POOL: std::sync::Mutex<Pool> = std::sync::Mutex::new(Pool { sessions: Vec::new() });
+static LAST_HARDWARE_CREATE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+fn pool_lock() -> std::sync::MutexGuard<'static, Pool> {
+    POOL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn hardware_create_allowed_now() -> bool {
+    let mut last = LAST_HARDWARE_CREATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = Instant::now();
+    if !crate::safety::hardware_create_allowed(*last, now, crate::safety::HARDWARE_CREATE_GAP) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
+fn reclaim_hardware(gpu: &Gpu, settings: &Settings) -> Option<VideoEncoder> {
+    let wanted = session_key(gpu, settings);
+    let parked = {
+        let mut pool = pool_lock();
+        let pos = pool.sessions.iter().position(|parts| {
+            crate::safety::reuse_hardware_encoder(
+                parts.device_ptr == wanted.device,
+                parts.key() == wanted,
+                parts.broken,
+            )
+        })?;
+        pool.sessions.remove(pos)
+    };
+    match revive(parked) {
+        Ok(encoder) => Some(encoder),
+        Err(parts) => {
+            log::warn!("could not restart parked encoder {}; releasing it later", parts.name);
+            bury(parts);
+            None
+        }
+    }
+}
+
+/// Flush and start streaming again. On failure the parts are returned so the caller can bury them.
+fn revive(parts: NativeParts) -> std::result::Result<VideoEncoder, NativeParts> {
+    let transform = parts.transform.clone();
+    let restart = unsafe {
+        let _ = transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+        let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+        transform
+            .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
+            .and_then(|()| transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0))
+    };
+    match restart {
+        Ok(()) => Ok(parts.into_encoder()),
+        Err(err) => {
+            log::warn!("parked encoder refused to restart: {err}");
+            Err(parts)
+        }
+    }
+}
+
+fn park_hardware(parts: NativeParts) -> std::result::Result<(), NativeParts> {
+    if parts.broken || !parts.hardware {
+        return Err(parts);
+    }
+    let mut pool = pool_lock();
+    if pool.sessions.iter().any(|existing| existing.key() == parts.key()) {
+        return Err(parts);
+    }
+    if pool.sessions.len() >= POOL_LIMIT {
+        let old = pool.sessions.remove(0);
+        drop(pool);
+        log::info!("hardware encoder pool is full; delaying release of {}", old.name);
+        bury(old);
+        pool_lock().sessions.push(parts);
+        return Ok(());
+    }
+    log::info!("parking hardware encoder {} for reuse", parts.name);
+    pool.sessions.push(parts);
+    Ok(())
+}
+
+struct Buried {
+    not_before: Instant,
+    parts: NativeParts,
+}
+
+fn bury(parts: NativeParts) {
+    // Ask the MFT to stop, but do not release it. NVIDIA may still have an RTWorkQ item queued.
+    unsafe {
+        let _ = parts.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+        let _ = parts.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+        let _ = parts.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+    }
+    if let Some(events) = &parts.events {
+        // Synchronous GetEvent only. There is no BeginGetEvent callback of ours to cancel.
+        // DrainComplete here still does not mean NVIDIA's RTWorkQ items have finished.
+        for _ in 0..8 {
+            match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                Ok(event) => {
+                    let kind = unsafe { event.GetType() }.unwrap_or(0);
+                    let signal = if kind == METransformDrainComplete.0 as u32 {
+                        crate::safety::worker_signal(crate::safety::DrainKind::DrainComplete)
+                    } else if kind == MEError.0 as u32 {
+                        crate::safety::worker_signal(crate::safety::DrainKind::Error)
+                    } else {
+                        crate::safety::worker_signal(crate::safety::DrainKind::Output)
+                    };
+                    if signal == crate::safety::WorkerSignal::StillWorking {
+                        continue;
+                    }
+                }
+                Err(_) => {
+                    let _ = crate::safety::worker_signal(crate::safety::DrainKind::Quiet);
+                    break;
+                }
+            }
+        }
+    }
+    log::info!("delaying release of hardware encoder {} by {}s", parts.name, crate::safety::GRAVEYARD_DELAY.as_secs());
+    let _ = graveyard_sender().send(Buried { not_before: Instant::now() + crate::safety::GRAVEYARD_DELAY, parts });
+}
+
+fn graveyard_sender() -> Sender<Buried> {
+    static SENDER: OnceLock<Sender<Buried>> = OnceLock::new();
+    SENDER
+        .get_or_init(|| {
+            let (tx, rx) = mpsc::channel();
+            let _ = std::thread::Builder::new().name("encoder-graveyard".into()).spawn(move || graveyard_loop(rx));
+            tx
+        })
+        .clone()
+}
+
+fn graveyard_loop(rx: mpsc::Receiver<Buried>) {
+    let _com = crate::win::ComGuard::mta();
+    let mut pending = Vec::new();
+    loop {
+        let wait = pending
+            .iter()
+            .filter_map(|item: &Buried| item.not_before.checked_duration_since(Instant::now()))
+            .min()
+            .unwrap_or(crate::safety::GRAVEYARD_DELAY);
+        match rx.recv_timeout(wait.max(Duration::from_millis(50))) {
+            Ok(item) => pending.push(item),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+        let now = Instant::now();
+        let mut i = 0;
+        while i < pending.len() {
+            if pending[i].not_before <= now {
+                let item = pending.swap_remove(i);
+                release_buried(item.parts);
+            } else {
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Runs only on the graveyard thread, after [`crate::safety::GRAVEYARD_DELAY`].
+fn release_buried(parts: NativeParts) {
+    log::info!("releasing hardware encoder {}", parts.name);
+    // Final method on the MFT. Nothing on `transform` after this.
+    if let Ok(shutdown) = parts.transform.cast::<IMFShutdown>() {
+        if let Err(err) = unsafe { shutdown.Shutdown() } {
+            log::warn!("IMFShutdown::Shutdown on {} failed: {err}", parts.name);
+        }
+    } else {
+        log::info!("{} has no IMFShutdown", parts.name);
+    }
+    // MFT interfaces first. The device manager and device drop with `parts` after this
+    // function returns, and they are the first fields so they are released last.
+    drop(parts.codec_api);
+    drop(parts.events);
+    drop(parts.transform);
+    if let Some(activate) = parts.activate {
+        unsafe {
+            let _ = activate.ShutdownObject();
+        }
+    }
+    drop(parts.manager);
+    drop(parts.device);
+}
+
+fn release_software(parts: NativeParts) {
+    unsafe {
+        let _ = parts.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+        let _ = parts.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+    }
+    let deadline = Instant::now() + SHUTDOWN_LIMIT;
+    while Instant::now() < deadline {
+        let mut buffer = MFT_OUTPUT_DATA_BUFFER {
+            dwStreamID: parts.output_id,
+            pSample: std::mem::ManuallyDrop::new(if parts.provides_samples {
+                None
+            } else {
+                mf::empty_sample(parts.output_size).ok()
+            }),
+            dwStatus: 0,
+            pEvents: std::mem::ManuallyDrop::new(None),
+        };
+        let mut status = 0u32;
+        let result = unsafe { parts.transform.ProcessOutput(0, std::slice::from_mut(&mut buffer), &mut status) };
+        drop(std::mem::ManuallyDrop::into_inner(buffer.pSample));
+        drop(std::mem::ManuallyDrop::into_inner(buffer.pEvents));
+        match result {
+            Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
+                let _ = crate::safety::worker_signal(crate::safety::DrainKind::NeedMoreInput);
+                break;
+            }
+            Err(_) => {
+                let _ = crate::safety::worker_signal(crate::safety::DrainKind::Error);
+                break;
+            }
+            Ok(()) => continue,
+        }
+    }
+    unsafe {
+        let _ = parts.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
     }
 }
 

@@ -108,7 +108,7 @@ impl Drop for State {
 
 fn init(settings: &config::Video) -> Result<State, String> {
     let monitor = crate::win::monitors::find(&settings.monitor).ok_or("no monitor found")?;
-    let gpu = Gpu::new().map_err(|e| format!("Direct3D 11 is unavailable: {e}"))?;
+    let gpu = Gpu::session().map_err(|e| format!("Direct3D 11 is unavailable: {e}"))?;
     let fps = settings.fps.clamp(10, 240);
     let capture = ScreenCapture::new(&gpu, monitor.handle, settings.capture_cursor, fps)
         .map_err(|e| format!("screen capture failed to start: {e}"))?;
@@ -183,7 +183,9 @@ pub fn spawn(
     Ok((handle, info))
 }
 
-fn encoder_error(encoder: &VideoEncoder, message: String) -> String {
+fn encoder_error(encoder: &mut VideoEncoder, message: String) -> String {
+    // A failed session must not go back into the reuse pool.
+    encoder.mark_broken();
     if encoder.is_hardware() {
         encoder::note_hardware_failure();
     }
@@ -306,7 +308,7 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
             let force_key = pending_key || key_due;
             let accepted = match s.encoder.submit(&s.gpu, frame, target, interval, force_key) {
                 Ok(accepted) => accepted,
-                Err(err) => return Err(encoder_error(&s.encoder, format!("encoder failed: {err}"))),
+                Err(err) => return Err(encoder_error(&mut s.encoder, format!("encoder failed: {err}"))),
             };
             if accepted {
                 last_encoded = target;
@@ -316,10 +318,10 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
                 // Shut the wedged encoder down on the way out (State::drop). Returning the error
                 // restarts the pipeline; it must not free the MFT while its thread is still in it.
                 log::warn!("video encoder stopped responding; releasing it before restart");
-                return Err(encoder_error(&s.encoder, "the video encoder stopped responding".into()));
+                return Err(encoder_error(&mut s.encoder, "the video encoder stopped responding".into()));
             }
         } else if let Err(err) = s.encoder.poll() {
-            return Err(encoder_error(&s.encoder, format!("encoder failed: {err}")));
+            return Err(encoder_error(&mut s.encoder, format!("encoder failed: {err}")));
         }
 
         for frame in s.encoder.take_output() {
@@ -342,7 +344,7 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
         }
 
         if !format_known && target - started > STALL_LIMIT {
-            return Err(encoder_error(&s.encoder, "the video encoder produced no usable output".into()));
+            return Err(encoder_error(&mut s.encoder, "the video encoder produced no usable output".into()));
         }
         if !hardware_ok && format_known && s.encoder.is_hardware() && target - started >= HARDWARE_HEALTHY {
             encoder::note_hardware_recovered();

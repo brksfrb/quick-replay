@@ -8,6 +8,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const WATCHDOG_LIMIT: Duration = Duration::from_secs(8);
 /// How long a restart waits for the capture threads before leaving a stuck encoder to release itself.
 pub const JOIN_LIMIT: Duration = Duration::from_secs(3);
+/// NVIDIA's Media Foundation encoder queues work on `RTWorkQ` that can run after
+/// `METransformDrainComplete`. The MFT, its event generator, and the D3D device stay
+/// referenced at least this long, and are released only on a background thread.
+pub const GRAVEYARD_DELAY: Duration = Duration::from_secs(8);
+/// Minimum gap between *new* hardware encoder objects. Reusing one does not count.
+pub const HARDWARE_CREATE_GAP: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WakeSchedule {
@@ -72,7 +78,6 @@ pub enum DrainKind {
     Output,
     /// The event queue had nothing in it. The worker has not said it is done.
     Quiet,
-    Other,
     DrainComplete,
     NeedMoreInput,
     Error,
@@ -83,13 +88,11 @@ pub enum WorkerSignal {
     StillWorking,
     Finished,
     Failed,
-    /// No completion signal arrived. Documented fallback for a wedged driver.
-    TimedOut,
 }
 
 pub fn worker_signal(kind: DrainKind) -> WorkerSignal {
     match kind {
-        DrainKind::Output | DrainKind::Quiet | DrainKind::Other => WorkerSignal::StillWorking,
+        DrainKind::Output | DrainKind::Quiet => WorkerSignal::StillWorking,
         DrainKind::DrainComplete | DrainKind::NeedMoreInput => WorkerSignal::Finished,
         DrainKind::Error => WorkerSignal::Failed,
     }
@@ -105,6 +108,25 @@ pub fn release_after_write<T, E>(clip: T, write: impl FnOnce(&T) -> Result<(), E
 
 /// Append `item`. When the queue is already at `limit`, try to spill the oldest to disk first.
 /// A failed spill keeps that oldest segment and still appends `item`. Nothing is overwritten.
+/// A brand-new hardware MFT, not a reused one. Bursts of wake/monitor restarts must not
+/// construct dozens of NVIDIA sessions.
+pub fn hardware_create_allowed(last: Option<std::time::Instant>, now: std::time::Instant, gap: Duration) -> bool {
+    match last {
+        Some(previous) => now.saturating_duration_since(previous) >= gap,
+        None => true,
+    }
+}
+
+/// Same device and same output format: flush and reconfigure, do not destroy the MFT.
+pub fn reuse_hardware_encoder(same_device: bool, same_format: bool, broken: bool) -> bool {
+    same_device && same_format && !broken
+}
+
+/// Quit must not delete a checkpoint that never made it into the video folder.
+pub fn keep_blocked_checkpoint(blocked: bool) -> bool {
+    blocked
+}
+
 pub fn enqueue_unsaved<T, E>(
     queue: &mut VecDeque<T>,
     item: T,
@@ -288,6 +310,25 @@ mod tests {
         let (frames, _) = frames.unwrap_err();
         assert_eq!(frames, vec![1, 2, 3, 4]);
         assert!(release_after_write(frames, |_| Ok::<(), &str>(())).is_ok());
+    }
+
+    #[test]
+    fn hardware_sessions_are_reused_and_not_recreated_in_a_burst() {
+        assert!(reuse_hardware_encoder(true, true, false));
+        assert!(!reuse_hardware_encoder(true, true, true), "a broken encoder is not reused");
+        assert!(!reuse_hardware_encoder(false, true, false), "a different D3D device is not reused");
+        assert!(!reuse_hardware_encoder(true, false, false));
+        let t0 = std::time::Instant::now();
+        assert!(hardware_create_allowed(None, t0, HARDWARE_CREATE_GAP));
+        assert!(!hardware_create_allowed(Some(t0), t0, HARDWARE_CREATE_GAP));
+        assert!(hardware_create_allowed(Some(t0), t0 + HARDWARE_CREATE_GAP, HARDWARE_CREATE_GAP));
+        assert!(GRAVEYARD_DELAY >= Duration::from_secs(5) && GRAVEYARD_DELAY <= Duration::from_secs(10));
+    }
+
+    #[test]
+    fn quit_keeps_an_unpublished_checkpoint() {
+        assert!(keep_blocked_checkpoint(true));
+        assert!(!keep_blocked_checkpoint(false));
     }
 
     #[test]

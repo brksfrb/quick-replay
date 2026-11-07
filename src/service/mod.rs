@@ -845,11 +845,16 @@ impl Service {
                 pipeline.stop_recording();
             }
         }
-        // A normal quit doesn't need the crash checkpoint, and it must not come back as a "recovered" video.
+        // A normal quit doesn't need the rolling checkpoint. A file we could not publish is
+        // unrecovered evidence: leave it so the next start can park and retry it.
         self.checkpoint_cancel.store(true, Ordering::Relaxed);
         self.stop_pipeline();
         self.preserved = None;
-        let _ = std::fs::remove_file(paths::checkpoint_path());
+        if safety::keep_blocked_checkpoint(self.checkpoint_blocked) {
+            log::warn!("keeping unpublished replay checkpoint {}", paths::checkpoint_path().display());
+        } else {
+            let _ = std::fs::remove_file(paths::checkpoint_path());
+        }
         unsafe { PostQuitMessage(0) };
     }
 

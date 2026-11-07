@@ -15,6 +15,11 @@ use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Media::MediaFoundation::{IMFDXGIDeviceManager, MFCreateDXGIDeviceManager};
 use windows::Win32::System::WinRT::Direct3D11::CreateDirect3D11DeviceFromDXGIDevice;
 
+static SESSION: std::sync::Mutex<Option<Gpu>> = std::sync::Mutex::new(None);
+
+// Same rationale as `NativeParts`: one owner at a time, MTA device with multithread protection.
+unsafe impl Send for Gpu {}
+
 pub struct Gpu {
     pub device: ID3D11Device,
     pub context: ID3D11DeviceContext,
@@ -24,6 +29,28 @@ pub struct Gpu {
 }
 
 impl Gpu {
+    /// The process-wide device. Encoder reuse is per device, so a capture restart must
+    /// not create a second device or the parked MFT cannot accept the new textures.
+    pub fn session() -> windows::core::Result<Gpu> {
+        let mut slot = SESSION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = slot.as_ref() {
+            return Ok(existing.clone_ref());
+        }
+        let gpu = Gpu::new()?;
+        *slot = Some(gpu.clone_ref());
+        Ok(gpu)
+    }
+
+    fn clone_ref(&self) -> Gpu {
+        Gpu {
+            device: self.device.clone(),
+            context: self.context.clone(),
+            luid: self.luid,
+            manager: self.manager.clone(),
+            winrt: self.winrt.clone(),
+        }
+    }
+
     pub fn new() -> windows::core::Result<Gpu> {
         let levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0];
         let mut device = None;
