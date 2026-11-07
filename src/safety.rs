@@ -274,6 +274,42 @@ pub fn replay_until_accepted<T, E>(
     Ok(())
 }
 
+/// Frames a busy-timeout fallback must keep when it replaces the encoder.
+/// `drained` belongs to the segment that was already running. `pending` is what the
+/// replacement still has to accept: inputs the drain did not acknowledge, then the
+/// frames that were never accepted, with no timestamp twice.
+#[derive(Debug, PartialEq, Eq)]
+pub struct BusyHandoff<S, I> {
+    pub drained: Vec<S>,
+    pub pending: VecDeque<I>,
+}
+
+/// Keep a shutdown drain, then the inputs that still need a sample.
+/// Unacknowledged inputs stay in front of the unaccepted queue so an accepted frame
+/// whose sample never came out is not skipped in favor of a later one.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn handoff_after_busy_timeout<S, I, K>(
+    drained: Vec<S>,
+    unacknowledged: impl IntoIterator<Item = I>,
+    still_queued: impl IntoIterator<Item = I>,
+    key: impl Fn(&I) -> K,
+) -> BusyHandoff<S, I>
+where
+    K: PartialEq,
+{
+    let mut pending = VecDeque::new();
+    let mut seen = Vec::new();
+    for item in unacknowledged.into_iter().chain(still_queued) {
+        let id = key(&item);
+        if seen.contains(&id) {
+            continue;
+        }
+        seen.push(id);
+        pending.push_back(item);
+    }
+    BusyHandoff { drained, pending }
+}
+
 /// What one step of an encoder drain means. An empty batch is [`DrainStep::KeepWaiting`],
 /// not completion. Async MFTs finish on `METransformDrainComplete`; sync MFTs finish when
 /// the drain says it needs more input.
@@ -622,6 +658,33 @@ mod tests {
         assert!(matches!(result, Err(ReplayStop::BusyTimeout)));
         assert_eq!(pending, VecDeque::from([10, 20, 30]));
         assert!(started.elapsed() < Duration::from_secs(2), "busy replay spun without a deadline");
+    }
+
+    #[test]
+    fn busy_timeout_publishes_the_drained_prefix_before_software_replays_the_rest() {
+        // A (10) and B (20) were accepted. Shutdown drained both. C and D were never accepted.
+        let handoff =
+            handoff_after_busy_timeout(vec![10, 20], Vec::<i64>::new(), VecDeque::from([30, 40]), |time| *time);
+        let mut old_segment = vec![1];
+        old_segment.extend(handoff.drained);
+        let software: Vec<i64> = handoff.pending.iter().copied().collect();
+        assert_eq!(old_segment, vec![1, 10, 20], "the drained prefix stays on the old segment");
+        assert_eq!(software, vec![30, 40], "software replays only what was not accepted");
+        assert!(software.iter().all(|time| !old_segment.contains(time)));
+    }
+
+    #[test]
+    fn busy_timeout_requeues_an_accepted_frame_when_the_shutdown_drain_is_incomplete() {
+        // A (10) came out. B (20) was accepted but the drain did not return it.
+        // C (30) was never accepted. 20 also sitting in the queue must not be encoded twice.
+        let handoff =
+            handoff_after_busy_timeout(vec![10], VecDeque::from([20]), VecDeque::from([20, 30]), |time| *time);
+        assert_eq!(handoff.drained, vec![10]);
+        assert_eq!(handoff.pending, VecDeque::from([20, 30]));
+        let mut published = handoff.drained;
+        let replay: Vec<i64> = handoff.pending.iter().copied().collect();
+        published.extend(replay);
+        assert_eq!(published, vec![10, 20, 30]);
     }
 
     #[test]

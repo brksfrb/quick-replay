@@ -958,7 +958,15 @@ impl VideoEncoder {
 
 impl Drop for VideoEncoder {
     fn drop(&mut self) {
-        self.shutdown();
+        let drained = self.shutdown();
+        if !drained.is_empty() {
+            log::error!(
+                "dropping {} with {} encoded frame(s) that were not published: {}",
+                self.name,
+                drained.len(),
+                drained.iter().map(|frame| frame.time.to_string()).collect::<Vec<_>>().join(", ")
+            );
+        }
     }
 }
 
@@ -1104,7 +1112,15 @@ fn driver_loop(mut encoder: VideoEncoder, rx: mpsc::Receiver<Request>) {
                 }
             }
             Request::TakeOutput { reply } => {
-                let _ = reply.send(std::mem::take(&mut encoder.output));
+                let frames = std::mem::take(&mut encoder.output);
+                if let Err(err) = reply.send(frames) {
+                    log::error!(
+                        "encoded output missed the caller; keeping {} frame(s) on {}",
+                        err.0.len(),
+                        encoder.name
+                    );
+                    encoder.output = err.0;
+                }
             }
             Request::MarkBroken => encoder.broken = true,
             #[cfg(test)]
@@ -1117,13 +1133,28 @@ fn driver_loop(mut encoder: VideoEncoder, rx: mpsc::Receiver<Request>) {
             },
             Request::Shutdown { reply } => {
                 let frames = encoder.shutdown_local();
-                let _ = reply.send(frames);
+                if let Err(err) = reply.send(frames) {
+                    log::error!(
+                        "shutdown drain missed the caller; {} sample(s) from {} were not published: {}",
+                        err.0.len(),
+                        encoder.name,
+                        err.0.iter().map(|frame| frame.time.to_string()).collect::<Vec<_>>().join(", ")
+                    );
+                }
                 break;
             }
         }
     }
     if !encoder.released {
-        encoder.shutdown_local();
+        let frames = encoder.shutdown_local();
+        if !frames.is_empty() {
+            log::error!(
+                "driver exit drained {} sample(s) from {} with no caller left: {}",
+                frames.len(),
+                encoder.name,
+                frames.iter().map(|frame| frame.time.to_string()).collect::<Vec<_>>().join(", ")
+            );
+        }
     }
 }
 
@@ -1966,13 +1997,14 @@ mod tests {
         let mut encoder =
             super::host_on_worker(super::encoder_shell(crate::config::Codec::H264, "shutdown".into(), None));
         let started = std::time::Instant::now();
-        encoder.shutdown();
+        let drained = encoder.shutdown();
+        assert!(drained.is_empty(), "shutdown with no input must not invent frames");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
             "worker shutdown deadlocked after {}ms",
             started.elapsed().as_millis()
         );
-        encoder.shutdown();
+        assert!(encoder.shutdown().is_empty());
     }
 
     #[test]
@@ -2003,7 +2035,8 @@ mod tests {
         assert_eq!(pending.iter().map(|frame| frame.time).collect::<Vec<_>>(), vec![20, 30]);
         // Shutdown of a poisoned worker must not join the stuck thread.
         let started = std::time::Instant::now();
-        encoder.shutdown();
+        let drained = encoder.shutdown();
+        assert!(drained.is_empty(), "a poisoned shutdown must not drop samples that were still queued");
         assert!(started.elapsed() < std::time::Duration::from_millis(500));
     }
 
@@ -2060,6 +2093,28 @@ mod media_foundation {
         }
     }
 
+    fn keep_shutdown_drain(
+        encoder: &mut VideoEncoder,
+        encoded: &mut Vec<super::EncodedFrame>,
+        pending: &mut VecDeque<super::HeldInput>,
+    ) {
+        let drained = encoder.shutdown();
+        let unacknowledged = encoder.take_unacknowledged();
+        let handoff =
+            crate::safety::handoff_after_busy_timeout(drained, unacknowledged, std::mem::take(pending), |input| {
+                input.time
+            });
+        if !handoff.drained.is_empty() {
+            eprintln!(
+                "shutdown drain kept {} frame(s) on the old encoder: {}",
+                handoff.drained.len(),
+                handoff.drained.iter().map(|frame| frame.time.to_string()).collect::<Vec<_>>().join(", ")
+            );
+        }
+        encoded.extend(handoff.drained);
+        *pending = handoff.pending;
+    }
+
     fn replay_after_stall(
         gpu: &super::super::gpu::Gpu,
         encoder: &mut VideoEncoder,
@@ -2078,6 +2133,7 @@ mod media_foundation {
         );
         loop {
             if encoder.is_poisoned() {
+                keep_shutdown_drain(encoder, encoded, &mut pending);
                 let hardware = allow_hardware && !super::prefer_software();
                 match VideoEncoder::new(gpu, &settings(width, height, hardware)) {
                     Ok(next) => *encoder = next,
@@ -2133,6 +2189,8 @@ mod media_foundation {
                     return;
                 }
                 Err(crate::safety::ReplayStop::BusyTimeout) => {
+                    encoder.mark_broken();
+                    keep_shutdown_drain(encoder, encoded, &mut pending);
                     eprintln!(
                         "recovery made no progress for {}s at {width}x{height}; falling back to software, queued {:?}",
                         crate::safety::REPLAY_DEADLINE.as_secs(),
@@ -2141,18 +2199,13 @@ mod media_foundation {
                     if !allow_hardware {
                         panic!("software recovery made no progress; queued {:?}", times_of(&pending));
                     }
-                    encoder.mark_broken();
-                    encoded.extend(encoder.shutdown());
                     *encoder = VideoEncoder::new(gpu, &settings(width, height, false)).unwrap_or_else(|err| {
                         panic!("software encoder failed ({err}); queued {:?}", times_of(&pending))
                     });
                     allow_hardware = false;
                 }
                 Err(crate::safety::ReplayStop::Stopped(err)) if err == "stall" => {
-                    let mut again: VecDeque<super::HeldInput> = encoder.take_unacknowledged().into();
-                    again.retain(|frame| !pending.iter().any(|kept| kept.time == frame.time));
-                    again.append(&mut pending);
-                    pending = again;
+                    keep_shutdown_drain(encoder, encoded, &mut pending);
                     eprintln!(
                         "stall during recovery ({}); {} frames still queued",
                         super::last_stall_phase(),
@@ -2181,7 +2234,13 @@ mod media_foundation {
         let mut encoder = VideoEncoder::new(gpu, &settings(width, height, allow_hardware)).expect("H.264 encoder");
         if allow_hardware && !encoder.is_hardware() {
             eprintln!("no hardware H.264 encoder ({}); skipping that path", encoder.name);
-            encoder.shutdown();
+            let drained = encoder.shutdown();
+            assert!(
+                drained.is_empty(),
+                "skipping hardware dropped {} frame(s): {:?}",
+                drained.len(),
+                drained.iter().map(|frame| frame.time).collect::<Vec<_>>()
+            );
             return None;
         }
         let label = if encoder.is_hardware() { "hardware" } else { "software" };

@@ -106,7 +106,15 @@ impl Drop for State {
     fn drop(&mut self) {
         // Encoder worker first (it holds DXGI textures and the device manager), then the capture
         // callback, and only then — when the fields below drop — the device itself.
-        self.encoder.shutdown();
+        // run() publishes this drain before returning. Frames still here have no parser left.
+        let drained = self.encoder.shutdown();
+        if !drained.is_empty() {
+            log::error!(
+                "capture stopped with {} encoded frame(s) that were not published: {}",
+                drained.len(),
+                drained.iter().map(|frame| frame.time.to_string()).collect::<Vec<_>>().join(", ")
+            );
+        }
         self.capture.shutdown();
         self.gpu.flush();
     }
@@ -170,21 +178,31 @@ fn replace_stalled_encoder(
     current_time: i64,
     interval: i64,
 ) -> Result<(), String> {
-    let mut pending = s.encoder.take_unacknowledged();
+    let unacknowledged = s.encoder.take_unacknowledged();
+    let mut queued = std::mem::take(&mut s.recovery);
     if !current_submitted {
         if let Some(frame) = current {
-            if !pending.iter().any(|held| held.time == current_time) {
+            let already = unacknowledged.iter().chain(queued.iter()).any(|held| held.time == current_time);
+            if !already {
                 if let Ok(texture) = encoder::snapshot_texture(&s.gpu, frame) {
-                    pending.push(encoder::HeldInput { texture: Some(texture), time: current_time, duration: interval });
+                    queued.push_back(encoder::HeldInput {
+                        texture: Some(texture),
+                        time: current_time,
+                        duration: interval,
+                    });
                 }
             }
         }
     }
-    for input in pending {
-        if !s.recovery.iter().any(|kept| kept.time == input.time) {
-            s.recovery.push_back(input);
-        }
-    }
+    // Accepted inputs stay in front of anything that was only queued. Flush publishes
+    // whatever shutdown can still return before the parser is reset.
+    s.recovery = crate::safety::handoff_after_busy_timeout(
+        Vec::<encoder::EncodedFrame>::new(),
+        unacknowledged,
+        queued,
+        |input| input.time,
+    )
+    .pending;
     flush_recovery(s, shared, parser, current_time)
 }
 
@@ -195,7 +213,17 @@ fn flush_recovery(s: &mut State, shared: &Shared, parser: &mut LiveParser, curre
     let mut used_software = false;
     loop {
         if s.encoder.is_poisoned() {
+            // Publish anything shutdown can still return, then keep unacknowledged inputs
+            // ahead of the queue, before the new encoder's parser takes over.
+            if let Err(err) = publish_busy_handoff(s, shared, parser, (s.width, s.height)) {
+                log::error!(
+                    "could not publish the drained frames ({err}); keeping {} recovery frames",
+                    s.recovery.len()
+                );
+                return Err(err);
+            }
             if let Err(err) = open_replacement(s, false) {
+                s.encoder.abandon_for_recovery();
                 log::error!(
                     "replacement encoder was not created ({err}); keeping {} recovery frames",
                     s.recovery.len()
@@ -215,26 +243,29 @@ fn flush_recovery(s: &mut State, shared: &Shared, parser: &mut LiveParser, curre
                 return Ok(());
             }
             Err(crate::safety::ReplayStop::BusyTimeout) => {
-                log::error!(
-                    "recovery made no progress for {}s; falling back to software with {} frames still queued",
-                    crate::safety::REPLAY_DEADLINE.as_secs(),
-                    s.recovery.len()
-                );
                 if used_software {
                     return Err("recovery made no progress on the software encoder".into());
                 }
                 used_software = true;
                 s.encoder.mark_broken();
-                let _ = s.encoder.shutdown();
-                open_replacement(s, true)?;
+                // Drain on the old parser. A sample for an accepted frame has to be published
+                // before reset_parser, or the software segment never sees it.
+                publish_busy_handoff(s, shared, parser, (width, height))?;
+                log::error!(
+                    "recovery made no progress for {}s; falling back to software with {} frames still queued",
+                    crate::safety::REPLAY_DEADLINE.as_secs(),
+                    s.recovery.len()
+                );
+                if let Err(err) = open_replacement(s, true) {
+                    s.encoder.abandon_for_recovery();
+                    return Err(err);
+                }
                 reset_parser(s, shared, parser, current_time);
             }
             Err(crate::safety::ReplayStop::Stopped(err)) if err == "stall" => {
-                let mut again: VecDeque<encoder::HeldInput> = s.encoder.take_unacknowledged().into();
-                again.retain(|frame| !s.recovery.iter().any(|kept| kept.time == frame.time));
-                again.append(&mut s.recovery);
-                s.recovery = again;
+                publish_busy_handoff(s, shared, parser, (width, height))?;
                 if let Err(open_err) = open_replacement(s, false) {
+                    s.encoder.abandon_for_recovery();
                     log::error!(
                         "replacement encoder was not created ({open_err}); keeping {} recovery frames",
                         s.recovery.len()
@@ -246,6 +277,31 @@ fn flush_recovery(s: &mut State, shared: &Shared, parser: &mut LiveParser, curre
             Err(crate::safety::ReplayStop::Stopped(err)) => return Err(err),
         }
     }
+}
+
+/// Shutdown's samples stay on the current segment. Inputs it did not acknowledge are
+/// placed in front of the frames that were never accepted.
+fn publish_busy_handoff(
+    s: &mut State,
+    shared: &Shared,
+    parser: &mut LiveParser,
+    size: (u32, u32),
+) -> Result<(), String> {
+    let drained = s.encoder.shutdown();
+    let unacknowledged = s.encoder.take_unacknowledged();
+    let handoff =
+        crate::safety::handoff_after_busy_timeout(drained, unacknowledged, std::mem::take(&mut s.recovery), |input| {
+            input.time
+        });
+    let (width, height) = size;
+    if let Err(err) = publish_frames(&s.encoder, width, height, shared, parser, handoff.drained) {
+        s.recovery = handoff.pending;
+        // The session was drained. A retry has to open another encoder, not submit to this one.
+        s.encoder.abandon_for_recovery();
+        return Err(err);
+    }
+    s.recovery = handoff.pending;
+    Ok(())
 }
 
 fn open_replacement(s: &mut State, force_software: bool) -> Result<(), String> {
@@ -435,21 +491,23 @@ fn publish_shutdown_tail(s: &mut State, shared: &Shared, parser: &mut LiveParser
     // in flight and poisons the session; those are re-encoded before this function returns.
     // One extra pass collects the replacement encoder's own tail, which State::drop would drop.
     for attempt in 0..2 {
-        let frames = s.encoder.shutdown();
-        publish_drained(s, shared, parser, frames);
-        let pending = s.encoder.take_unacknowledged();
-        if !pending.is_empty() {
+        let drained = s.encoder.shutdown();
+        let unacknowledged = s.encoder.take_unacknowledged();
+        let handoff = crate::safety::handoff_after_busy_timeout(
+            drained,
+            unacknowledged,
+            std::mem::take(&mut s.recovery),
+            |input| input.time,
+        );
+        if !handoff.pending.is_empty() {
             log::warn!(
                 "drain left {} input(s) for recovery: {}",
-                pending.len(),
-                pending.iter().map(|input| input.time.to_string()).collect::<Vec<_>>().join(", ")
+                handoff.pending.len(),
+                handoff.pending.iter().map(|input| input.time.to_string()).collect::<Vec<_>>().join(", ")
             );
         }
-        for input in pending {
-            if !s.recovery.iter().any(|kept| kept.time == input.time) {
-                s.recovery.push_back(input);
-            }
-        }
+        publish_drained(s, shared, parser, handoff.drained);
+        s.recovery = handoff.pending;
         if s.recovery.is_empty() {
             return;
         }
@@ -469,14 +527,14 @@ fn publish_shutdown_tail(s: &mut State, shared: &Shared, parser: &mut LiveParser
             return;
         }
     }
-    let frames = s.encoder.shutdown();
-    publish_drained(s, shared, parser, frames);
-    let pending = s.encoder.take_unacknowledged();
-    for input in pending {
-        if !s.recovery.iter().any(|kept| kept.time == input.time) {
-            s.recovery.push_back(input);
-        }
-    }
+    let drained = s.encoder.shutdown();
+    let unacknowledged = s.encoder.take_unacknowledged();
+    let handoff =
+        crate::safety::handoff_after_busy_timeout(drained, unacknowledged, std::mem::take(&mut s.recovery), |input| {
+            input.time
+        });
+    publish_drained(s, shared, parser, handoff.drained);
+    s.recovery = handoff.pending;
     if !s.recovery.is_empty() {
         log::error!(
             "stopping with {} frame(s) still not encoded: {}",
