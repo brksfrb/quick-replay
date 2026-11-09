@@ -2,6 +2,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+#[cfg(any(windows, test))]
+mod conversion_policy;
 #[cfg(all(windows, debug_assertions))]
 mod devpng;
 mod hotkey;

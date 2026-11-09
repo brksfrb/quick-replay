@@ -66,7 +66,7 @@ fn load_png(gpu: &Gpu, path: &Path) -> Result<(ID3D11Texture2D, u32, u32), Strin
 }
 
 pub(crate) fn run(args: &[String]) -> Result<serde_json::Value, String> {
-    let usage = "usage: --selftest-encode input.png output.mp4 [--seconds 5] [--fps 144] [--width 1920] [--height 1080] [--quality low|medium|high]";
+    let usage = "usage: --selftest-encode input.png output.mp4 [--seconds 5] [--fps 144] [--width 1920] [--height 1080] [--quality low|medium|high|maximum]";
     if args.len() < 2 || !(args.len() - 2).is_multiple_of(2) {
         return Err(usage.into());
     }
@@ -78,6 +78,7 @@ pub(crate) fn run(args: &[String]) -> Result<serde_json::Value, String> {
                 "low" => Quality::Low,
                 "medium" => Quality::Medium,
                 "high" => Quality::High,
+                "maximum" => Quality::Maximum,
                 _ => return Err(usage.into()),
             };
         } else {
@@ -117,7 +118,7 @@ pub(crate) fn run(args: &[String]) -> Result<serde_json::Value, String> {
     let mut encoder = encoder::VideoEncoder::new(
         &gpu,
         &encoder::Settings {
-            codec: Codec::H264,
+            codec: settings.encoding_codec(),
             width,
             height,
             fps,
@@ -162,15 +163,23 @@ pub(crate) fn run(args: &[String]) -> Result<serde_json::Value, String> {
         if frame.time != index as i64 * HNS_PER_SEC / i64::from(fps) {
             return Err("encoder returned missing or duplicate timestamps".into());
         }
-        let (data, key) = qr_mp4::annexb_to_sample(qr_mp4::VideoCodec::H264, &frame.data, &mut params);
+        let (data, key) = qr_mp4::annexb_to_sample(
+            match encoder.codec {
+                Codec::H264 => qr_mp4::VideoCodec::H264,
+                Codec::Hevc => qr_mp4::VideoCodec::Hevc,
+            },
+            &frame.data,
+            &mut params,
+        );
         if data.is_empty() || (index == 0 && !key) {
             return Err("encoder returned unusable video".into());
         }
         packets.push(Packet { time: frame.time, data: data.into(), key });
     }
-    let format = VideoFormat::from_params(Codec::H264, width, height, &params).map_err(|err| err.to_string())?;
+    let format =
+        VideoFormat::from_params(encoder.codec, width, height, &params, !fast_preset).map_err(|err| err.to_string())?;
     writer::write_clip(&output, &Clip { video: packets, audio: Vec::new() }, &format, None)
         .map_err(|err| err.to_string())?;
     Ok(serde_json::json!({"ok": true, "frames": seconds * fps, "path": output,
-        "encoder": name, "bitrate_kbps": bitrate_kbps, "fast_preset": fast_preset, "width": width, "height": height}))
+        "encoder": name, "codec": format!("{:?}", encoder.codec), "full_range": !fast_preset, "bitrate_kbps": bitrate_kbps, "fast_preset": fast_preset, "width": width, "height": height}))
 }

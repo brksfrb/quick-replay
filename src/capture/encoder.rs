@@ -297,7 +297,10 @@ fn video_type(sub: &GUID, s: &Settings) -> Result<IMFMediaType> {
         t.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
         t.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)?;
         t.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
-        t.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
+        t.SetUINT32(
+            &MF_MT_VIDEO_NOMINAL_RANGE,
+            if s.fast_preset { MFNominalRange_16_235 } else { MFNominalRange_0_255 }.0 as u32,
+        )?;
     }
     Ok(t)
 }
@@ -350,8 +353,19 @@ impl VideoEncoder {
         } else {
             log::warn!("using the software H.264 encoder after repeated hardware-encoder failures");
         }
+        if settings.codec == Codec::Hevc && settings.allow_hardware {
+            log::warn!("HEVC hardware unavailable; falling back to H.264 at {} kbps", settings.bitrate_kbps);
+            return Self::new(gpu, &Settings { codec: Codec::H264, ..*settings });
+        }
+        if settings.codec == Codec::Hevc {
+            log::warn!("falling back to software H.264 at {} kbps", settings.bitrate_kbps);
+        }
         let software = Settings { codec: Codec::H264, allow_hardware: false, ..*settings };
         Self::software(gpu, &software).map_err(|err| format!("no video encoder available: {err}"))
+    }
+
+    pub fn full_range(&self) -> bool {
+        !self.fast_preset
     }
 
     pub fn is_hardware(&self) -> bool {
@@ -442,6 +456,28 @@ impl VideoEncoder {
             };
             output_type.SetUINT32(&MF_MT_MPEG2_PROFILE, profile)?;
             transform.SetOutputType(output_id, &output_type, 0)?;
+            // Opt-in diagnostic only: test negotiation on the actual adapter/MFT and
+            // output profile used by production, without changing the selected input.
+            if hardware && std::env::var_os("QUICKREPLAY_PROBE_INPUT_FORMATS").is_some() {
+                for (label, sub) in [
+                    ("NV12", MFVideoFormat_NV12),
+                    ("AYUV", MFVideoFormat_AYUV),
+                    ("YUY2", MFVideoFormat_YUY2),
+                    ("YV12", MFVideoFormat_YV12),
+                    ("P010", MFVideoFormat_P010),
+                ] {
+                    let result = video_type(&sub, s)
+                        .and_then(|t| transform.SetInputType(input_id, &t, MFT_SET_TYPE_TEST_ONLY.0 as u32));
+                    eprintln!(
+                        "input probe {name} {:?} {label}: {}",
+                        s.codec,
+                        match result {
+                            Ok(()) => "accepted TEST_ONLY".into(),
+                            Err(e) => hresult_text(&e),
+                        }
+                    );
+                }
+            }
             transform.SetInputType(input_id, &video_type(&MFVideoFormat_NV12, s)?, 0)?;
         }
 
@@ -2350,7 +2386,8 @@ mod media_foundation {
         }
         assert!(params.is_complete(VideoCodec::H264), "{label} encoder produced no parameter sets");
         assert!(packets.iter().any(|p| p.key), "{label} encoder produced no keyframe");
-        let format = super::super::VideoFormat::from_params(Codec::H264, width, height, &params).expect("sample entry");
+        let format =
+            super::super::VideoFormat::from_params(Codec::H264, width, height, &params, false).expect("sample entry");
         let clip = super::super::buffer::Clip { video: packets, audio: Vec::new() };
         let dir = std::env::temp_dir().join(format!("qr-mft-{}-{}", label, std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");

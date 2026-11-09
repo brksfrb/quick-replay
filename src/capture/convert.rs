@@ -19,8 +19,9 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_VPOV_DIMENSION_TEXTURE2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, DXGI_FORMAT,
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
+    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709,
+    DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12,
+    DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 
 /// Several output textures so the encoder can still be reading one while the next is written.
@@ -88,9 +89,9 @@ fn fit_rect(in_w: u32, in_h: u32, out_w: u32, out_h: u32) -> RECT {
     RECT { left: x, top: y, right: x + w, bottom: y + h }
 }
 
-// Only scaling benefits from the quality hint. Native conversion keeps its cheap path.
-fn processor_usage(fast: bool, iw: u32, ih: u32, ow: u32, oh: u32) -> D3D11_VIDEO_USAGE {
-    if !fast && (iw > ow || ih > oh) {
+// Format conversion kernels also benefit from quality processing at native size.
+fn processor_usage(fast: bool) -> D3D11_VIDEO_USAGE {
+    if crate::conversion_policy::quality_processing(fast) {
         D3D11_VIDEO_USAGE_OPTIMAL_QUALITY
     } else {
         D3D11_VIDEO_USAGE_OPTIMAL_SPEED
@@ -128,7 +129,7 @@ impl Converter {
             OutputFrameRate: rate,
             OutputWidth: self.out_w,
             OutputHeight: self.out_h,
-            Usage: processor_usage(self.fast_preset, in_w, in_h, self.out_w, self.out_h),
+            Usage: processor_usage(self.fast_preset),
         };
         let enumerator = unsafe { self.video_device.CreateVideoProcessorEnumerator(&desc)? };
         let processor = unsafe { self.video_device.CreateVideoProcessor(&enumerator, 0)? };
@@ -156,7 +157,15 @@ impl Converter {
             let ctx = &self.video_context;
             if let Ok(ctx1) = ctx.cast::<ID3D11VideoContext1>() {
                 ctx1.VideoProcessorSetStreamColorSpace1(&processor, 0, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
-                ctx1.VideoProcessorSetOutputColorSpace1(&processor, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
+                ctx1.VideoProcessorSetOutputColorSpace1(
+                    &processor,
+                    if self.fast_preset {
+                        DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709
+                    } else {
+                        // No FULL_G22_TOPLEFT_P709 in DXGI/windows-rs 0.62.2.
+                        DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709
+                    },
+                );
             } else {
                 // windows-rs 0.62 exposes the SDK bitfields as one u32.
                 // Bit 2 selects BT.709; bits 4..5 select nominal range; RGB_Range stays full.
@@ -165,7 +174,15 @@ impl Converter {
                     _bitfield: 1 | (1 << 2) | ((D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255.0 as u32) << 4),
                 };
                 let yuv = D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
-                    _bitfield: 1 | (1 << 2) | ((D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235.0 as u32) << 4),
+                    _bitfield: 1
+                        | (1 << 2)
+                        | ((if self.fast_preset {
+                            D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235
+                        } else {
+                            D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255
+                        }
+                        .0 as u32)
+                            << 4),
                 };
                 ctx.VideoProcessorSetStreamColorSpace(&processor, 0, &rgb);
                 ctx.VideoProcessorSetOutputColorSpace(&processor, &yuv);
@@ -291,12 +308,10 @@ mod tests {
     use super::{fit_rect, mostly_black, PROBE_POINTS};
 
     #[test]
-    fn quality_hint_only_for_quality_downscaling() {
+    fn quality_hint_includes_native_conversion() {
         use super::{processor_usage, D3D11_VIDEO_USAGE_OPTIMAL_QUALITY as Q, D3D11_VIDEO_USAGE_OPTIMAL_SPEED as S};
-        assert_eq!(processor_usage(false, 2560, 1440, 1920, 1080), Q);
-        assert_eq!(processor_usage(true, 2560, 1440, 1920, 1080), S);
-        assert_eq!(processor_usage(false, 1920, 1080, 1920, 1080), S);
-        assert_eq!(processor_usage(false, 1280, 720, 1920, 1080), S);
+        assert_eq!(processor_usage(false), Q);
+        assert_eq!(processor_usage(true), S);
     }
 
     #[test]

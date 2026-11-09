@@ -131,7 +131,7 @@ fn init(settings: &config::Video) -> Result<State, String> {
     let converter = Converter::new(&gpu, width, height, fps, settings.quality == config::Quality::Low)
         .map_err(|e| format!("color conversion unavailable: {e}"))?;
     let encoder_settings = encoder::Settings {
-        codec: settings.codec,
+        codec: settings.encoding_codec(),
         width,
         height,
         fps,
@@ -385,7 +385,7 @@ fn publish_frames(
     for frame in frames {
         let (sample, key) = qr_mp4::annexb_to_sample(parser.codec, &frame.data, &mut parser.params);
         if !parser.format_known && parser.params.is_complete(parser.codec) {
-            match VideoFormat::from_params(encoder.codec, width, height, &parser.params) {
+            match VideoFormat::from_params(encoder.codec, width, height, &parser.params, encoder.full_range()) {
                 Ok(format) => {
                     shared.set_video_format(format);
                     parser.format_known = true;
