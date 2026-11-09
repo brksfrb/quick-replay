@@ -11,9 +11,12 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE,
     D3D11_MAP_READ, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
     D3D11_VIDEO_COLOR, D3D11_VIDEO_COLOR_0, D3D11_VIDEO_COLOR_RGBA, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
-    D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
-    D3D11_VIDEO_USAGE_OPTIMAL_SPEED, D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255,
+    D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE,
+    D3D11_VIDEO_USAGE_OPTIMAL_QUALITY, D3D11_VIDEO_USAGE_OPTIMAL_SPEED, D3D11_VPIV_DIMENSION_TEXTURE2D,
+    D3D11_VPOV_DIMENSION_TEXTURE2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, DXGI_FORMAT,
@@ -41,6 +44,7 @@ pub struct Converter {
     out_h: u32,
     fps: u32,
     next: usize,
+    fast_preset: bool,
     /// Tiny CPU-readable texture for `looks_black`.
     probe: Option<ID3D11Texture2D>,
 }
@@ -84,14 +88,34 @@ fn fit_rect(in_w: u32, in_h: u32, out_w: u32, out_h: u32) -> RECT {
     RECT { left: x, top: y, right: x + w, bottom: y + h }
 }
 
+// Only scaling benefits from the quality hint. Native conversion keeps its cheap path.
+fn processor_usage(fast: bool, iw: u32, ih: u32, ow: u32, oh: u32) -> D3D11_VIDEO_USAGE {
+    if !fast && (iw > ow || ih > oh) {
+        D3D11_VIDEO_USAGE_OPTIMAL_QUALITY
+    } else {
+        D3D11_VIDEO_USAGE_OPTIMAL_SPEED
+    }
+}
+
 impl Converter {
-    pub fn new(gpu: &Gpu, out_w: u32, out_h: u32, fps: u32) -> Result<Converter> {
+    pub fn new(gpu: &Gpu, out_w: u32, out_h: u32, fps: u32, fast_preset: bool) -> Result<Converter> {
         let video_device: ID3D11VideoDevice = gpu.device.cast()?;
         let video_context: ID3D11VideoContext = gpu.context.cast()?;
         let outputs = (0..OUTPUT_TEXTURES)
             .map(|_| texture(gpu, out_w, out_h, DXGI_FORMAT_NV12, D3D11_BIND_RENDER_TARGET.0 as u32).map(|t| (t, None)))
             .collect::<Result<Vec<_>>>()?;
-        Ok(Converter { video_device, video_context, processor: None, outputs, out_w, out_h, fps, next: 0, probe: None })
+        Ok(Converter {
+            video_device,
+            video_context,
+            processor: None,
+            outputs,
+            out_w,
+            out_h,
+            fps,
+            fast_preset,
+            next: 0,
+            probe: None,
+        })
     }
 
     fn build_processor(&mut self, gpu: &Gpu, in_w: u32, in_h: u32) -> Result<()> {
@@ -104,7 +128,7 @@ impl Converter {
             OutputFrameRate: rate,
             OutputWidth: self.out_w,
             OutputHeight: self.out_h,
-            Usage: D3D11_VIDEO_USAGE_OPTIMAL_SPEED,
+            Usage: processor_usage(self.fast_preset, in_w, in_h, self.out_w, self.out_h),
         };
         let enumerator = unsafe { self.video_device.CreateVideoProcessorEnumerator(&desc)? };
         let processor = unsafe { self.video_device.CreateVideoProcessor(&enumerator, 0)? };
@@ -133,6 +157,18 @@ impl Converter {
             if let Ok(ctx1) = ctx.cast::<ID3D11VideoContext1>() {
                 ctx1.VideoProcessorSetStreamColorSpace1(&processor, 0, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
                 ctx1.VideoProcessorSetOutputColorSpace1(&processor, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
+            } else {
+                // windows-rs 0.62 exposes the SDK bitfields as one u32.
+                // Bit 2 selects BT.709; bits 4..5 select nominal range; RGB_Range stays full.
+                // Without this fallback D3D11 defaults to BT.601 on older devices.
+                let rgb = D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
+                    _bitfield: 1 | (1 << 2) | ((D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255.0 as u32) << 4),
+                };
+                let yuv = D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
+                    _bitfield: 1 | (1 << 2) | ((D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235.0 as u32) << 4),
+                };
+                ctx.VideoProcessorSetStreamColorSpace(&processor, 0, &rgb);
+                ctx.VideoProcessorSetOutputColorSpace(&processor, &yuv);
             }
             ctx.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
             let src = RECT { left: 0, top: 0, right: in_w as i32, bottom: in_h as i32 };
@@ -253,6 +289,15 @@ impl Converter {
 #[cfg(test)]
 mod tests {
     use super::{fit_rect, mostly_black, PROBE_POINTS};
+
+    #[test]
+    fn quality_hint_only_for_quality_downscaling() {
+        use super::{processor_usage, D3D11_VIDEO_USAGE_OPTIMAL_QUALITY as Q, D3D11_VIDEO_USAGE_OPTIMAL_SPEED as S};
+        assert_eq!(processor_usage(false, 2560, 1440, 1920, 1080), Q);
+        assert_eq!(processor_usage(true, 2560, 1440, 1920, 1080), S);
+        assert_eq!(processor_usage(false, 1920, 1080, 1920, 1080), S);
+        assert_eq!(processor_usage(false, 1280, 720, 1920, 1080), S);
+    }
 
     #[test]
     fn black_detection_tolerates_a_cursor() {

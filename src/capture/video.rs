@@ -128,15 +128,15 @@ fn init(settings: &config::Video) -> Result<State, String> {
         .map_err(|e| format!("screen capture failed to start: {e}"))?;
     let (src_w, src_h) = capture.size();
     let (width, height) = settings.output_size(src_w, src_h);
-    let converter =
-        Converter::new(&gpu, width, height, fps).map_err(|e| format!("color conversion unavailable: {e}"))?;
+    let converter = Converter::new(&gpu, width, height, fps, settings.quality == config::Quality::Low)
+        .map_err(|e| format!("color conversion unavailable: {e}"))?;
     let encoder_settings = encoder::Settings {
         codec: settings.codec,
         width,
         height,
         fps,
         bitrate_kbps: settings.bitrate_kbps(width, height),
-        fast_preset: settings.quality != config::Quality::High,
+        fast_preset: settings.quality == config::Quality::Low,
         allow_hardware: !encoder::prefer_software(),
     };
     let bitrate_kbps = encoder_settings.bitrate_kbps;

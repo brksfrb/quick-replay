@@ -247,24 +247,37 @@ fn set_codec_value(api: &ICodecAPI, key: &GUID, value: &windows::Win32::System::
 
 fn configure_codec_api(api: &ICodecAPI, s: &Settings) {
     let bitrate = s.bitrate_kbps.saturating_mul(1000);
-    let peak = eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32;
-    if !set_codec_value(api, &CODECAPI_AVEncCommonRateControlMode, &mf::variant_u32(peak)) {
-        let cbr = eAVEncCommonRateControlMode_CBR.0 as u32;
-        set_codec_value(api, &CODECAPI_AVEncCommonRateControlMode, &mf::variant_u32(cbr));
+    // Prefer average-target VBR for evidence quality; keep bounded peaks for Low.
+    let modes: &[_] = if s.fast_preset {
+        &[eAVEncCommonRateControlMode_PeakConstrainedVBR, eAVEncCommonRateControlMode_CBR]
+    } else {
+        &[
+            eAVEncCommonRateControlMode_UnconstrainedVBR,
+            eAVEncCommonRateControlMode_PeakConstrainedVBR,
+            eAVEncCommonRateControlMode_CBR,
+        ]
+    };
+    let mut selected = None;
+    for &mode in modes {
+        if set_codec_value(api, &CODECAPI_AVEncCommonRateControlMode, &mf::variant_u32(mode.0 as u32)) {
+            selected = Some(mode);
+            break;
+        }
     }
+    log::info!("encoder rate control: {selected:?}, low latency: {}", s.fast_preset);
     set_codec_value(api, &CODECAPI_AVEncCommonMeanBitRate, &mf::variant_u32(bitrate));
-    set_codec_value(api, &CODECAPI_AVEncCommonMaxBitRate, &mf::variant_u32(bitrate.saturating_mul(3) / 2));
+    if selected == Some(eAVEncCommonRateControlMode_PeakConstrainedVBR) {
+        set_codec_value(api, &CODECAPI_AVEncCommonMaxBitRate, &mf::variant_u32(bitrate.saturating_mul(3) / 2));
+    }
     // Keyframes are forced once a second by time (frames are only sent when the screen changes);
     // the encoder's own interval is just a safety net.
     set_codec_value(api, &CODECAPI_AVEncMPVGOPSize, &mf::variant_u32(s.fps * 2));
     // No B-frames, so decode order equals display order and muxing stays simple.
     set_codec_value(api, &CODECAPI_AVEncMPVDefaultBPictureCount, &mf::variant_u32(0));
-    set_codec_value(api, &CODECAPI_AVLowLatencyMode, &mf::variant_bool(true));
-    // The fastest encoder preset: about a third less encoder load (measured on NVENC at 1080p60)
-    // for a small quality cost; "High" quality keeps the driver's slower, better preset.
-    if s.fast_preset {
-        set_codec_value(api, &CODECAPI_AVEncCommonQualityVsSpeed, &mf::variant_u32(0));
-    }
+    set_codec_value(api, &CODECAPI_AVLowLatencyMode, &mf::variant_bool(s.fast_preset));
+    // Explicitly reset both modes; parked sessions retain their codec properties.
+    let speed = if s.fast_preset { 0 } else { 75 };
+    set_codec_value(api, &CODECAPI_AVEncCommonQualityVsSpeed, &mf::variant_u32(speed));
 }
 
 fn video_type(sub: &GUID, s: &Settings) -> Result<IMFMediaType> {
@@ -274,6 +287,11 @@ fn video_type(sub: &GUID, s: &Settings) -> Result<IMFMediaType> {
         t.SetUINT64(&MF_MT_FRAME_RATE, mf::pack(s.fps, 1))?;
         t.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, mf::pack(1, 1))?;
         t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+        // Match the converter and the MP4 nclx box on both NV12 input and coded output.
+        t.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
+        t.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)?;
+        t.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
+        t.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
     }
     Ok(t)
 }
