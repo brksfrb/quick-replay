@@ -9,6 +9,7 @@ pub(crate) mod encoder;
 mod gpu;
 mod mf;
 mod screen;
+pub(crate) mod selftest;
 mod timeline;
 mod video;
 mod writer;
@@ -45,14 +46,27 @@ pub struct VideoFormat {
 }
 
 impl VideoFormat {
-    fn from_params(codec: Codec, width: u32, height: u32, p: &qr_mp4::ParamSets) -> std::io::Result<VideoFormat> {
+    fn from_params(
+        codec: Codec,
+        width: u32,
+        height: u32,
+        p: &qr_mp4::ParamSets,
+        full_range: bool,
+    ) -> std::io::Result<VideoFormat> {
         let missing = || std::io::Error::other("missing parameter sets");
         let (w, h) = (width as u16, height as u16);
         let sps = p.sps.as_deref().ok_or_else(missing)?;
         let pps = p.pps.as_deref().ok_or_else(missing)?;
         let sample_entry = match codec {
-            Codec::H264 => qr_mp4::avc1_sample_entry(w, h, sps, pps)?,
-            Codec::Hevc => qr_mp4::hvc1_sample_entry(w, h, p.vps.as_deref().ok_or_else(missing)?, sps, pps)?,
+            Codec::H264 => qr_mp4::boxes::avc1_sample_entry_with_range(w, h, sps, pps, full_range)?,
+            Codec::Hevc => qr_mp4::boxes::hvc1_sample_entry_with_range(
+                w,
+                h,
+                p.vps.as_deref().ok_or_else(missing)?,
+                sps,
+                pps,
+                full_range,
+            )?,
         };
         Ok(VideoFormat { width, height, sample_entry })
     }

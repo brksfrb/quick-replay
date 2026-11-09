@@ -247,24 +247,43 @@ fn set_codec_value(api: &ICodecAPI, key: &GUID, value: &windows::Win32::System::
 
 fn configure_codec_api(api: &ICodecAPI, s: &Settings) {
     let bitrate = s.bitrate_kbps.saturating_mul(1000);
-    let peak = eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32;
-    if !set_codec_value(api, &CODECAPI_AVEncCommonRateControlMode, &mf::variant_u32(peak)) {
-        let cbr = eAVEncCommonRateControlMode_CBR.0 as u32;
-        set_codec_value(api, &CODECAPI_AVEncCommonRateControlMode, &mf::variant_u32(cbr));
+    // Prefer constant quality; fall back to budgeted VBR when the driver rejects it.
+    let modes: &[_] = if s.fast_preset {
+        &[eAVEncCommonRateControlMode_PeakConstrainedVBR, eAVEncCommonRateControlMode_CBR]
+    } else {
+        &[
+            eAVEncCommonRateControlMode_Quality,
+            eAVEncCommonRateControlMode_PeakConstrainedVBR,
+            eAVEncCommonRateControlMode_UnconstrainedVBR,
+            eAVEncCommonRateControlMode_CBR,
+        ]
+    };
+    let mut selected = None;
+    for &mode in modes {
+        if set_codec_value(api, &CODECAPI_AVEncCommonRateControlMode, &mf::variant_u32(mode.0 as u32)) {
+            if mode == eAVEncCommonRateControlMode_Quality
+                && !set_codec_value(api, &CODECAPI_AVEncCommonQuality, &mf::variant_u32(93))
+            {
+                continue;
+            }
+            selected = Some(mode);
+            break;
+        }
     }
+    log::info!("encoder rate control: {selected:?}, low latency: {}", s.fast_preset);
     set_codec_value(api, &CODECAPI_AVEncCommonMeanBitRate, &mf::variant_u32(bitrate));
-    set_codec_value(api, &CODECAPI_AVEncCommonMaxBitRate, &mf::variant_u32(bitrate.saturating_mul(3) / 2));
+    if selected == Some(eAVEncCommonRateControlMode_PeakConstrainedVBR) {
+        set_codec_value(api, &CODECAPI_AVEncCommonMaxBitRate, &mf::variant_u32(bitrate.saturating_mul(2)));
+    }
     // Keyframes are forced once a second by time (frames are only sent when the screen changes);
     // the encoder's own interval is just a safety net.
     set_codec_value(api, &CODECAPI_AVEncMPVGOPSize, &mf::variant_u32(s.fps * 2));
     // No B-frames, so decode order equals display order and muxing stays simple.
     set_codec_value(api, &CODECAPI_AVEncMPVDefaultBPictureCount, &mf::variant_u32(0));
-    set_codec_value(api, &CODECAPI_AVLowLatencyMode, &mf::variant_bool(true));
-    // The fastest encoder preset: about a third less encoder load (measured on NVENC at 1080p60)
-    // for a small quality cost; "High" quality keeps the driver's slower, better preset.
-    if s.fast_preset {
-        set_codec_value(api, &CODECAPI_AVEncCommonQualityVsSpeed, &mf::variant_u32(0));
-    }
+    set_codec_value(api, &CODECAPI_AVLowLatencyMode, &mf::variant_bool(s.fast_preset));
+    // Explicitly reset both modes; parked sessions retain their codec properties.
+    let speed = if s.fast_preset { 0 } else { 100 };
+    set_codec_value(api, &CODECAPI_AVEncCommonQualityVsSpeed, &mf::variant_u32(speed));
 }
 
 fn video_type(sub: &GUID, s: &Settings) -> Result<IMFMediaType> {
@@ -274,6 +293,14 @@ fn video_type(sub: &GUID, s: &Settings) -> Result<IMFMediaType> {
         t.SetUINT64(&MF_MT_FRAME_RATE, mf::pack(s.fps, 1))?;
         t.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, mf::pack(1, 1))?;
         t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+        // Match the converter and the MP4 nclx box on both NV12 input and coded output.
+        t.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
+        t.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)?;
+        t.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
+        t.SetUINT32(
+            &MF_MT_VIDEO_NOMINAL_RANGE,
+            if s.fast_preset { MFNominalRange_16_235 } else { MFNominalRange_0_255 }.0 as u32,
+        )?;
     }
     Ok(t)
 }
@@ -326,8 +353,19 @@ impl VideoEncoder {
         } else {
             log::warn!("using the software H.264 encoder after repeated hardware-encoder failures");
         }
+        if settings.codec == Codec::Hevc && settings.allow_hardware {
+            log::warn!("HEVC hardware unavailable; falling back to H.264 at {} kbps", settings.bitrate_kbps);
+            return Self::new(gpu, &Settings { codec: Codec::H264, ..*settings });
+        }
+        if settings.codec == Codec::Hevc {
+            log::warn!("falling back to software H.264 at {} kbps", settings.bitrate_kbps);
+        }
         let software = Settings { codec: Codec::H264, allow_hardware: false, ..*settings };
         Self::software(gpu, &software).map_err(|err| format!("no video encoder available: {err}"))
+    }
+
+    pub fn full_range(&self) -> bool {
+        !self.fast_preset
     }
 
     pub fn is_hardware(&self) -> bool {
@@ -387,7 +425,7 @@ impl VideoEncoder {
                 if is_async {
                     attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)?;
                 }
-                let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
+                let _ = attrs.SetUINT32(&MF_LOW_LATENCY, u32::from(s.fast_preset));
             }
         }
         let d3d_aware = hardware
@@ -418,6 +456,28 @@ impl VideoEncoder {
             };
             output_type.SetUINT32(&MF_MT_MPEG2_PROFILE, profile)?;
             transform.SetOutputType(output_id, &output_type, 0)?;
+            // Opt-in diagnostic only: test negotiation on the actual adapter/MFT and
+            // output profile used by production, without changing the selected input.
+            if hardware && std::env::var_os("QUICKREPLAY_PROBE_INPUT_FORMATS").is_some() {
+                for (label, sub) in [
+                    ("NV12", MFVideoFormat_NV12),
+                    ("AYUV", MFVideoFormat_AYUV),
+                    ("YUY2", MFVideoFormat_YUY2),
+                    ("YV12", MFVideoFormat_YV12),
+                    ("P010", MFVideoFormat_P010),
+                ] {
+                    let result = video_type(&sub, s)
+                        .and_then(|t| transform.SetInputType(input_id, &t, MFT_SET_TYPE_TEST_ONLY.0 as u32));
+                    eprintln!(
+                        "input probe {name} {:?} {label}: {}",
+                        s.codec,
+                        match result {
+                            Ok(()) => "accepted TEST_ONLY".into(),
+                            Err(e) => hresult_text(&e),
+                        }
+                    );
+                }
+            }
             transform.SetInputType(input_id, &video_type(&MFVideoFormat_NV12, s)?, 0)?;
         }
 
@@ -2326,7 +2386,8 @@ mod media_foundation {
         }
         assert!(params.is_complete(VideoCodec::H264), "{label} encoder produced no parameter sets");
         assert!(packets.iter().any(|p| p.key), "{label} encoder produced no keyframe");
-        let format = super::super::VideoFormat::from_params(Codec::H264, width, height, &params).expect("sample entry");
+        let format =
+            super::super::VideoFormat::from_params(Codec::H264, width, height, &params, false).expect("sample entry");
         let clip = super::super::buffer::Clip { video: packets, audio: Vec::new() };
         let dir = std::env::temp_dir().join(format!("qr-mft-{}-{}", label, std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");

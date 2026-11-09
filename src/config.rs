@@ -199,17 +199,19 @@ pub enum Quality {
     Low,
     Medium,
     High,
+    Maximum,
     Custom,
 }
 
 impl Quality {
-    pub const ALL: [Quality; 4] = [Quality::Low, Quality::Medium, Quality::High, Quality::Custom];
+    pub const ALL: [Quality; 5] = [Quality::Low, Quality::Medium, Quality::High, Quality::Maximum, Quality::Custom];
 
     pub fn label(self) -> &'static str {
         match self {
             Quality::Low => "Low (smallest files)",
             Quality::Medium => "Medium",
             Quality::High => "High",
+            Quality::Maximum => "Maximum (best, larger files)",
             Quality::Custom => "Custom bitrate",
         }
     }
@@ -250,13 +252,22 @@ impl Default for Video {
 const H264_MAX_SIDE: u32 = 4096;
 
 impl Video {
+    /// Maximum always requests HEVC, regardless of the stored format preference.
+    pub fn encoding_codec(&self) -> Codec {
+        if self.quality == Quality::Maximum {
+            Codec::Hevc
+        } else {
+            self.codec
+        }
+    }
+
     /// Encoded size for a monitor: scaled down to the chosen height (never up), even dimensions.
     pub fn output_size(&self, src_w: u32, src_h: u32) -> (u32, u32) {
         let mut scale = match self.resolution.max_height() {
             Some(max) if src_h > max => f64::from(max) / f64::from(src_h),
             _ => 1.0,
         };
-        if self.codec == Codec::H264 {
+        if self.encoding_codec() == Codec::H264 {
             let longest = f64::from(src_w.max(src_h)) * scale;
             if longest > f64::from(H264_MAX_SIDE) {
                 scale *= f64::from(H264_MAX_SIDE) / longest;
@@ -269,18 +280,19 @@ impl Video {
 
     pub const FPS_CHOICES: [u32; 5] = [30, 60, 90, 120, 144];
 
-    /// Target bitrate for the given output size, scaled from 1080p60 reference values.
+    /// Target bitrate with constant bits per pixel per frame, up to the bitrate limits.
     pub fn bitrate_kbps(&self, width: u32, height: u32) -> u32 {
-        let reference = match self.quality {
-            Quality::Low => 7_000.0,
-            Quality::Medium => 14_000.0,
-            Quality::High => 28_000.0,
+        let bpp = match self.quality {
+            Quality::Low => 0.08,
+            Quality::Medium => 0.16,
+            Quality::High => 0.32,
+            Quality::Maximum => 0.48,
             Quality::Custom => return self.custom_bitrate_kbps.clamp(500, 150_000),
         };
         let pixel_rate = f64::from(width) * f64::from(height) * f64::from(self.fps);
-        let scale = (pixel_rate / (1920.0 * 1080.0 * 60.0)).powf(0.75);
-        let codec_factor = if self.codec == Codec::Hevc { 0.65 } else { 1.0 };
-        (reference * scale * codec_factor).clamp(1_000.0, 150_000.0) as u32
+        let codec_factor =
+            if self.encoding_codec() == Codec::Hevc && self.quality != Quality::Maximum { 0.65 } else { 1.0 };
+        (bpp * pixel_rate * codec_factor / 1000.0).clamp(1_000.0, 150_000.0) as u32
     }
 }
 
@@ -428,8 +440,47 @@ mod tests {
     #[test]
     fn bitrate_scales_with_resolution() {
         let video = Video::default();
-        assert!(video.bitrate_kbps(1280, 720) < video.bitrate_kbps(1920, 1080));
+        for (width, height) in [(1280, 720), (1920, 1080), (2560, 1440)] {
+            let expected = 0.16 * f64::from(width) * f64::from(height) * 60.0 / 1000.0;
+            assert!((f64::from(video.bitrate_kbps(width, height)) - expected).abs() < 1.0);
+        }
         assert!(video.bitrate_kbps(2560, 1440) < 40_000);
+    }
+
+    #[test]
+    fn bitrate_preserves_bpp_across_fps_and_presets() {
+        for (quality, bpp) in [(Quality::Low, 0.08), (Quality::Medium, 0.16), (Quality::High, 0.32)] {
+            for fps in [30, 60, 144] {
+                let video = Video { quality, fps, codec: Codec::H264, ..Video::default() };
+                let expected = bpp * 1920.0 * 1080.0 * f64::from(fps) / 1000.0;
+                assert!((f64::from(video.bitrate_kbps(1920, 1080)) - expected).abs() < 1.0);
+            }
+        }
+        let mut video = Video { quality: Quality::High, fps: 144, ..Video::default() };
+        let h264 = video.bitrate_kbps(1920, 1080);
+        assert!((85_000..=110_000).contains(&h264));
+        video.codec = Codec::Hevc;
+        assert!((f64::from(video.bitrate_kbps(1920, 1080)) - f64::from(h264) * 0.65).abs() < 1.0);
+        assert_eq!(video.bitrate_kbps(7680, 4320), 150_000);
+        assert_eq!(video.bitrate_kbps(2, 2), 1_000);
+        video.quality = Quality::Custom;
+        video.custom_bitrate_kbps = 1;
+        assert_eq!(video.bitrate_kbps(1920, 1080), 500);
+        video.custom_bitrate_kbps = 200_000;
+        assert_eq!(video.bitrate_kbps(1920, 1080), 150_000);
+    }
+
+    #[test]
+    fn maximum_spends_bits_and_overrides_codec() {
+        let mut video = Video { quality: Quality::Maximum, fps: 144, ..Video::default() };
+        let target = video.bitrate_kbps(1920, 1080);
+        assert!((143_000..=144_000).contains(&target));
+        assert_eq!(target, 143_327);
+        assert_eq!(video.encoding_codec(), Codec::Hevc);
+        video.codec = Codec::Hevc;
+        assert_eq!(video.bitrate_kbps(1920, 1080), target);
+        assert_eq!(serde_json::to_string(&Quality::Maximum).unwrap(), "\"maximum\"");
+        assert_eq!(serde_json::from_str::<Quality>("\"maximum\"").unwrap(), Quality::Maximum);
     }
 
     #[test]

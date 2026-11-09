@@ -24,7 +24,10 @@ mod recovery;
 pub mod trim;
 pub mod writer;
 
-pub use boxes::{aac_lc_asc, avc1_sample_entry, hvc1_sample_entry, mp4a_sample_entry};
+pub use boxes::{
+    aac_lc_asc, avc1_sample_entry, avc1_sample_entry_with_range, hvc1_sample_entry, hvc1_sample_entry_with_range,
+    mp4a_sample_entry,
+};
 pub use nal::{annexb_to_sample, split_annexb, ParamSets};
 pub use reader::{probe, read_mp4, Mp4File, Sample, Track};
 pub use recovery::{recover, RecoverResult};

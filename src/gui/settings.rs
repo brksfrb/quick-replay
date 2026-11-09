@@ -289,12 +289,17 @@ fn video_section(ui: &mut Ui, video: &mut Video, monitors: &[Monitor]) {
                 }
             });
         });
-        setting_row(ui, "Format", "HEVC files are about a third smaller but don't play everywhere.", |ui| {
-            ComboBox::from_id_salt("codec").selected_text(video.codec.label()).width(220.0).show_ui(ui, |ui| {
-                for c in [Codec::H264, Codec::Hevc] {
-                    ui.selectable_value(&mut video.codec, c, c.label());
-                }
-            });
+        setting_row(ui, "Format", "Maximum uses HEVC when available. Other presets use this format.", |ui| {
+            ComboBox::from_id_salt("codec").selected_text(video.encoding_codec().label()).width(220.0).show_ui(
+                ui,
+                |ui| {
+                    for c in [Codec::H264, Codec::Hevc] {
+                        ui.add_enabled_ui(video.quality != Quality::Maximum, |ui| {
+                            ui.selectable_value(&mut video.codec, c, c.label());
+                        });
+                    }
+                },
+            );
         });
         setting_row(ui, "Quality", "", |ui| {
             ComboBox::from_id_salt("quality").selected_text(video.quality.label()).show_ui(ui, |ui| {
@@ -305,7 +310,7 @@ fn video_section(ui: &mut Ui, video: &mut Video, monitors: &[Monitor]) {
         });
         if video.quality == Quality::Custom {
             setting_row(ui, "Bitrate", "", |ui| {
-                ui.add(Slider::new(&mut video.custom_bitrate_kbps, 1_000..=100_000).suffix(" kbps").logarithmic(true))
+                ui.add(Slider::new(&mut video.custom_bitrate_kbps, 1_000..=150_000).suffix(" kbps").logarithmic(true))
             });
         }
         let (w, h) = output_for(video, monitors);

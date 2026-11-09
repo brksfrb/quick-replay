@@ -12,18 +12,47 @@ use crate::nal::{avcc_box, hvcc_box};
 /// Builds an `avc1` sample entry with `avcC`, `colr` (nclx BT.709, limited
 /// range) and `pasp` (1:1). `sps`/`pps` are NAL units without start codes.
 pub fn avc1_sample_entry(width: u16, height: u16, sps: &[u8], pps: &[u8]) -> io::Result<Vec<u8>> {
+    avc1_sample_entry_with_range(width, height, sps, pps, false)
+}
+
+/// Builds an AVC sample entry with explicit BT.709 nclx full/limited range.
+pub fn avc1_sample_entry_with_range(
+    width: u16,
+    height: u16,
+    sps: &[u8],
+    pps: &[u8],
+    full_range: bool,
+) -> io::Result<Vec<u8>> {
     let avcc = avcc_box(sps, pps)?;
-    visual_sample_entry(b"avc1", width, height, &avcc)
+    visual_sample_entry(b"avc1", width, height, &avcc, full_range)
 }
 
 /// Builds an `hvc1` sample entry with `hvcC` (parsed from the SPS), `colr`
 /// and `pasp`. Parameter sets are NAL units without start codes.
 pub fn hvc1_sample_entry(width: u16, height: u16, vps: &[u8], sps: &[u8], pps: &[u8]) -> io::Result<Vec<u8>> {
-    let hvcc = hvcc_box(vps, sps, pps)?;
-    visual_sample_entry(b"hvc1", width, height, &hvcc)
+    hvc1_sample_entry_with_range(width, height, vps, sps, pps, false)
 }
 
-fn visual_sample_entry(fourcc: &[u8; 4], width: u16, height: u16, config: &[u8]) -> io::Result<Vec<u8>> {
+/// Builds an HEVC sample entry with explicit BT.709 nclx full/limited range.
+pub fn hvc1_sample_entry_with_range(
+    width: u16,
+    height: u16,
+    vps: &[u8],
+    sps: &[u8],
+    pps: &[u8],
+    full_range: bool,
+) -> io::Result<Vec<u8>> {
+    let hvcc = hvcc_box(vps, sps, pps)?;
+    visual_sample_entry(b"hvc1", width, height, &hvcc, full_range)
+}
+
+fn visual_sample_entry(
+    fourcc: &[u8; 4],
+    width: u16,
+    height: u16,
+    config: &[u8],
+    full_range: bool,
+) -> io::Result<Vec<u8>> {
     let mut b = BoxBuf::new();
     let start = b.begin(fourcc);
     b.zeros(6); // reserved
@@ -47,7 +76,7 @@ fn visual_sample_entry(fourcc: &[u8; 4], width: u16, height: u16, config: &[u8])
     b.u16(1); // colour_primaries: BT.709
     b.u16(1); // transfer_characteristics: BT.709
     b.u16(1); // matrix_coefficients: BT.709
-    b.u8(0); // full_range_flag = 0 (limited)
+    b.u8(u8::from(full_range) << 7); // full_range_flag is the high bit; reserved bits zero
     b.end(colr);
 
     let pasp = b.begin(b"pasp");
@@ -167,6 +196,23 @@ mod tests {
         let dsi = esds.windows(7).position(|w| w == [0x05, 0x80, 0x80, 0x80, 2, 0x11, 0x90]);
         assert!(dsi.is_some());
         assert_eq!(&esds[esds.len() - 6..], &[0x06, 0x80, 0x80, 0x80, 1, 2]);
+    }
+
+    #[test]
+    fn nclx_range_flag_for_both_codecs() {
+        // Exercise the shared builder with each codec entry, independent of SPS parsing.
+        for fourcc in [b"avc1", b"hvc1"] {
+            for full in [false, true] {
+                let e = visual_sample_entry(fourcc, 1920, 1080, &[], full).unwrap();
+                let offset = e.windows(8).position(|w| w == b"colrnclx").unwrap();
+                assert_eq!(&e[offset + 8..offset + 14], &[0, 1, 0, 1, 0, 1]);
+                assert_eq!(e[offset + 14], if full { 0x80 } else { 0 });
+            }
+        }
+        let limited = avc1_sample_entry(1920, 1080, &[0x67, 0x42, 0xC0, 0x28, 0xDA], &[0x68, 0xCE]).unwrap();
+        let full =
+            avc1_sample_entry_with_range(1920, 1080, &[0x67, 0x42, 0xC0, 0x28, 0xDA], &[0x68, 0xCE], true).unwrap();
+        assert_eq!(limited.iter().zip(&full).filter(|(a, b)| a != b).count(), 1);
     }
 
     #[test]
