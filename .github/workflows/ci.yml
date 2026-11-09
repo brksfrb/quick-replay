@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, fix/recording-sharpness]
+    branches: [main, fix/recording-sharpness, test/selftest-encode-v016]
   pull_request:
 
 permissions:
