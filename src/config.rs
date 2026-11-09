@@ -290,7 +290,8 @@ impl Video {
             Quality::Custom => return self.custom_bitrate_kbps.clamp(500, 150_000),
         };
         let pixel_rate = f64::from(width) * f64::from(height) * f64::from(self.fps);
-        let codec_factor = if self.encoding_codec() == Codec::Hevc && self.quality != Quality::Maximum { 0.65 } else { 1.0 };
+        let codec_factor =
+            if self.encoding_codec() == Codec::Hevc && self.quality != Quality::Maximum { 0.65 } else { 1.0 };
         (bpp * pixel_rate * codec_factor / 1000.0).clamp(1_000.0, 150_000.0) as u32
     }
 }
