@@ -190,7 +190,7 @@ impl Library {
         self.thumbs.update(ctx);
     }
 
-    pub fn ui(&mut self, ui: &mut Ui) -> LibraryAction {
+    pub fn ui(&mut self, ui: &mut Ui, streamable_enabled: bool) -> LibraryAction {
         let mut action = LibraryAction::None;
         let total: u64 = self.videos.iter().map(|v| v.size).sum();
         ui.horizontal(|ui| {
@@ -264,7 +264,7 @@ impl Library {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = CARD_GAP;
                     for &index in row {
-                        let result = self.card(ui, index, card_w);
+                        let result = self.card(ui, index, card_w, streamable_enabled);
                         if !matches!(result, LibraryAction::None) {
                             action = result;
                         }
@@ -276,7 +276,7 @@ impl Library {
         action
     }
 
-    fn card(&mut self, ui: &mut Ui, index: usize, width: f32) -> LibraryAction {
+    fn card(&mut self, ui: &mut Ui, index: usize, width: f32, streamable_enabled: bool) -> LibraryAction {
         let thumb_h = width * 9.0 / 16.0;
         let (rect, response) = ui.allocate_exact_size(Vec2::new(width, thumb_h + 58.0), Sense::click());
         let video = &self.videos[index];
@@ -360,6 +360,14 @@ impl Library {
                 } else {
                     "Clipboard is busy".into()
                 });
+                ui.close();
+            }
+            if streamable_enabled && ui.button("Upload to Streamable").clicked() {
+                let message = match crate::ipc::upload_streamable(&path) {
+                    Ok(()) => "Upload queued".into(),
+                    Err(err) => err,
+                };
+                action = LibraryAction::Flash(message);
                 ui.close();
             }
             if ui.button(format!("{}   Open with default player", icon::OPEN_WITH)).clicked() {

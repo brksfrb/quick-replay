@@ -13,9 +13,10 @@ use crate::win::{clipboard, monitors, wide, ComGuard};
 use crate::{install, paths};
 use overlay::{Glyph, Overlay, Placement, Toast};
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tray::{MenuItem, Tray, WM_TRAY};
@@ -52,6 +53,7 @@ const TIMER_UPDATE: usize = 6;
 const TIMER_RESUME: usize = 7;
 const TIMER_WATCHDOG: usize = 8;
 const TIMER_CHECKPOINT: usize = 9;
+const TIMER_LINK_CLIPBOARD: usize = 10;
 /// How often the service checks that the capture thread is still making progress.
 const WATCHDOG_TICK_MS: u32 = 2_000;
 /// How often the in-memory replay buffer is copied to disk so a process crash can still be saved.
@@ -125,6 +127,8 @@ struct Service {
     /// An update that waits for the current recording to end.
     pending_update: Option<(String, PathBuf)>,
     update_running: bool,
+    upload_queue: Option<SyncSender<(PathBuf, bool)>>,
+    pending_links: VecDeque<(String, u8)>,
     badge: Option<Overlay>,
     replay_hotkeys: Vec<(i32, u32)>,
     recording_since: Option<Instant>,
@@ -197,6 +201,75 @@ impl Service {
     fn notify_video(&mut self, title: &str, subtitle: &str, video: &Path) {
         self.notify(Glyph::Check, title, &format!("{subtitle} · click to watch"));
         self.toast_action = Some(ToastAction::OpenVideo(video.to_path_buf()));
+        if self.config.streamable.enabled && self.config.streamable.auto_upload {
+            self.upload_streamable(video.to_path_buf(), false);
+        }
+    }
+
+    fn upload_streamable(&mut self, path: PathBuf, manual: bool) {
+        if !self.config.streamable.enabled {
+            return;
+        }
+        if self.upload_queue.is_none() {
+            let (tx, rx) = sync_channel::<(PathBuf, bool)>(32);
+            let events = self.events.clone();
+            let spawned = std::thread::Builder::new().name("streamable-upload".into()).spawn(move || {
+                while let Ok((path, manual)) = rx.recv() {
+                    let login = match crate::win::credentials::read() {
+                        Ok(Some(login)) => login,
+                        Ok(None) if !manual => continue,
+                        Ok(None) => {
+                            events.send(Event::StreamableFailed(
+                                "Save your Streamable email and password in Settings first.".into(),
+                            ));
+                            continue;
+                        }
+                        Err(err) => {
+                            events.send(Event::StreamableFailed(err));
+                            continue;
+                        }
+                    };
+                    let started = crate::streamable::Progress::Uploading(None);
+                    events.send(Event::StreamableProgress(started));
+                    let mut last = Some(started);
+                    let result = crate::streamable::upload(&path, Some(&login), |progress| {
+                        if last != Some(progress) {
+                            events.send(Event::StreamableProgress(progress));
+                            last = Some(progress);
+                        }
+                    });
+                    events.send(match result {
+                        Ok(url) => Event::StreamableReady(url),
+                        Err(err) => Event::StreamableFailed(err),
+                    });
+                }
+            });
+            if spawned.is_err() {
+                self.notify(Glyph::Warning, "Streamable upload failed", "Couldn't start the upload worker.");
+                return;
+            }
+            self.upload_queue = Some(tx);
+        }
+        if self.upload_queue.as_ref().unwrap().try_send((path, manual)).is_err() {
+            self.notify(Glyph::Warning, "Streamable upload failed", "The upload queue is full. Try again later.");
+        }
+    }
+
+    fn copy_streamable_links(&mut self) {
+        while let Some((url, attempts)) = self.pending_links.pop_front() {
+            if clipboard::copy_text(&url) {
+                self.notify(Glyph::Check, "Link copied", &url);
+            } else if attempts < 9 {
+                self.pending_links.push_front((url, attempts + 1));
+                unsafe { SetTimer(Some(self.hwnd), TIMER_LINK_CLIPBOARD, 50, None) };
+                return;
+            } else {
+                self.notify(Glyph::Warning, "Link ready", &format!("Clipboard is busy · {url}"));
+            }
+        }
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_LINK_CLIPBOARD);
+        }
     }
 
     /// Checks GitHub on a worker thread; the result comes back as an event.
@@ -265,6 +338,10 @@ impl Service {
     }
 
     fn notify(&mut self, glyph: Glyph, title: &str, subtitle: &str) {
+        self.show_notice(glyph, title, subtitle, true);
+    }
+
+    fn show_notice(&mut self, glyph: Glyph, title: &str, subtitle: &str, sound: bool) {
         self.toast_action = None;
         let n = &self.config.notifications;
         if !n.enabled {
@@ -273,7 +350,7 @@ impl Service {
         let place = self.placement(n.position, n.hide_from_capture);
         let accent = n.accent_rgb();
         let hold = Duration::from_millis(u64::from(n.duration_ms.clamp(800, 10_000)));
-        if n.sound {
+        if n.sound && sound {
             let alias = wide("Notification.Default");
             unsafe {
                 let _ = PlaySoundW(PCWSTR(alias.as_ptr()), None, SND_ALIAS | SND_ASYNC | SND_NODEFAULT);
@@ -632,6 +709,10 @@ impl Service {
             Command::ToggleBuffer => self.toggle_buffer(),
             Command::Quit => self.quit(),
             Command::CheckUpdates => self.check_updates(true),
+            Command::UploadStreamable(id) => match ipc::take_upload_request(id) {
+                Ok(path) => self.upload_streamable(path, true),
+                Err(err) => self.notify(Glyph::Warning, "Streamable upload failed", &err),
+            },
         }
     }
 
@@ -652,6 +733,22 @@ impl Service {
                 Event::RecordingSaved { path, seconds } => {
                     log::info!("recording saved: {}", path.display());
                     self.saved(&path, "Recording saved", format_duration(seconds));
+                }
+                Event::StreamableProgress(progress) => {
+                    use crate::streamable::Progress;
+                    let (title, percent) = match progress {
+                        Progress::Uploading(percent) => ("Uploading to Streamable", percent),
+                        Progress::Processing(percent) => ("Processing on Streamable", percent),
+                    };
+                    let subtitle = percent.map_or_else(String::new, |p| format!("{p}%"));
+                    self.show_notice(Glyph::Check, title, &subtitle, false);
+                }
+                Event::StreamableReady(url) => {
+                    self.pending_links.push_back((url, 0));
+                    self.copy_streamable_links();
+                }
+                Event::StreamableFailed(message) => {
+                    self.notify(Glyph::Warning, "Streamable upload failed", &message);
                 }
                 Event::SaveFailed(message) => self.notify(Glyph::Warning, "Couldn't save", &message),
                 Event::UpdateReady { version, path, manual } => {
@@ -720,6 +817,7 @@ impl Service {
                 }
             }
             TIMER_BADGE => self.update_badge(),
+            TIMER_LINK_CLIPBOARD => self.copy_streamable_links(),
             TIMER_RESTART => {
                 unsafe {
                     let _ = KillTimer(Some(self.hwnd), TIMER_RESTART);
@@ -1105,6 +1203,8 @@ pub fn run(mode: StartMode) {
         failure_notified: false,
         pending_update: None,
         update_running: false,
+        upload_queue: None,
+        pending_links: VecDeque::new(),
         badge: Overlay::new(instance, false),
         replay_hotkeys: Vec::new(),
         recording_since: None,

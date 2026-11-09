@@ -111,7 +111,7 @@ impl Player {
         }
     }
 
-    fn start_export(&mut self, copy: bool) {
+    fn start_export(&mut self, copy: bool, auto_upload: bool) {
         if self.export.is_some() {
             return;
         }
@@ -123,11 +123,17 @@ impl Player {
         std::thread::spawn(move || {
             let result = qr_mp4::trim(&source, &target, start, end).map_err(|e| e.to_string()).map(|kept| {
                 let length = theme::format_time(kept.end_secs - kept.start_secs);
-                if copy && clipboard::copy_file(None, &target) {
+                let mut message = if copy && clipboard::copy_file(None, &target) {
                     format!("Clip copied to clipboard ({length})")
                 } else {
                     format!("Clip saved ({length})")
+                };
+                if auto_upload && crate::win::credentials::read().is_ok_and(|login| login.is_some()) {
+                    if let Err(err) = crate::ipc::upload_streamable(&target) {
+                        message.push_str(&format!(" · {err}"));
+                    }
                 }
+                message
             });
             let _ = tx.send(result);
         });
@@ -219,7 +225,7 @@ impl Player {
         self.trim = Some((start, at.min(self.duration()).max(low)));
     }
 
-    pub fn ui(&mut self, ui: &mut Ui) -> PlayerAction {
+    pub fn ui(&mut self, ui: &mut Ui, auto_upload: bool) -> PlayerAction {
         let mut action = self.handle_keys(ui);
         if let Some(rx) = &self.export {
             if let Ok(result) = rx.try_recv() {
@@ -246,7 +252,7 @@ impl Player {
         ui.add_space(10.0);
         self.timeline(ui);
         ui.add_space(6.0);
-        if let Some(a) = self.controls(ui) {
+        if let Some(a) = self.controls(ui, auto_upload) {
             action = a;
         }
         self.schedule_repaint(ui.ctx());
@@ -436,7 +442,7 @@ impl Player {
         }
     }
 
-    fn controls(&mut self, ui: &mut Ui) -> Option<PlayerAction> {
+    fn controls(&mut self, ui: &mut Ui, auto_upload: bool) -> Option<PlayerAction> {
         let action = None;
         let (start, end) = self.trim_range();
         ui.horizontal(|ui| {
@@ -470,12 +476,12 @@ impl Player {
                 let save =
                     ui.add_enabled_ui(can_cut, |ui| theme::primary_button(ui, Some(icon::CUT), "Save clip")).inner;
                 if save.clicked() {
-                    self.start_export(false);
+                    self.start_export(false, auto_upload);
                 }
                 let copy =
                     ui.add_enabled_ui(can_cut, |ui| theme::secondary_button(ui, Some(icon::COPY), "Copy clip")).inner;
                 if copy.clicked() {
-                    self.start_export(true);
+                    self.start_export(true, auto_upload);
                 }
                 if busy {
                     ui.spinner();

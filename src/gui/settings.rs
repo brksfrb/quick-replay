@@ -4,7 +4,7 @@ use super::theme::{self, icon, setting_row, toggle};
 use crate::config::{parse_hex_color, Audio, Codec, Config, Corner, Quality, ReplayHotkey, Resolution, Video};
 use crate::hotkey::Hotkey;
 use crate::win::monitors::Monitor;
-use crate::win::shell;
+use crate::win::{credentials, shell};
 use crate::{install, paths};
 use eframe::egui::{self, ComboBox, RichText, Slider, Ui};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
@@ -39,6 +39,11 @@ pub enum SettingsAction {
 #[derive(Default)]
 pub struct SettingsPage {
     capture: Option<KeyCapture>,
+    streamable_loaded: bool,
+    streamable_email: String,
+    streamable_password: String,
+    streamable_saved: bool,
+    streamable_error: Option<String>,
 }
 
 fn key_down(vk: u16) -> bool {
@@ -124,6 +129,7 @@ impl SettingsPage {
             audio_section(ui, &mut config.audio);
             notifications_section(ui, config);
             let sort = storage_section(ui, config);
+            self.streamable_section(ui, config);
             action = general_section(ui, config);
             if matches!(action, SettingsAction::None) {
                 action = sort;
@@ -131,6 +137,73 @@ impl SettingsPage {
             ui.add_space(24.0);
         });
         action
+    }
+
+    fn streamable_section(&mut self, ui: &mut Ui, config: &mut Config) {
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            theme::section_title(ui, icon::OPEN_WITH, "Streamable");
+            setting_row(
+                ui,
+                "Upload to Streamable",
+                "Upload clips and get a share link. Needs a free Streamable account.",
+                |ui| toggle(ui, &mut config.streamable.enabled),
+            );
+            if !config.streamable.enabled {
+                return;
+            }
+            if !self.streamable_loaded {
+                self.streamable_loaded = true;
+                match credentials::read() {
+                    Ok(Some(login)) => {
+                        self.streamable_email = login.email;
+                        self.streamable_saved = true;
+                    }
+                    Ok(None) => {}
+                    Err(err) => self.streamable_error = Some(err),
+                }
+            }
+            setting_row(ui, "Email", "Your Streamable account email.", |ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.streamable_email).desired_width(240.0));
+            });
+            setting_row(ui, "Password", "Saved securely in Windows Credential Manager.", |ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.streamable_password).password(true).desired_width(240.0));
+            });
+            ui.horizontal(|ui| {
+                if theme::secondary_button(ui, None, "Save login").clicked() {
+                    match credentials::save(&self.streamable_email, &self.streamable_password) {
+                        Ok(()) => {
+                            self.streamable_password.clear();
+                            self.streamable_saved = true;
+                            self.streamable_error = None;
+                        }
+                        Err(err) => self.streamable_error = Some(err),
+                    }
+                }
+                if theme::secondary_button(ui, None, "Clear login").clicked() {
+                    match credentials::clear() {
+                        Ok(()) => {
+                            self.streamable_email.clear();
+                            self.streamable_password.clear();
+                            self.streamable_saved = false;
+                            self.streamable_error = None;
+                        }
+                        Err(err) => self.streamable_error = Some(err),
+                    }
+                }
+                ui.label(
+                    RichText::new(if self.streamable_saved { "Login saved" } else { "No login saved" })
+                        .color(theme::TEXT_WEAK),
+                );
+            });
+            if let Some(err) = &self.streamable_error {
+                ui.colored_label(theme::WARN, err);
+            }
+            setting_row(ui, "Upload automatically after saving", "Copies the share link when it's ready.", |ui| {
+                toggle(ui, &mut config.streamable.auto_upload)
+            });
+        });
+        ui.add_space(14.0);
     }
 
     fn replay_section(&mut self, ui: &mut Ui, config: &mut Config, monitors: &[Monitor]) {

@@ -6,11 +6,8 @@
 //! and portable copies; dev builds never update.
 
 use crate::paths;
-use crate::win::wide;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use windows::core::PCWSTR;
-use windows::Win32::Networking::WinHttp::*;
 use windows::Win32::Security::Cryptography::{BCryptHash, BCRYPT_SHA256_ALG_HANDLE};
 
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/brksfrb/quick-replay/releases/latest";
@@ -55,96 +52,20 @@ fn sha256(data: &[u8]) -> Option<[u8; 32]> {
     unsafe { BCryptHash(BCRYPT_SHA256_ALG_HANDLE, None, data, &mut out) }.is_ok().then_some(out)
 }
 
-/// Closes a WinHTTP handle when dropped.
-struct Handle(*mut core::ffi::c_void);
-
-impl Drop for Handle {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            let _ = unsafe { WinHttpCloseHandle(self.0) };
-        }
-    }
-}
-
-fn checked(handle: *mut core::ffi::c_void, what: &str) -> Result<Handle, String> {
-    if handle.is_null() {
-        Err(format!("{what} failed: {}", windows::core::Error::from_thread()))
-    } else {
-        Ok(Handle(handle))
-    }
-}
-
-/// HTTPS GET with Windows' own HTTP stack (system proxy and certificates, redirects followed).
+/// HTTPS GET with Windows' own HTTP stack.
 fn http_get(url: &str, accept: &str) -> Result<Vec<u8>, String> {
-    let url_wide: Vec<u16> = url.encode_utf16().collect();
-    let mut host = vec![0u16; 256];
-    let mut path = vec![0u16; 2048];
-    let mut parts = URL_COMPONENTS {
-        dwStructSize: std::mem::size_of::<URL_COMPONENTS>() as u32,
-        lpszHostName: windows::core::PWSTR(host.as_mut_ptr()),
-        dwHostNameLength: host.len() as u32,
-        lpszUrlPath: windows::core::PWSTR(path.as_mut_ptr()),
-        dwUrlPathLength: path.len() as u32,
-        ..Default::default()
-    };
-    unsafe { WinHttpCrackUrl(&url_wide, 0, &mut parts) }.map_err(|e| format!("bad URL: {e}"))?;
-    let host = wide(String::from_utf16_lossy(&host[..parts.dwHostNameLength as usize]));
-    let path = wide(String::from_utf16_lossy(&path[..parts.dwUrlPathLength as usize]));
-    let agent = wide(format!("QuickReplay/{}", env!("CARGO_PKG_VERSION")));
-    let headers: Vec<u16> = format!("Accept: {accept}\r\n").encode_utf16().collect();
-    unsafe {
-        let session = checked(
-            WinHttpOpen(PCWSTR(agent.as_ptr()), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, PCWSTR::null(), PCWSTR::null(), 0),
-            "WinHttpOpen",
-        )?;
-        let connection = checked(WinHttpConnect(session.0, PCWSTR(host.as_ptr()), parts.nPort, 0), "connect")?;
-        let request = checked(
-            WinHttpOpenRequest(
-                connection.0,
-                PCWSTR(wide("GET").as_ptr()),
-                PCWSTR(path.as_ptr()),
-                PCWSTR::null(),
-                PCWSTR::null(),
-                std::ptr::null(),
-                WINHTTP_FLAG_SECURE,
-            ),
-            "request",
-        )?;
-        WinHttpSendRequest(request.0, Some(&headers), None, 0, 0, 0).map_err(|e| format!("send failed: {e}"))?;
-        WinHttpReceiveResponse(request.0, std::ptr::null_mut()).map_err(|e| format!("no response: {e}"))?;
-        let mut status = 0u32;
-        let mut size = std::mem::size_of::<u32>() as u32;
-        WinHttpQueryHeaders(
-            request.0,
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            PCWSTR::null(),
-            Some(&mut status as *mut u32 as *mut _),
-            &mut size,
-            std::ptr::null_mut(),
-        )
-        .map_err(|e| format!("bad response: {e}"))?;
-        if status != 200 {
-            return Err(format!("server answered {status}"));
-        }
-        let mut body = Vec::new();
-        loop {
-            let mut available = 0u32;
-            WinHttpQueryDataAvailable(request.0, &mut available).map_err(|e| format!("download failed: {e}"))?;
-            if available == 0 {
-                break;
-            }
-            let start = body.len();
-            body.resize(start + available as usize, 0);
-            let mut read = 0u32;
-            WinHttpReadData(request.0, body[start..].as_mut_ptr().cast(), available, &mut read)
-                .map_err(|e| format!("download failed: {e}"))?;
-            body.truncate(start + read as usize);
-            if body.len() > MAX_DOWNLOAD {
-                return Err("download is unexpectedly large".into());
-            }
-        }
-        Ok(body)
+    let response = crate::win::http::request(
+        url,
+        "GET",
+        &format!("Accept: {accept}\r\n"),
+        &[],
+        crate::win::http::Options { max_response: MAX_DOWNLOAD, redirects: true, deadline: None },
+        &mut |_| {},
+    )?;
+    if response.status != 200 {
+        return Err(format!("server answered {}", response.status));
     }
+    Ok(response.body)
 }
 
 /// The latest release if it's newer than this build, with a verifiable exe.

@@ -8,7 +8,7 @@ use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
-use windows::Win32::System::Ole::CF_HDROP;
+use windows::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT};
 
 const OPEN_ATTEMPTS: u32 = 10;
 const OPEN_RETRY_MS: u64 = 50;
@@ -66,4 +66,27 @@ pub fn copy_file(owner: Option<HWND>, path: &Path) -> bool {
     };
     let _ = unsafe { CloseClipboard() };
     ok
+}
+
+/// A single attempt: clipboard contention must not stall recording hotkeys.
+pub fn copy_text(text: &str) -> bool {
+    let Some(owner) = crate::ipc::service_window() else {
+        return false;
+    };
+    let bytes: Vec<u8> = text.encode_utf16().chain(std::iter::once(0)).flat_map(u16::to_le_bytes).collect();
+    let Some(mem) = global_with(&bytes) else {
+        return false;
+    };
+    unsafe {
+        if OpenClipboard(Some(owner)).is_err() {
+            let _ = GlobalFree(Some(mem));
+            return false;
+        }
+        let ok = EmptyClipboard().is_ok() && SetClipboardData(u32::from(CF_UNICODETEXT.0), Some(HANDLE(mem.0))).is_ok();
+        if !ok {
+            let _ = GlobalFree(Some(mem));
+        }
+        let _ = CloseClipboard();
+        ok
+    }
 }

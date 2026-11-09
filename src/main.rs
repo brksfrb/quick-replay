@@ -13,6 +13,8 @@ mod organize;
 mod paths;
 mod persist;
 mod safety;
+#[cfg(any(windows, test))]
+mod streamable;
 
 #[cfg(windows)]
 mod capture;
