@@ -9,6 +9,7 @@ pub(crate) mod encoder;
 mod gpu;
 mod mf;
 mod screen;
+pub(crate) mod selftest;
 mod timeline;
 mod video;
 mod writer;

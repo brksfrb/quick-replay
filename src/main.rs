@@ -34,6 +34,17 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |flag: &str| args.iter().any(|a| a == flag);
 
+    if let Some(i) = args.iter().position(|arg| arg == "--selftest-encode") {
+        match capture::selftest::run(&args[i + 1..]) {
+            Ok(result) => println!("{result}"),
+            Err(err) => {
+                eprintln!("selftest-encode: {err}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     if has("--gui") {
         logger::init(&paths::log_path(), "gui");
         gui::run();
