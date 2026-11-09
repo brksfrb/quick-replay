@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, fix/recording-sharpness]
   pull_request:
 
 permissions:
@@ -20,3 +20,18 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - run: cargo build --release
+      - name: Package
+        shell: bash
+        run: |
+          mkdir dist
+          cp target/release/QuickReplay.exe dist/QuickReplay.exe
+          cd dist && sha256sum QuickReplay.exe > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: quickreplay-windows
+          path: |
+            dist/QuickReplay.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
