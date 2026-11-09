@@ -1,6 +1,8 @@
 //! Small safe wrappers over the Win32 APIs used across the app.
 
 pub mod clipboard;
+pub mod credentials;
+pub mod http;
 pub mod monitors;
 pub mod registry;
 pub mod shell;

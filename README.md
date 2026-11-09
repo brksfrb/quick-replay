@@ -73,6 +73,19 @@ the game or app in front, like `VALORANT\VALORANT 2026-10-14 21-03-55.mp4`. The 
 all together with a chip per folder to filter. Both are options in Settings, and "Sort now" files
 videos you already have. Settings are in `%LOCALAPPDATA%\QuickReplay\config.toml`.
 
+### Share on Streamable
+
+In **Settings → Streamable**, turn on **Upload to Streamable**, enter your account email and
+password, and click **Save login**. Right-click a library video and choose **Upload to Streamable**,
+or turn on **Upload automatically after saving**. QuickReplay uploads in the background, waits
+for processing, and copies an HTTPS link with a **Link copied** notification. Failed uploads keep
+the local clip. Clips over 500 MB are refused.
+
+Both upload options are off by default. Email and password are saved only in Windows Credential
+Manager under `QuickReplay/Streamable`; `config.toml` holds only the two upload switches.
+A Streamable account is required: anonymous uploads return HTTP 401. This uses Streamable's
+legacy API; its docs say uploading is unsupported, so the endpoint may stop working.
+
 ## Resource use
 
 Measured on Windows 11 with an RTX 3080 Ti, 1080p60 H.264. RAM is the "Memory" column in Task

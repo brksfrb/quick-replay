@@ -55,6 +55,7 @@ pub enum Command {
     ToggleBuffer,
     Quit,
     CheckUpdates,
+    UploadStreamable(u32),
 }
 
 impl Command {
@@ -66,6 +67,7 @@ impl Command {
             Command::ToggleBuffer => (4, 0),
             Command::Quit => (5, 0),
             Command::CheckUpdates => (6, 0),
+            Command::UploadStreamable(id) => (7, id as isize),
         }
     }
 
@@ -77,6 +79,7 @@ impl Command {
             4 => Command::ToggleBuffer,
             5 => Command::Quit,
             6 => Command::CheckUpdates,
+            7 => Command::UploadStreamable(u32::try_from(lparam).ok()?),
             _ => return None,
         })
     }
@@ -230,6 +233,43 @@ pub fn take_open_request() -> Option<std::path::PathBuf> {
     video.is_file().then_some(video)
 }
 
+fn upload_request_path(id: u32) -> std::path::PathBuf {
+    crate::paths::data_dir().join(format!("upload-request-{id}.json"))
+}
+
+/// One file per request so quick successive clicks cannot overwrite each other.
+pub fn upload_streamable(video: &std::path::Path) -> Result<(), String> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    for _ in 0..16 {
+        let id = std::process::id().wrapping_mul(65537).wrapping_add(NEXT.fetch_add(1, Ordering::Relaxed));
+        let path = upload_request_path(id);
+        let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err("Couldn't queue the upload.".into()),
+        };
+        let payload = serde_json::to_vec(video).map_err(|_| "Couldn't read the clip path.")?;
+        let written = file.write_all(&payload);
+        drop(file);
+        if written.is_ok() && send_to_service(Command::UploadStreamable(id)) {
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(&path);
+        return Err("Couldn't queue the upload. Make sure QuickReplay is running.".into());
+    }
+    Err("Couldn't queue the upload. Try again.".into())
+}
+
+pub fn take_upload_request(id: u32) -> Result<std::path::PathBuf, String> {
+    let path = upload_request_path(id);
+    let payload = std::fs::read(&path);
+    let _ = std::fs::remove_file(&path);
+    let payload = payload.map_err(|_| "Couldn't read the upload request.")?;
+    serde_json::from_slice(&payload).map_err(|_| "Couldn't read the clip path.".into())
+}
+
 /// Focuses the window if it's open, otherwise starts the window process.
 pub fn open_gui() {
     // A window that's still starting up has the mutex but maybe not the event yet; it will show
@@ -259,6 +299,8 @@ mod tests {
             Command::ToggleRecording,
             Command::ToggleBuffer,
             Command::Quit,
+            Command::CheckUpdates,
+            Command::UploadStreamable(42),
         ] {
             let (w, l) = cmd.encode();
             assert_eq!(Command::decode(w, l), Some(cmd));

@@ -83,6 +83,9 @@ pub enum Event {
         seconds: f64,
     },
     SaveFailed(String),
+    StreamableProgress(crate::streamable::Progress),
+    StreamableReady(String),
+    StreamableFailed(String),
     /// A newer version was downloaded and verified. `manual`: the user asked for the check.
     UpdateReady {
         version: String,

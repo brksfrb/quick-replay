@@ -282,13 +282,13 @@ impl App {
 
     fn main(&mut self, ui: &mut Ui) {
         match &mut self.page {
-            Page::Library => match self.library.ui(ui) {
+            Page::Library => match self.library.ui(ui, self.config.streamable.enabled) {
                 LibraryAction::Open(path) => self.page = Page::Player(Box::new(Player::open(path))),
                 LibraryAction::Flash(message) => self.show_flash(message),
                 LibraryAction::None => {}
             },
             Page::Player(player) => {
-                let action = player.ui(ui);
+                let action = player.ui(ui, self.config.streamable.enabled && self.config.streamable.auto_upload);
                 let gone = !player.path.exists();
                 match action {
                     PlayerAction::Back => self.page = Page::Library,

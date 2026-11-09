@@ -22,6 +22,14 @@ pub struct Config {
     pub audio: Audio,
     pub notifications: Notifications,
     pub storage: Storage,
+    pub streamable: Streamable,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Streamable {
+    pub enabled: bool,
+    pub auto_upload: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -427,6 +435,8 @@ mod tests {
         let config: Config = toml::from_str("[video]\nfps = 30\n").unwrap();
         assert_eq!(config.video.fps, 30);
         assert_eq!(config.replay, Replay::default());
+        assert!(!config.streamable.enabled);
+        assert!(!config.streamable.auto_upload);
         assert!(config.general.restart_on_crash);
     }
 
