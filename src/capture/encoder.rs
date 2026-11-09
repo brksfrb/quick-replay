@@ -247,19 +247,25 @@ fn set_codec_value(api: &ICodecAPI, key: &GUID, value: &windows::Win32::System::
 
 fn configure_codec_api(api: &ICodecAPI, s: &Settings) {
     let bitrate = s.bitrate_kbps.saturating_mul(1000);
-    // Prefer average-target VBR for evidence quality; keep bounded peaks for Low.
+    // Prefer constant quality; fall back to budgeted VBR when the driver rejects it.
     let modes: &[_] = if s.fast_preset {
         &[eAVEncCommonRateControlMode_PeakConstrainedVBR, eAVEncCommonRateControlMode_CBR]
     } else {
         &[
-            eAVEncCommonRateControlMode_UnconstrainedVBR,
+            eAVEncCommonRateControlMode_Quality,
             eAVEncCommonRateControlMode_PeakConstrainedVBR,
+            eAVEncCommonRateControlMode_UnconstrainedVBR,
             eAVEncCommonRateControlMode_CBR,
         ]
     };
     let mut selected = None;
     for &mode in modes {
         if set_codec_value(api, &CODECAPI_AVEncCommonRateControlMode, &mf::variant_u32(mode.0 as u32)) {
+            if mode == eAVEncCommonRateControlMode_Quality
+                && !set_codec_value(api, &CODECAPI_AVEncCommonQuality, &mf::variant_u32(93))
+            {
+                continue;
+            }
             selected = Some(mode);
             break;
         }
@@ -267,7 +273,7 @@ fn configure_codec_api(api: &ICodecAPI, s: &Settings) {
     log::info!("encoder rate control: {selected:?}, low latency: {}", s.fast_preset);
     set_codec_value(api, &CODECAPI_AVEncCommonMeanBitRate, &mf::variant_u32(bitrate));
     if selected == Some(eAVEncCommonRateControlMode_PeakConstrainedVBR) {
-        set_codec_value(api, &CODECAPI_AVEncCommonMaxBitRate, &mf::variant_u32(bitrate.saturating_mul(3) / 2));
+        set_codec_value(api, &CODECAPI_AVEncCommonMaxBitRate, &mf::variant_u32(bitrate.saturating_mul(2)));
     }
     // Keyframes are forced once a second by time (frames are only sent when the screen changes);
     // the encoder's own interval is just a safety net.
@@ -276,7 +282,7 @@ fn configure_codec_api(api: &ICodecAPI, s: &Settings) {
     set_codec_value(api, &CODECAPI_AVEncMPVDefaultBPictureCount, &mf::variant_u32(0));
     set_codec_value(api, &CODECAPI_AVLowLatencyMode, &mf::variant_bool(s.fast_preset));
     // Explicitly reset both modes; parked sessions retain their codec properties.
-    let speed = if s.fast_preset { 0 } else { 75 };
+    let speed = if s.fast_preset { 0 } else { 100 };
     set_codec_value(api, &CODECAPI_AVEncCommonQualityVsSpeed, &mf::variant_u32(speed));
 }
 
@@ -405,7 +411,7 @@ impl VideoEncoder {
                 if is_async {
                     attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1)?;
                 }
-                let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
+                let _ = attrs.SetUINT32(&MF_LOW_LATENCY, u32::from(s.fast_preset));
             }
         }
         let d3d_aware = hardware

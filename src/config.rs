@@ -269,18 +269,17 @@ impl Video {
 
     pub const FPS_CHOICES: [u32; 5] = [30, 60, 90, 120, 144];
 
-    /// Target bitrate for the given output size, scaled from 1080p60 reference values.
+    /// Target bitrate with constant bits per pixel per frame, up to the bitrate limits.
     pub fn bitrate_kbps(&self, width: u32, height: u32) -> u32 {
-        let reference = match self.quality {
-            Quality::Low => 7_000.0,
-            Quality::Medium => 14_000.0,
-            Quality::High => 28_000.0,
+        let bpp = match self.quality {
+            Quality::Low => 0.08,
+            Quality::Medium => 0.16,
+            Quality::High => 0.32,
             Quality::Custom => return self.custom_bitrate_kbps.clamp(500, 150_000),
         };
         let pixel_rate = f64::from(width) * f64::from(height) * f64::from(self.fps);
-        let scale = (pixel_rate / (1920.0 * 1080.0 * 60.0)).powf(0.75);
         let codec_factor = if self.codec == Codec::Hevc { 0.65 } else { 1.0 };
-        (reference * scale * codec_factor).clamp(1_000.0, 150_000.0) as u32
+        (bpp * pixel_rate * codec_factor / 1000.0).clamp(1_000.0, 150_000.0) as u32
     }
 }
 
@@ -428,8 +427,34 @@ mod tests {
     #[test]
     fn bitrate_scales_with_resolution() {
         let video = Video::default();
-        assert!(video.bitrate_kbps(1280, 720) < video.bitrate_kbps(1920, 1080));
+        for (width, height) in [(1280, 720), (1920, 1080), (2560, 1440)] {
+            let expected = 0.16 * f64::from(width) * f64::from(height) * 60.0 / 1000.0;
+            assert!((f64::from(video.bitrate_kbps(width, height)) - expected).abs() < 1.0);
+        }
         assert!(video.bitrate_kbps(2560, 1440) < 40_000);
+    }
+
+    #[test]
+    fn bitrate_preserves_bpp_across_fps_and_presets() {
+        for (quality, bpp) in [(Quality::Low, 0.08), (Quality::Medium, 0.16), (Quality::High, 0.32)] {
+            for fps in [30, 60, 144] {
+                let video = Video { quality, fps, codec: Codec::H264, ..Video::default() };
+                let expected = bpp * 1920.0 * 1080.0 * f64::from(fps) / 1000.0;
+                assert!((f64::from(video.bitrate_kbps(1920, 1080)) - expected).abs() < 1.0);
+            }
+        }
+        let mut video = Video { quality: Quality::High, fps: 144, ..Video::default() };
+        let h264 = video.bitrate_kbps(1920, 1080);
+        assert!((85_000..=110_000).contains(&h264));
+        video.codec = Codec::Hevc;
+        assert!((f64::from(video.bitrate_kbps(1920, 1080)) - f64::from(h264) * 0.65).abs() < 1.0);
+        assert_eq!(video.bitrate_kbps(7680, 4320), 150_000);
+        assert_eq!(video.bitrate_kbps(2, 2), 1_000);
+        video.quality = Quality::Custom;
+        video.custom_bitrate_kbps = 1;
+        assert_eq!(video.bitrate_kbps(1920, 1080), 500);
+        video.custom_bitrate_kbps = 200_000;
+        assert_eq!(video.bitrate_kbps(1920, 1080), 150_000);
     }
 
     #[test]

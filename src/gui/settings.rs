@@ -305,7 +305,7 @@ fn video_section(ui: &mut Ui, video: &mut Video, monitors: &[Monitor]) {
         });
         if video.quality == Quality::Custom {
             setting_row(ui, "Bitrate", "", |ui| {
-                ui.add(Slider::new(&mut video.custom_bitrate_kbps, 1_000..=100_000).suffix(" kbps").logarithmic(true))
+                ui.add(Slider::new(&mut video.custom_bitrate_kbps, 1_000..=150_000).suffix(" kbps").logarithmic(true))
             });
         }
         let (w, h) = output_for(video, monitors);

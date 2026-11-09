@@ -15,7 +15,7 @@ These are verified configuration issues/limitations, not a measured attribution 
 ## Files and behavior changed
 
 - `src/capture/convert.rs`: request optimal quality only when downscaling with a non-fast preset; retain speed preference for Low and unscaled conversion. Pass the preset into `Converter::new`; cover downscale, Low, native and upscale decisions with a unit test. Add the legacy BT.709 color-space fallback.
-- `src/capture/encoder.rs`: quality presets prefer unconstrained VBR, with peak-constrained VBR then CBR fallback. Low retains peak-constrained VBR then CBR. Set a maximum bitrate only for the peak-constrained mode. Request low latency only for Low, and QualityVsSpeed 75 for quality presets (0 for Low). Keep no B-frames and existing GOP/bitrate targets. Set BT.709 primaries, transfer and matrix plus limited range on both NV12 input and coded output media types.
+- `src/capture/encoder.rs`: quality presets now prefer Quality mode at 93, then peak-constrained VBR, unconstrained VBR and CBR. Quality mode requires acceptance of both the mode and quality value. Low retains peak-constrained VBR then CBR. Peak-constrained VBR requests mean=target and max=2×target. Both transform and CodecAPI low-latency settings now follow Low/fast only; QualityVsSpeed is 100 for quality presets and 0 for Low. Keep no B-frames, GOP=fps×2, High profile and BT.709 metadata.
 - `src/capture/video.rs`: only Low selects the fast path; Medium, High and Custom select quality behavior for both conversion and encoding. The sole `Converter::new` caller is updated.
 - `BLUR-FIX-REPORT.md` and `PR-BODY.md`: investigation, validation and review handoff.
 
@@ -50,3 +50,13 @@ No merge, tag or release is part of this change.
 ## Publication
 
 `gh pr create --base main --head fix/recording-sharpness --title 'Fix recording sharpness presets and align BT.709 color metadata' --body-file PR-BODY.md` was attempted and failed because GitHub CLI is unauthenticated. The branch is published separately using the requested noninteractive SSH push; use `PR-BODY.md` to open the PR after authentication. Remote Windows CI has not been verified.
+
+## Follow-up: 1080p144 sharpness
+
+Burak reported only a small improvement on a 1920×1080 / RTX 3080 Ti setup at H.264 High, 144 fps, with clips averaging roughly 21–30 Mbps. Code review confirmed that the old 28 Mbps 1080p60 High reference and pixel-rate exponent 0.75 reduced bits per pixel per frame as FPS increased (about 54 Mbps / 0.181 bpp at 1080p144). The transform also still forced MF_LOW_LATENCY=1, despite the quality-mode CodecAPI setting.
+
+Automatic bitrates now use width×height×fps×bpp/1000, with Low=0.08, Medium=0.16 and High=0.32 bpp, HEVC factor 0.65, and a 1,000–150,000 kbps clamp. H.264 High at 1080p144 targets 95,551 kbps (~95.6 Mbps). Custom retains its 500–150,000 kbps clamp; its UI slider now reaches 150,000. Constant-quality encoding remains content dependent and does not guarantee this average bitrate.
+
+Native conversion remains unchanged: quality processing only for downscaling with a non-fast preset, with NV12/4:2:0 retained. Park/reuse keys include bitrate and fast preset; reused sessions retain matching codec settings. GPU runtime and visual quality still need Windows PC verification.
+
+Follow-up validation on Linux: cargo fmt passed; cargo test --workspace passed (99 tests, zero failures; host dead-code warnings); Windows MSVC all-targets cargo check and cargo clippy with -D warnings both passed using -j 4. Added coverage for resolution/FPS bpp scaling, the 1080p144 High range, HEVC factor and bitrate clamps.
