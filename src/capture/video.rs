@@ -8,6 +8,7 @@ use super::gpu::Gpu;
 use super::screen::ScreenCapture;
 use super::{Packet, Shared, VideoFormat};
 use crate::config::{self, Codec};
+use crate::rate_policy::Profile as RateProfile;
 use crate::win::ComGuard;
 use qr_mp4::{ParamSets, VideoCodec};
 use std::collections::VecDeque;
@@ -97,6 +98,7 @@ struct State {
     windowed_cap: bool,
     bitrate_kbps: u32,
     fast_preset: bool,
+    rate: RateProfile,
     /// Pictures not yet accepted by the current encoder. Survives a busy submit, a second stall,
     /// and a failure to construct the replacement.
     recovery: VecDeque<encoder::HeldInput>,
@@ -137,10 +139,12 @@ fn init(settings: &config::Video) -> Result<State, String> {
         fps,
         bitrate_kbps: settings.bitrate_kbps(width, height),
         fast_preset: settings.quality == config::Quality::Low,
+        rate: RateProfile::for_quality(settings.quality),
         allow_hardware: !encoder::prefer_software(),
     };
     let bitrate_kbps = encoder_settings.bitrate_kbps;
     let fast_preset = encoder_settings.fast_preset;
+    let rate = encoder_settings.rate;
     let encoder = VideoEncoder::new(&gpu, &encoder_settings)?;
     let windowed_cap = settings.full_rate_only_fullscreen && i64::from(fps) > WINDOWED_FPS;
     Ok(State {
@@ -156,6 +160,7 @@ fn init(settings: &config::Video) -> Result<State, String> {
         windowed_cap,
         bitrate_kbps,
         fast_preset,
+        rate,
         recovery: VecDeque::new(),
     })
 }
@@ -312,6 +317,7 @@ fn open_replacement(s: &mut State, force_software: bool) -> Result<(), String> {
         fps: s.fps,
         bitrate_kbps: s.bitrate_kbps,
         fast_preset: s.fast_preset,
+        rate: s.rate,
         allow_hardware: !force_software && !encoder::prefer_software(),
     };
     s.encoder = VideoEncoder::new(&s.gpu, &settings)?;

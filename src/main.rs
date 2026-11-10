@@ -10,8 +10,12 @@ mod hotkey;
 mod icon;
 mod logger;
 mod organize;
+#[cfg(any(windows, test))]
+mod pacing_policy;
 mod paths;
 mod persist;
+#[cfg(any(windows, test))]
+mod rate_policy;
 mod safety;
 
 #[cfg(windows)]

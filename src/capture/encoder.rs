@@ -9,6 +9,7 @@
 use super::gpu::Gpu;
 use super::mf;
 use crate::config::Codec;
+use crate::rate_policy::{self, Mode as RateMode, Profile as RateProfile, Property as RateProperty};
 use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -58,6 +59,7 @@ pub struct VideoEncoder {
     fps: u32,
     bitrate_kbps: u32,
     fast_preset: bool,
+    rate: RateProfile,
     /// Held so a parked or buried MFT outlives the pipeline's `Gpu` clone.
     device: Option<ID3D11Device>,
     manager: Option<IMFDXGIDeviceManager>,
@@ -155,6 +157,8 @@ pub struct Settings {
     pub fps: u32,
     pub bitrate_kbps: u32,
     pub fast_preset: bool,
+    /// How the bitrate is used: Maximum must hand it to the driver as a target.
+    pub rate: RateProfile,
     /// When false, skip NVENC/AMF/Quick Sync and use the software H.264 encoder.
     pub allow_hardware: bool,
 }
@@ -245,35 +249,61 @@ fn set_codec_value(api: &ICodecAPI, key: &GUID, value: &windows::Win32::System::
     unsafe { api.SetValue(key, value) }.is_ok()
 }
 
-fn configure_codec_api(api: &ICodecAPI, s: &Settings) {
-    let bitrate = s.bitrate_kbps.saturating_mul(1000);
-    // Prefer constant quality; fall back to budgeted VBR when the driver rejects it.
-    let modes: &[_] = if s.fast_preset {
-        &[eAVEncCommonRateControlMode_PeakConstrainedVBR, eAVEncCommonRateControlMode_CBR]
-    } else {
-        &[
-            eAVEncCommonRateControlMode_Quality,
-            eAVEncCommonRateControlMode_PeakConstrainedVBR,
-            eAVEncCommonRateControlMode_UnconstrainedVBR,
-            eAVEncCommonRateControlMode_CBR,
-        ]
-    };
-    let mut selected = None;
-    for &mode in modes {
-        if set_codec_value(api, &CODECAPI_AVEncCommonRateControlMode, &mf::variant_u32(mode.0 as u32)) {
-            if mode == eAVEncCommonRateControlMode_Quality
-                && !set_codec_value(api, &CODECAPI_AVEncCommonQuality, &mf::variant_u32(93))
-            {
-                continue;
-            }
-            selected = Some(mode);
-            break;
-        }
+fn rate_mode_value(mode: RateMode) -> eAVEncCommonRateControlMode {
+    match mode {
+        RateMode::Cbr => eAVEncCommonRateControlMode_CBR,
+        RateMode::PeakConstrainedVbr => eAVEncCommonRateControlMode_PeakConstrainedVBR,
+        RateMode::UnconstrainedVbr => eAVEncCommonRateControlMode_UnconstrainedVBR,
+        RateMode::Quality => eAVEncCommonRateControlMode_Quality,
     }
-    log::info!("encoder rate control: {selected:?}, low latency: {}", s.fast_preset);
-    set_codec_value(api, &CODECAPI_AVEncCommonMeanBitRate, &mf::variant_u32(bitrate));
-    if selected == Some(eAVEncCommonRateControlMode_PeakConstrainedVBR) {
-        set_codec_value(api, &CODECAPI_AVEncCommonMaxBitRate, &mf::variant_u32(bitrate.saturating_mul(2)));
+}
+
+fn set_rate_property(api: &ICodecAPI, property: &RateProperty) -> bool {
+    let (key, value) = match *property {
+        RateProperty::RateControlMode(mode) => (&CODECAPI_AVEncCommonRateControlMode, rate_mode_value(mode).0 as u32),
+        RateProperty::MeanBitRate(bps) => (&CODECAPI_AVEncCommonMeanBitRate, bps),
+        RateProperty::MaxBitRate(bps) => (&CODECAPI_AVEncCommonMaxBitRate, bps),
+        RateProperty::BufferSize(bits) => (&CODECAPI_AVEncCommonBufferSize, bits),
+        RateProperty::Quality(quality) => (&CODECAPI_AVEncCommonQuality, quality),
+    };
+    let ok = set_codec_value(api, key, &mf::variant_u32(value));
+    if !ok {
+        log::info!("encoder rejected {property:?}");
+    }
+    ok
+}
+
+/// What the driver reports back, for the log. `None` when the property cannot be read.
+fn read_codec_u32(api: &ICodecAPI, key: &GUID) -> Option<u32> {
+    let value = unsafe { api.GetValue(key) }.ok()?;
+    u32::try_from(&value).ok()
+}
+
+/// Logged once the media types are set, so the log shows the values the driver kept.
+fn log_rate_control(api: &ICodecAPI) {
+    log::info!(
+        "encoder reports mode {:?}, mean {:?} bps, max {:?} bps, buffer {:?} bits, quality {:?}",
+        read_codec_u32(api, &CODECAPI_AVEncCommonRateControlMode),
+        read_codec_u32(api, &CODECAPI_AVEncCommonMeanBitRate),
+        read_codec_u32(api, &CODECAPI_AVEncCommonMaxBitRate),
+        read_codec_u32(api, &CODECAPI_AVEncCommonBufferSize),
+        read_codec_u32(api, &CODECAPI_AVEncCommonQuality),
+    );
+}
+
+fn configure_codec_api(api: &ICodecAPI, s: &Settings) {
+    let selected = rate_policy::apply(&rate_policy::plan(s.rate, s.bitrate_kbps), |p| set_rate_property(api, p));
+    log::info!(
+        "encoder rate control: {selected:?} ({:?}, target {} kbps), low latency: {}",
+        s.rate,
+        s.bitrate_kbps,
+        s.fast_preset
+    );
+    if s.rate == RateProfile::TargetBitrate && !rate_policy::honors_bitrate(selected) {
+        log::warn!(
+            "encoder accepted no bitrate-driven rate control; the {} kbps target will not be met",
+            s.bitrate_kbps
+        );
     }
     // Keyframes are forced once a second by time (frames are only sent when the screen changes);
     // the encoder's own interval is just a safety net.
@@ -480,6 +510,9 @@ impl VideoEncoder {
             }
             transform.SetInputType(input_id, &video_type(&MFVideoFormat_NV12, s)?, 0)?;
         }
+        if let Some(api) = &codec_api {
+            log_rate_control(api);
+        }
 
         let info = unsafe { transform.GetOutputStreamInfo(output_id)? };
         let provides_samples = info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0;
@@ -522,6 +555,7 @@ impl VideoEncoder {
             fps: s.fps,
             bitrate_kbps: s.bitrate_kbps,
             fast_preset: s.fast_preset,
+            rate: s.rate,
             device: d3d_aware.then(|| gpu.device.clone()),
             manager: d3d_aware.then(|| gpu.manager.clone()),
             device_ptr: gpu.device.as_raw() as usize,
@@ -977,6 +1011,7 @@ impl VideoEncoder {
             fps: self.fps,
             bitrate_kbps: self.bitrate_kbps,
             fast_preset: self.fast_preset,
+            rate: self.rate,
             device_ptr: self.device_ptr,
             sessions: self.sessions,
             born: self.born,
@@ -1086,6 +1121,7 @@ fn encoder_shell(codec: Codec, name: String, remote: Option<Remote>) -> VideoEnc
         fps: 0,
         bitrate_kbps: 0,
         fast_preset: false,
+        rate: RateProfile::ConstantQuality,
         device: None,
         manager: None,
         device_ptr: 0,
@@ -1226,6 +1262,7 @@ struct SessionKey {
     fps: u32,
     bitrate_kbps: u32,
     fast_preset: bool,
+    rate: RateProfile,
     device: usize,
 }
 
@@ -1255,6 +1292,7 @@ struct NativeParts {
     fps: u32,
     bitrate_kbps: u32,
     fast_preset: bool,
+    rate: RateProfile,
     device_ptr: usize,
     sessions: u32,
     born: Instant,
@@ -1272,6 +1310,7 @@ impl NativeParts {
             fps: self.fps,
             bitrate_kbps: self.bitrate_kbps,
             fast_preset: self.fast_preset,
+            rate: self.rate,
             device: self.device_ptr,
         }
     }
@@ -1297,6 +1336,7 @@ impl NativeParts {
             fps: self.fps,
             bitrate_kbps: self.bitrate_kbps,
             fast_preset: self.fast_preset,
+            rate: self.rate,
             device: self.device,
             manager: self.manager,
             device_ptr: self.device_ptr,
@@ -1320,6 +1360,7 @@ fn session_key(gpu: &Gpu, settings: &Settings) -> SessionKey {
         fps: settings.fps,
         bitrate_kbps: settings.bitrate_kbps,
         fast_preset: settings.fast_preset,
+        rate: settings.rate,
         device: gpu.device.as_raw() as usize,
     }
 }
@@ -2115,6 +2156,7 @@ mod tests {
 mod media_foundation {
     use super::VideoEncoder;
     use crate::config::Codec;
+    use crate::rate_policy::Profile as RateProfile;
     use crate::win::ComGuard;
     use qr_mp4::{annexb_to_sample, ParamSets, VideoCodec};
     use std::collections::VecDeque;
@@ -2149,6 +2191,7 @@ mod media_foundation {
             fps: 30,
             bitrate_kbps: 800,
             fast_preset: true,
+            rate: RateProfile::Fast,
             allow_hardware,
         }
     }

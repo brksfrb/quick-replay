@@ -65,7 +65,8 @@ impl ScreenCapture {
         // Optional features from newer Windows builds; older ones just keep their defaults.
         let _ = session.SetIsCursorCaptureEnabled(cursor);
         let _ = session.SetIsBorderRequired(false);
-        let interval = TimeSpan { Duration: super::clock::HNS_PER_SEC / i64::from(fps.max(1)) };
+        // Half the encode interval; an exact one dropped every other frame at 144 Hz.
+        let interval = TimeSpan { Duration: crate::pacing_policy::min_update_interval(fps) };
         let _ = session.SetMinUpdateInterval(interval);
         // Report which parts of the screen changed (Windows 11 24H2+), so tiny changes can be
         // encoded at a low frame rate.

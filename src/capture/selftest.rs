@@ -124,6 +124,7 @@ pub(crate) fn run(args: &[String]) -> Result<serde_json::Value, String> {
             fps,
             bitrate_kbps,
             fast_preset,
+            rate: crate::rate_policy::Profile::for_quality(quality),
             allow_hardware: !encoder::prefer_software(),
         },
     )?;
