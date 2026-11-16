@@ -1,6 +1,8 @@
 // QuickReplay: instant replays and screen recording from the system tray.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(any(windows, test))]
+mod capture_policy;
 mod config;
 #[cfg(any(windows, test))]
 mod conversion_policy;

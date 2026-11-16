@@ -50,30 +50,36 @@ pub fn list() -> Vec<Monitor> {
 /// True when the app in front covers the whole of `monitor` (fullscreen or borderless games,
 /// fullscreen video). The desktop and taskbar don't count.
 pub fn fullscreen_app_on(monitor: isize) -> bool {
+    foreground_on(monitor).1
+}
+
+/// The foreground window (0 if none) and whether it covers the whole of `monitor`.
+pub fn foreground_on(monitor: isize) -> (isize, bool) {
     use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONULL};
     use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetForegroundWindow, GetWindowRect};
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.is_invalid() {
-            return false;
+            return (0, false);
         }
+        let id = hwnd.0 as isize;
         let mut class = [0u16; 64];
         let len = GetClassNameW(hwnd, &mut class).max(0) as usize;
         let class = String::from_utf16_lossy(&class[..len]);
         if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
-            return false;
+            return (id, false);
         }
         let on = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
         if on.0 as isize != monitor {
-            return false;
+            return (id, false);
         }
         let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
         let mut rect = RECT::default();
         if !GetMonitorInfoW(on, &mut info).as_bool() || GetWindowRect(hwnd, &mut rect).is_err() {
-            return false;
+            return (id, false);
         }
         let m = info.rcMonitor;
-        rect.left <= m.left && rect.top <= m.top && rect.right >= m.right && rect.bottom >= m.bottom
+        (id, rect.left <= m.left && rect.top <= m.top && rect.right >= m.right && rect.bottom >= m.bottom)
     }
 }
 
@@ -82,16 +88,28 @@ pub fn fullscreen_app_on(monitor: isize) -> bool {
 /// the screen capture of such fullscreen apps stop updating (measured with a fullscreen OpenGL
 /// test window; Direct3D fullscreen apps are unaffected).
 pub fn foreground_uses_opengl() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_invalid() {
+        return false;
+    }
+    window_uses_opengl(hwnd.0 as isize).unwrap_or(true)
+}
+
+/// Whether the process that owns `hwnd` has opengl32.dll loaded; None when that can't be found
+/// out (protected processes).
+pub fn window_uses_opengl(hwnd: isize) -> Option<bool> {
+    use windows::Win32::Foundation::HWND;
     use windows::Win32::System::ProcessStatus::{EnumProcessModulesEx, GetModuleBaseNameW, LIST_MODULES_ALL};
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
-    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
     unsafe {
         let mut pid = 0u32;
-        GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid));
+        GetWindowThreadProcessId(HWND(hwnd as *mut _), Some(&mut pid));
         if pid == 0 {
-            return false;
+            return Some(false);
         }
-        let Ok(process) = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) else { return true };
+        let Ok(process) = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) else { return None };
         let mut modules = [windows::Win32::Foundation::HMODULE::default(); 1024];
         let mut needed = 0u32;
         let listed = EnumProcessModulesEx(
@@ -101,15 +119,16 @@ pub fn foreground_uses_opengl() -> bool {
             &mut needed,
             LIST_MODULES_ALL,
         );
-        let mut found = listed.is_err();
+        let mut found = None;
         if listed.is_ok() {
+            found = Some(false);
             let count =
                 (needed as usize / std::mem::size_of::<windows::Win32::Foundation::HMODULE>()).min(modules.len());
             for module in &modules[..count] {
                 let mut name = [0u16; 64];
                 let len = GetModuleBaseNameW(process, Some(*module), &mut name) as usize;
                 if String::from_utf16_lossy(&name[..len.min(name.len())]).eq_ignore_ascii_case("opengl32.dll") {
-                    found = true;
+                    found = Some(true);
                     break;
                 }
             }

@@ -3,10 +3,12 @@
 
 use super::clock::{Clock, HNS_PER_SEC};
 use super::convert::Converter;
+use super::duplication::DesktopDuplication;
 use super::encoder::{self, EncoderFault, VideoEncoder};
 use super::gpu::Gpu;
 use super::screen::ScreenCapture;
 use super::{Packet, Shared, VideoFormat};
+use crate::capture_policy::{Action, Backend, CaptureWatch, Front};
 use crate::config::{self, Codec};
 use crate::win::ComGuard;
 use qr_mp4::{ParamSets, VideoCodec};
@@ -48,6 +50,11 @@ static STALE_STREAK: AtomicU32 = AtomicU32::new(0);
 pub const STALE: &str = "screen capture went stale";
 /// How often to look at which app is in front.
 const FULLSCREEN_CHECK: i64 = HNS_PER_SEC;
+/// A lost Desktop Duplication (display mode switch) is reopened for this long before falling back
+/// to Windows.Graphics.Capture.
+const DUPLICATION_REOPEN: i64 = 5 * HNS_PER_SEC;
+/// A WGC session that closes again this soon after being reopened is not reopened again.
+const WGC_REOPEN_WINDOW: i64 = 10 * HNS_PER_SEC;
 /// A hardware encoder that has produced output this long counts as healthy.
 const HARDWARE_HEALTHY: i64 = 30 * HNS_PER_SEC;
 
@@ -83,9 +90,118 @@ impl Drop for Timer {
     }
 }
 
+/// The active screen capture: Windows.Graphics.Capture normally, Desktop Duplication while an
+/// OpenGL app is in exclusive fullscreen (see `capture_policy`).
+enum Source {
+    Wgc(ScreenCapture),
+    Duplication(DesktopDuplication),
+}
+
+impl Source {
+    fn open(gpu: &Gpu, backend: Backend, monitor: isize, cursor: bool, fps: u32) -> windows::core::Result<Source> {
+        Ok(match backend {
+            Backend::Wgc => Source::Wgc(ScreenCapture::new(gpu, monitor, cursor, fps)?),
+            Backend::Duplication => Source::Duplication(DesktopDuplication::new(gpu, monitor)?),
+        })
+    }
+
+    fn backend(&self) -> Backend {
+        match self {
+            Source::Wgc(_) => Backend::Wgc,
+            Source::Duplication(_) => Backend::Duplication,
+        }
+    }
+
+    fn size(&self) -> (u32, u32) {
+        match self {
+            Source::Wgc(c) => c.size(),
+            Source::Duplication(c) => c.size(),
+        }
+    }
+
+    /// The session can't deliver pictures any more and has to be reopened.
+    fn is_closed(&self) -> bool {
+        match self {
+            Source::Wgc(c) => c.is_closed(),
+            Source::Duplication(c) => c.is_lost(),
+        }
+    }
+
+    fn poll(&mut self, gpu: &Gpu) -> windows::core::Result<Option<f32>> {
+        match self {
+            Source::Wgc(c) => c.poll(gpu),
+            Source::Duplication(c) => c.poll(gpu),
+        }
+    }
+
+    fn has_frame(&self) -> bool {
+        match self {
+            Source::Wgc(c) => c.has_frame(),
+            Source::Duplication(c) => c.has_frame(),
+        }
+    }
+
+    fn take_frame(
+        &mut self,
+        use_frame: impl FnOnce(
+            &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+            u32,
+            u32,
+        ) -> windows::core::Result<()>,
+    ) -> windows::core::Result<bool> {
+        match self {
+            Source::Wgc(c) => c.take_frame(use_frame),
+            Source::Duplication(c) => c.take_frame(use_frame),
+        }
+    }
+
+    fn shutdown(&mut self) {
+        if let Source::Wgc(c) = self {
+            c.shutdown();
+        }
+    }
+}
+
+/// Opens a fresh capture session of `backend` and replaces the current one. The encoder, the
+/// converter and the replay buffer are untouched; a different picture size is scaled to the
+/// output size by the converter.
+fn reopen(s: &mut State, backend: Backend) -> Result<(), String> {
+    let fresh = Source::open(&s.gpu, backend, s.monitor, s.cursor, s.fps).map_err(|e| e.to_string())?;
+    let (old_w, old_h) = s.capture.size();
+    let (new_w, new_h) = fresh.size();
+    // Stop the old session's callback before its objects are freed.
+    s.capture.shutdown();
+    s.capture = fresh;
+    if (old_w, old_h) != (new_w, new_h) {
+        log::info!(
+            "screen capture size changed {old_w}x{old_h} -> {new_w}x{new_h} (output stays {}x{})",
+            s.width,
+            s.height
+        );
+    }
+    Ok(())
+}
+
+/// What is in front of the captured monitor. The OpenGL check opens the process, so it is only
+/// done for a fullscreen window and remembered per window.
+fn front_window(monitor: isize, opengl_cache: &mut (isize, bool)) -> Front {
+    let (hwnd, fullscreen) = crate::win::monitors::foreground_on(monitor);
+    let opengl = if fullscreen {
+        if opengl_cache.0 != hwnd {
+            // Unknown (protected process) counts as not OpenGL: Desktop Duplication is only for
+            // apps known to need it.
+            *opengl_cache = (hwnd, crate::win::monitors::window_uses_opengl(hwnd).unwrap_or(false));
+        }
+        opengl_cache.1
+    } else {
+        false
+    };
+    Front { hwnd, fullscreen, opengl }
+}
+
 struct State {
     gpu: Gpu,
-    capture: ScreenCapture,
+    capture: Source,
     converter: Converter,
     encoder: VideoEncoder,
     width: u32,
@@ -124,7 +240,7 @@ fn init(settings: &config::Video) -> Result<State, String> {
     let monitor = crate::win::monitors::find(&settings.monitor).ok_or("no monitor found")?;
     let gpu = Gpu::session().map_err(|e| format!("Direct3D 11 is unavailable: {e}"))?;
     let fps = settings.fps.clamp(10, 240);
-    let capture = ScreenCapture::new(&gpu, monitor.handle, settings.capture_cursor, fps)
+    let capture = Source::open(&gpu, Backend::Wgc, monitor.handle, settings.capture_cursor, fps)
         .map_err(|e| format!("screen capture failed to start: {e}"))?;
     let (src_w, src_h) = capture.size();
     let (width, height) = settings.output_size(src_w, src_h);
@@ -573,6 +689,11 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
     let mut hardware_ok = false;
     let mut current_submitted = false;
     let mut current_time = 0i64;
+    let mut watch = CaptureWatch::new(started);
+    let mut opengl_cache = (0isize, false);
+    let mut duplication_lost_since: Option<i64> = None;
+    let mut last_reopen_try = i64::MIN / 2;
+    let mut wgc_reopened_at = i64::MIN / 2;
 
     let result = (|| {
         while !stop.load(Ordering::Relaxed) {
@@ -595,27 +716,101 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
                     None => std::thread::sleep(std::time::Duration::from_nanos(wait as u64 * 100)),
                 }
             }
-            if s.capture.is_closed() {
-                return Err("the captured monitor was disconnected".into());
+            if s.capture.is_closed() && target - last_reopen_try >= HNS_PER_SEC {
+                last_reopen_try = target;
+                match s.capture.backend() {
+                    Backend::Wgc => {
+                        // The item closes when the monitor goes away, but also on some display
+                        // mode switches: try a new session on the same monitor before giving up.
+                        // A session that closes again right away means the monitor is really gone.
+                        let again = target - wgc_reopened_at < WGC_REOPEN_WINDOW;
+                        if again {
+                            log::warn!("screen capture closed again right after reopening");
+                            return Err("the captured monitor was disconnected".into());
+                        }
+                        if let Err(err) = reopen(&mut s, Backend::Wgc) {
+                            log::warn!("screen capture closed and could not be reopened: {err}");
+                            return Err("the captured monitor was disconnected".into());
+                        }
+                        log::info!("screen capture closed by Windows; reopened");
+                        wgc_reopened_at = target;
+                        watch.lost(target);
+                    }
+                    Backend::Duplication => {
+                        let since = *duplication_lost_since.get_or_insert(target);
+                        match reopen(&mut s, Backend::Duplication) {
+                            Ok(()) => {
+                                log::info!(
+                                    "desktop duplication reopened after {} ms",
+                                    (target - since) / (HNS_PER_SEC / 1000)
+                                );
+                                duplication_lost_since = None;
+                                watch.lost(target);
+                            }
+                            Err(err) if target - since >= DUPLICATION_REOPEN => {
+                                log::warn!(
+                                    "desktop duplication stays unavailable ({err}); back to Windows.Graphics.Capture"
+                                );
+                                duplication_lost_since = None;
+                                reopen(&mut s, Backend::Wgc)
+                                    .map_err(|e| format!("screen capture failed to start: {e}"))?;
+                                watch.duplication_failed(target);
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+                pending_key = true;
+                black_since = None;
             }
             if !stop.load(Ordering::Relaxed) && shared.take_capture_refresh() {
-                match ScreenCapture::new(&s.gpu, s.monitor, s.cursor, s.fps) {
-                    Ok(fresh) if fresh.size() == s.capture.size() => {
-                        // Stop the old session's callback before its objects are freed.
-                        s.capture.shutdown();
-                        s.capture = fresh;
+                let backend = s.capture.backend();
+                match reopen(&mut s, backend) {
+                    Ok(()) => {
                         black_since = None;
-                        log::info!("screen capture session refreshed");
+                        pending_key = true;
+                        watch.applied(
+                            crate::capture_policy::Action::Refresh(crate::capture_policy::Reason::Settled),
+                            true,
+                            target,
+                        );
+                        log::info!("screen capture session refreshed ({backend:?})");
                     }
-                    Ok(_) => return Err(STALE.into()),
                     Err(err) => log::warn!("couldn't refresh the screen capture: {err}"),
                 }
             }
 
-            let change = s.capture.poll(&s.gpu).map_err(|e| format!("capture failed: {e}"))?;
-            if s.windowed_cap && target - last_fullscreen_check >= FULLSCREEN_CHECK {
+            if target - last_fullscreen_check >= FULLSCREEN_CHECK {
                 last_fullscreen_check = target;
-                full_rate = crate::win::monitors::fullscreen_app_on(s.monitor);
+                let front = front_window(s.monitor, &mut opengl_cache);
+                if s.windowed_cap {
+                    full_rate = front.fullscreen;
+                }
+                if let Some(action) = watch.check(target, front, crate::win::input_idle_ms()) {
+                    let (backend, reason) = match action {
+                        Action::Switch(backend, reason) => (backend, reason),
+                        Action::Refresh(reason) => (s.capture.backend(), reason),
+                    };
+                    let from = s.capture.backend();
+                    match reopen(&mut s, backend) {
+                        Ok(()) => {
+                            log::info!("screen capture {from:?} -> {backend:?} ({reason}; front window {front:?})");
+                            watch.applied(action, true, target);
+                            duplication_lost_since = None;
+                            pending_key = true;
+                            black_since = None;
+                        }
+                        Err(err) => {
+                            log::warn!("screen capture {from:?} -> {backend:?} failed ({reason}): {err}");
+                            watch.applied(action, false, target);
+                        }
+                    }
+                }
+            }
+
+            let change = s.capture.poll(&s.gpu).map_err(|e| format!("capture failed: {e}"))?;
+            if change.is_some() {
+                watch.frame_arrived(target);
             }
             // Outside fullscreen apps, even big changes are encoded at most WINDOWED_FPS times a second.
             let min_gap = if full_rate { 0 } else { HNS_PER_SEC / WINDOWED_FPS - interval / 2 };

@@ -5,6 +5,7 @@ mod audio;
 mod buffer;
 mod clock;
 mod convert;
+mod duplication;
 pub(crate) mod encoder;
 mod gpu;
 mod mf;
