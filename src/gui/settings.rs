@@ -152,12 +152,12 @@ impl SettingsPage {
             ui.add_space(6.0);
             let mut remove = None;
             let count = config.replay.hotkeys.len();
-            for index in 0..count {
+            for (index, entry) in config.replay.hotkeys.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
-                    let current = config.replay.hotkeys[index].hotkey;
+                    let current = entry.hotkey;
                     self.hotkey_button(ui, Target::Replay(index), Some(current));
                     ui.label(RichText::new("saves the last").color(theme::TEXT_WEAK));
-                    let seconds = &mut config.replay.hotkeys[index].seconds;
+                    let seconds = &mut entry.seconds;
                     ComboBox::from_id_salt(("replay-length", index)).selected_text(length_label(*seconds)).show_ui(
                         ui,
                         |ui| {
