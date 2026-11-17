@@ -8,7 +8,10 @@ use super::encoder::{self, EncoderFault, VideoEncoder};
 use super::gpu::Gpu;
 use super::screen::ScreenCapture;
 use super::{Packet, Shared, VideoFormat};
-use crate::capture_policy::{Action, Backend, CaptureWatch, Front};
+use crate::capture_policy::{
+    external_refresh_needed, reopen_order, Action, Backend, CaptureWatch, DuplicationRecovery, Front, RecoveryNote,
+    ReopenOrder,
+};
 use crate::config::{self, Codec};
 use crate::win::ComGuard;
 use qr_mp4::{ParamSets, VideoCodec};
@@ -50,9 +53,6 @@ static STALE_STREAK: AtomicU32 = AtomicU32::new(0);
 pub const STALE: &str = "screen capture went stale";
 /// How often to look at which app is in front.
 const FULLSCREEN_CHECK: i64 = HNS_PER_SEC;
-/// A lost Desktop Duplication (display mode switch) is reopened for this long before falling back
-/// to Windows.Graphics.Capture.
-const DUPLICATION_REOPEN: i64 = 5 * HNS_PER_SEC;
 /// A WGC session that closes again this soon after being reopened is not reopened again.
 const WGC_REOPEN_WINDOW: i64 = 10 * HNS_PER_SEC;
 /// A hardware encoder that has produced output this long counts as healthy.
@@ -156,8 +156,16 @@ impl Source {
     }
 
     fn shutdown(&mut self) {
-        if let Source::Wgc(c) = self {
-            c.shutdown();
+        match self {
+            Source::Wgc(c) => c.shutdown(),
+            Source::Duplication(c) => c.release(),
+        }
+    }
+
+    fn lost_cause(&mut self) -> Option<String> {
+        match self {
+            Source::Wgc(_) => None,
+            Source::Duplication(c) => c.take_lost_cause(),
         }
     }
 }
@@ -165,13 +173,23 @@ impl Source {
 /// Opens a fresh capture session of `backend` and replaces the current one. The encoder, the
 /// converter and the replay buffer are untouched; a different picture size is scaled to the
 /// output size by the converter.
+///
+/// Duplication -> Duplication releases the old duplication first (see `reopen_order`); if the new
+/// one can't be created, the source stays a released duplication (`is_closed`), which the caller
+/// keeps reopening with backoff instead of falling back to WGC. Everything else opens the new
+/// session first and keeps the old one when that fails.
 fn reopen(s: &mut State, backend: Backend) -> Result<(), String> {
-    let fresh = Source::open(&s.gpu, backend, s.monitor, s.cursor, s.fps).map_err(|e| e.to_string())?;
     let (old_w, old_h) = s.capture.size();
-    let (new_w, new_h) = fresh.size();
-    // Stop the old session's callback before its objects are freed.
-    s.capture.shutdown();
-    s.capture = fresh;
+    match (reopen_order(s.capture.backend(), backend), &mut s.capture) {
+        (ReopenOrder::ReleaseOldFirst, Source::Duplication(dd)) => dd.restart(&s.gpu).map_err(|e| e.to_string())?,
+        _ => {
+            let fresh = Source::open(&s.gpu, backend, s.monitor, s.cursor, s.fps).map_err(|e| e.to_string())?;
+            // Stop the old session's callback before its objects are freed.
+            s.capture.shutdown();
+            s.capture = fresh;
+        }
+    }
+    let (new_w, new_h) = s.capture.size();
     if (old_w, old_h) != (new_w, new_h) {
         log::info!(
             "screen capture size changed {old_w}x{old_h} -> {new_w}x{new_h} (output stays {}x{})",
@@ -180,6 +198,25 @@ fn reopen(s: &mut State, backend: Backend) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn log_recovery(note: RecoveryNote, detail: Option<&str>) {
+    let detail = detail.map(|d| format!(" ({d})")).unwrap_or_default();
+    match note {
+        RecoveryNote::Lost => log::info!("desktop duplication lost{detail}; reopening"),
+        RecoveryNote::KeepsLosing { losses, seconds } => log::warn!(
+            "desktop duplication lost again right after reopening ({losses} times in {seconds} s){detail}; backing off"
+        ),
+        RecoveryNote::Reopened { after_ms, attempts } => {
+            log::info!("desktop duplication reopened after {after_ms} ms ({attempts} attempt(s))")
+        }
+        RecoveryNote::ReopenFailing { attempts, seconds } => log::warn!(
+            "desktop duplication can't be reopened yet{detail}; {attempts} attempt(s) in {seconds} s, retrying with backoff"
+        ),
+        RecoveryNote::Recovered { losses, attempts, seconds } => log::info!(
+            "desktop duplication stable again: {losses} losses, {attempts} reopen attempt(s) over {seconds} s"
+        ),
+    }
 }
 
 /// What is in front of the captured monitor. The OpenGL check opens the process, so it is only
@@ -691,7 +728,7 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
     let mut current_time = 0i64;
     let mut watch = CaptureWatch::new(started);
     let mut opengl_cache = (0isize, false);
-    let mut duplication_lost_since: Option<i64> = None;
+    let mut recovery = DuplicationRecovery::default();
     let mut last_reopen_try = i64::MIN / 2;
     let mut wgc_reopened_at = i64::MIN / 2;
 
@@ -716,67 +753,78 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
                     None => std::thread::sleep(std::time::Duration::from_nanos(wait as u64 * 100)),
                 }
             }
-            if s.capture.is_closed() && target - last_reopen_try >= HNS_PER_SEC {
-                last_reopen_try = target;
-                match s.capture.backend() {
-                    Backend::Wgc => {
-                        // The item closes when the monitor goes away, but also on some display
-                        // mode switches: try a new session on the same monitor before giving up.
-                        // A session that closes again right away means the monitor is really gone.
-                        let again = target - wgc_reopened_at < WGC_REOPEN_WINDOW;
-                        if again {
-                            log::warn!("screen capture closed again right after reopening");
-                            return Err("the captured monitor was disconnected".into());
-                        }
-                        if let Err(err) = reopen(&mut s, Backend::Wgc) {
-                            log::warn!("screen capture closed and could not be reopened: {err}");
-                            return Err("the captured monitor was disconnected".into());
-                        }
-                        log::info!("screen capture closed by Windows; reopened");
-                        wgc_reopened_at = target;
-                        watch.lost(target);
+            match s.capture.backend() {
+                Backend::Wgc if s.capture.is_closed() && target - last_reopen_try >= HNS_PER_SEC => {
+                    last_reopen_try = target;
+                    // The item closes when the monitor goes away, but also on some display mode
+                    // switches: try a new session on the same monitor before giving up. A session
+                    // that closes again right away means the monitor is really gone.
+                    let again = target - wgc_reopened_at < WGC_REOPEN_WINDOW;
+                    if again {
+                        log::warn!("screen capture closed again right after reopening");
+                        return Err("the captured monitor was disconnected".into());
                     }
-                    Backend::Duplication => {
-                        let since = *duplication_lost_since.get_or_insert(target);
+                    if let Err(err) = reopen(&mut s, Backend::Wgc) {
+                        log::warn!("screen capture closed and could not be reopened: {err}");
+                        return Err("the captured monitor was disconnected".into());
+                    }
+                    log::info!("screen capture closed by Windows; reopened");
+                    wgc_reopened_at = target;
+                    watch.lost(target);
+                    pending_key = true;
+                    black_since = None;
+                }
+                Backend::Wgc => {}
+                Backend::Duplication if s.capture.is_closed() => {
+                    // Lost (mode switch, secure desktop) or a restart that failed. Reopen with
+                    // backoff and stay on duplication: WGC would hide the game's cursor and freeze.
+                    let step = recovery.lost(target);
+                    let cause = s.capture.lost_cause();
+                    if let Some(note) = step.note {
+                        log_recovery(note, cause.as_deref());
+                    }
+                    if step.try_now {
                         match reopen(&mut s, Backend::Duplication) {
                             Ok(()) => {
-                                log::info!(
-                                    "desktop duplication reopened after {} ms",
-                                    (target - since) / (HNS_PER_SEC / 1000)
-                                );
-                                duplication_lost_since = None;
+                                if let Some(note) = recovery.reopened(target) {
+                                    log_recovery(note, None);
+                                }
                                 watch.lost(target);
+                                pending_key = true;
+                                black_since = None;
                             }
-                            Err(err) if target - since >= DUPLICATION_REOPEN => {
-                                log::warn!(
-                                    "desktop duplication stays unavailable ({err}); back to Windows.Graphics.Capture"
-                                );
-                                duplication_lost_since = None;
-                                reopen(&mut s, Backend::Wgc)
-                                    .map_err(|e| format!("screen capture failed to start: {e}"))?;
-                                watch.duplication_failed(target);
+                            Err(err) => {
+                                if let Some(note) = recovery.failed(target) {
+                                    log_recovery(note, Some(&err));
+                                }
                             }
-                            Err(_) => {}
                         }
                     }
                 }
-                pending_key = true;
-                black_since = None;
+                Backend::Duplication => {
+                    if let Some(note) = recovery.tick(target) {
+                        log_recovery(note, None);
+                    }
+                }
             }
             if !stop.load(Ordering::Relaxed) && shared.take_capture_refresh() {
                 let backend = s.capture.backend();
-                match reopen(&mut s, backend) {
-                    Ok(()) => {
-                        black_since = None;
-                        pending_key = true;
-                        watch.applied(
-                            crate::capture_policy::Action::Refresh(crate::capture_policy::Reason::Settled),
-                            true,
-                            target,
-                        );
-                        log::info!("screen capture session refreshed ({backend:?})");
+                if external_refresh_needed(backend) {
+                    match reopen(&mut s, backend) {
+                        Ok(()) => {
+                            black_since = None;
+                            pending_key = true;
+                            watch.applied(
+                                crate::capture_policy::Action::Refresh(crate::capture_policy::Reason::Settled),
+                                true,
+                                target,
+                            );
+                            log::info!("screen capture session refreshed ({backend:?})");
+                        }
+                        Err(err) => log::warn!("couldn't refresh the screen capture: {err}"),
                     }
-                    Err(err) => log::warn!("couldn't refresh the screen capture: {err}"),
+                } else {
+                    log::debug!("capture refresh skipped: desktop duplication is not affected");
                 }
             }
 
@@ -796,12 +844,15 @@ fn run(mut s: State, clock: Clock, shared: &Shared, stop: &AtomicBool) -> Result
                         Ok(()) => {
                             log::info!("screen capture {from:?} -> {backend:?} ({reason}; front window {front:?})");
                             watch.applied(action, true, target);
-                            duplication_lost_since = None;
+                            recovery.reset();
                             pending_key = true;
                             black_since = None;
                         }
                         Err(err) => {
-                            log::warn!("screen capture {from:?} -> {backend:?} failed ({reason}): {err}");
+                            // A duplication whose restart failed is released now and gets reopened
+                            // by `recovery` (still Duplication, never WGC).
+                            let note = if s.capture.is_closed() { "; reopening with backoff" } else { "" };
+                            log::warn!("screen capture {from:?} -> {backend:?} failed ({reason}): {err}{note}");
                             watch.applied(action, false, target);
                         }
                     }

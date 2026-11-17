@@ -23,8 +23,22 @@ pub const ACTIVE_INPUT_MS: u32 = 3_000;
 /// Wait between stall refreshes; doubles while refreshes don't bring pictures back.
 pub const STALL_BACKOFF_MIN: i64 = 10 * HNS_PER_SEC;
 pub const STALL_BACKOFF_MAX: i64 = 5 * 60 * HNS_PER_SEC;
-/// After Desktop Duplication fails to start, stay on WGC this long before trying again.
-pub const DUPLICATION_RETRY: i64 = 60 * HNS_PER_SEC;
+/// After Desktop Duplication fails to start, stay on WGC this long before trying again; doubles
+/// with every failure in a row (the start often fails only while the game is still switching
+/// display modes after F11).
+pub const DUPLICATION_RETRY_MIN: i64 = 2 * HNS_PER_SEC;
+pub const DUPLICATION_RETRY_MAX: i64 = 60 * HNS_PER_SEC;
+/// A lost Desktop Duplication is reopened right away the first time, then after this long,
+/// doubling up to `REOPEN_MAX` while reopening fails or the new session is lost again.
+pub const REOPEN_MIN: i64 = HNS_PER_SEC / 4;
+pub const REOPEN_MAX: i64 = 5 * HNS_PER_SEC;
+/// A reopened duplication that lasts this long ends the loss episode (and its backoff).
+pub const REOPEN_STABLE: i64 = 10 * HNS_PER_SEC;
+/// While a duplication keeps failing or getting lost, a reminder is logged at most this often.
+pub const REOPEN_LOG_EVERY: i64 = 60 * HNS_PER_SEC;
+
+/// `DXGI_ERROR_WAIT_TIMEOUT`: no new picture within the wait. Normal, not a loss.
+pub const HR_WAIT_TIMEOUT: i32 = 0x887A_0027_u32 as i32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
@@ -94,6 +108,7 @@ pub struct CaptureWatch {
     next_stall_refresh: i64,
     stall_backoff: i64,
     duplication_blocked_until: i64,
+    duplication_retry: i64,
 }
 
 impl CaptureWatch {
@@ -107,6 +122,7 @@ impl CaptureWatch {
             next_stall_refresh: now,
             stall_backoff: STALL_BACKOFF_MIN,
             duplication_blocked_until: i64::MIN,
+            duplication_retry: DUPLICATION_RETRY_MIN,
         }
     }
 
@@ -122,21 +138,24 @@ impl CaptureWatch {
     }
 
     /// The caller carried out `action` (or tried to). `ok == false` for a failed switch to
-    /// Desktop Duplication keeps WGC and blocks retries for a while.
+    /// Desktop Duplication keeps WGC and blocks retries for a while (growing with each failure).
+    /// A failed refresh of a duplication leaves it released: the caller's `DuplicationRecovery`
+    /// reopens it, the backend stays Duplication (WGC would hide the game's cursor again).
     pub fn applied(&mut self, action: Action, ok: bool, now: i64) {
         match action {
-            Action::Switch(backend, _) if ok => self.backend = backend,
-            Action::Switch(Backend::Duplication, _) => self.duplication_blocked_until = now + DUPLICATION_RETRY,
+            Action::Switch(backend, _) if ok => {
+                self.backend = backend;
+                if backend == Backend::Duplication {
+                    self.duplication_retry = DUPLICATION_RETRY_MIN;
+                }
+            }
+            Action::Switch(Backend::Duplication, _) => {
+                self.duplication_blocked_until = now + self.duplication_retry;
+                self.duplication_retry = (self.duplication_retry * 2).min(DUPLICATION_RETRY_MAX);
+            }
             _ => {}
         }
         // A fresh session gets the full stall window before it is judged.
-        self.last_frame = now;
-    }
-
-    /// Desktop Duplication could not be kept running; the caller went back to WGC.
-    pub fn duplication_failed(&mut self, now: i64) {
-        self.backend = Backend::Wgc;
-        self.duplication_blocked_until = now + DUPLICATION_RETRY;
         self.last_frame = now;
     }
 
@@ -164,7 +183,10 @@ impl CaptureWatch {
                             self.second_refresh_at = Some(now + SECOND_REFRESH);
                             return Some(action);
                         }
-                        if relevant_change(applied, front) {
+                        // Desktop Duplication follows the monitor, not a window: a recreated
+                        // fullscreen window needs no new session (a mode switch shows up as a
+                        // lost duplication instead).
+                        if relevant_change(applied, front) && self.backend == Backend::Wgc {
                             self.second_refresh_at = Some(now + SECOND_REFRESH);
                             return Some(Action::Refresh(Reason::FullscreenChanged));
                         }
@@ -179,9 +201,13 @@ impl CaptureWatch {
         if let Some(at) = self.second_refresh_at {
             if now >= at {
                 self.second_refresh_at = None;
-                return Some(
-                    self.backend_action(front, now, Reason::Settled).unwrap_or(Action::Refresh(Reason::Settled)),
-                );
+                if let Some(action) = self.backend_action(front, now, Reason::Settled) {
+                    return Some(action);
+                }
+                // A late display mode switch invalidates a duplication by itself (reported as lost
+                // and reopened then); refreshing a healthy one only drops pictures. 0.1.8 did, and
+                // its new session failed with E_INVALIDARG while the old one was still held.
+                return (self.backend == Backend::Wgc).then_some(Action::Refresh(Reason::Settled));
             }
             return None;
         }
@@ -213,6 +239,201 @@ impl CaptureWatch {
 /// its window on every F11). Ordinary window switching on the desktop is not worth a refresh.
 fn relevant_change(old: Front, new: Front) -> bool {
     old.fullscreen != new.fullscreen || (new.fullscreen && old.hwnd != new.hwnd)
+}
+
+/// Order of operations when one capture session replaces another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReopenOrder {
+    /// Open the new session, then shut the old one down: a failed open keeps the old session.
+    OpenNewFirst,
+    /// Release the old session before opening the new one. DXGI allows one
+    /// `IDXGIOutputDuplication` per output and process: `DuplicateOutput` fails with
+    /// E_INVALIDARG while the old one is alive, and releasing the old one after a successful
+    /// open invalidates the new one (ACCESS_LOST on its first frame).
+    ReleaseOldFirst,
+}
+
+pub fn reopen_order(from: Backend, to: Backend) -> ReopenOrder {
+    if from == Backend::Duplication && to == Backend::Duplication {
+        ReopenOrder::ReleaseOldFirst
+    } else {
+        ReopenOrder::OpenNewFirst
+    }
+}
+
+/// The service asks for a fresh session when an OpenGL fullscreen app shows up (windows hidden
+/// from WGC can leave its capture frozen). Desktop Duplication is not affected by that, and a
+/// lost one is already being reopened by `DuplicationRecovery`.
+pub fn external_refresh_needed(backend: Backend) -> bool {
+    backend == Backend::Wgc
+}
+
+/// What `IDXGIOutputDuplication::AcquireNextFrame` failing with `hresult` means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcquireFailure {
+    /// No new picture yet: keep the session and the last picture.
+    NoNewFrame,
+    /// ACCESS_LOST (mode switch, secure desktop, fullscreen transition) or anything else the
+    /// session can't continue from: release it and reopen.
+    Lost,
+}
+
+pub fn acquire_failure(hresult: i32) -> AcquireFailure {
+    if hresult == HR_WAIT_TIMEOUT {
+        AcquireFailure::NoNewFrame
+    } else {
+        AcquireFailure::Lost
+    }
+}
+
+/// What the caller should log about a lost Desktop Duplication. Everything else stays quiet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryNote {
+    /// A loss episode started.
+    Lost,
+    /// The session keeps getting lost right after being reopened.
+    KeepsLosing { losses: u32, seconds: i64 },
+    /// First successful reopen in this episode.
+    Reopened { after_ms: i64, attempts: u32 },
+    /// Reopening failed (first failure, then a reminder at most every `REOPEN_LOG_EVERY`).
+    ReopenFailing { attempts: u32, seconds: i64 },
+    /// The episode ended after more than one loss.
+    Recovered { losses: u32, attempts: u32, seconds: i64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LostStep {
+    pub note: Option<RecoveryNote>,
+    /// Reopen now (otherwise wait: backoff).
+    pub try_now: bool,
+}
+
+/// Reopening a lost Desktop Duplication with backoff and quiet logging. It never gives up on
+/// duplication while it is the wanted backend: WGC would hide the game's cursor and freeze.
+#[derive(Default)]
+pub struct DuplicationRecovery {
+    episode: Option<Episode>,
+}
+
+struct Episode {
+    started: i64,
+    losses: u32,
+    attempts: u32,
+    failures: u32,
+    /// Lost and not reopened yet.
+    waiting: bool,
+    delay: i64,
+    next_try: i64,
+    last_ok: Option<i64>,
+    last_note: Option<i64>,
+}
+
+fn next_delay(delay: i64) -> i64 {
+    if delay == 0 {
+        REOPEN_MIN
+    } else {
+        (delay * 2).min(REOPEN_MAX)
+    }
+}
+
+impl Episode {
+    /// Reminders are rate-limited; the first note of each kind is always logged.
+    fn note_due(&mut self, now: i64) -> bool {
+        let due = self.last_note.is_none_or(|at| now - at >= REOPEN_LOG_EVERY);
+        if due {
+            self.last_note = Some(now);
+        }
+        due
+    }
+}
+
+impl DuplicationRecovery {
+    /// Call on every loop pass while the duplication is lost (or released).
+    pub fn lost(&mut self, now: i64) -> LostStep {
+        if self.episode.as_ref().is_some_and(|ep| !ep.waiting && ep.last_ok.is_some_and(|ok| now - ok >= REOPEN_STABLE))
+        {
+            self.episode = None;
+        }
+        let mut note = None;
+        let ep = self.episode.get_or_insert_with(|| {
+            note = Some(RecoveryNote::Lost);
+            Episode {
+                started: now,
+                losses: 0,
+                attempts: 0,
+                failures: 0,
+                waiting: false,
+                delay: 0,
+                next_try: now,
+                last_ok: None,
+                last_note: Some(now),
+            }
+        });
+        if !ep.waiting {
+            ep.waiting = true;
+            ep.losses += 1;
+            if ep.losses > 1 {
+                // Lost again soon after a reopen: don't reopen in a tight loop.
+                ep.delay = next_delay(ep.delay);
+                ep.next_try = now + ep.delay;
+                if ep.note_due(now) || ep.losses == 2 {
+                    note = Some(RecoveryNote::KeepsLosing {
+                        losses: ep.losses,
+                        seconds: (now - ep.started) / HNS_PER_SEC,
+                    });
+                }
+            }
+        }
+        LostStep { note, try_now: now >= ep.next_try }
+    }
+
+    /// The reopen asked for by `lost` succeeded.
+    pub fn reopened(&mut self, now: i64) -> Option<RecoveryNote> {
+        let ep = self.episode.as_mut()?;
+        ep.attempts += 1;
+        ep.waiting = false;
+        let first = ep.last_ok.is_none();
+        ep.last_ok = Some(now);
+        first.then_some(RecoveryNote::Reopened {
+            after_ms: (now - ep.started) / (HNS_PER_SEC / 1000),
+            attempts: ep.attempts,
+        })
+    }
+
+    /// The reopen asked for by `lost` failed; the duplication stays released.
+    pub fn failed(&mut self, now: i64) -> Option<RecoveryNote> {
+        let ep = self.episode.as_mut()?;
+        ep.attempts += 1;
+        ep.failures += 1;
+        ep.delay = next_delay(ep.delay);
+        ep.next_try = now + ep.delay;
+        (ep.note_due(now) || ep.failures == 1)
+            .then_some(RecoveryNote::ReopenFailing { attempts: ep.attempts, seconds: (now - ep.started) / HNS_PER_SEC })
+    }
+
+    /// Call while the duplication is healthy. Ends an episode once the reopened session lasted.
+    pub fn tick(&mut self, now: i64) -> Option<RecoveryNote> {
+        let ep = self.episode.as_ref()?;
+        if ep.waiting || ep.last_ok.is_none_or(|ok| now - ok < REOPEN_STABLE) {
+            return None;
+        }
+        let ep = self.episode.take()?;
+        (ep.losses > 1).then_some(RecoveryNote::Recovered {
+            losses: ep.losses,
+            attempts: ep.attempts,
+            seconds: (now - ep.started) / HNS_PER_SEC,
+        })
+    }
+
+    /// A different session took over (backend switch or a fresh duplication from the policy).
+    pub fn reset(&mut self) {
+        self.episode = None;
+    }
+
+    #[cfg(test)]
+    fn waiting(&self) -> bool {
+        self.episode.as_ref().is_some_and(|ep| ep.waiting)
+    }
 }
 
 #[cfg(test)]
@@ -260,9 +481,8 @@ mod tests {
         assert!(run(&mut w, MC_WINDOWED, 0, 10 * S, true).is_empty());
         // F11: new fullscreen window. Wait SETTLE, then switch.
         let actions = run(&mut w, MC_FULLSCREEN, 10 * S, 30 * S, true);
-        assert_eq!(actions[0], (11 * S, Action::Switch(Backend::Duplication, Reason::FullscreenChanged)));
-        assert_eq!(actions[1].1, Action::Refresh(Reason::Settled));
-        assert_eq!(actions.len(), 2);
+        // No settle refresh of a healthy duplication (0.1.8 did one, and it failed).
+        assert_eq!(actions, vec![(11 * S, Action::Switch(Backend::Duplication, Reason::FullscreenChanged))]);
         assert_eq!(w.backend(), Backend::Duplication);
         // F11 again: back to WGC.
         let actions = run(&mut w, MC_WINDOWED, 30 * S, 50 * S, true);
@@ -316,31 +536,166 @@ mod tests {
     }
 
     #[test]
-    fn duplication_lost_for_good_falls_back_to_wgc() {
+    fn d3d_fullscreen_on_wgc_still_gets_settle_refresh() {
         let mut w = CaptureWatch::new(0);
-        run(&mut w, MC_FULLSCREEN, 0, 10 * S, true);
-        assert_eq!(w.backend(), Backend::Duplication);
-        w.duplication_failed(10 * S);
-        assert_eq!(w.backend(), Backend::Wgc);
-        // Retried once the block expires, not before.
-        let actions = run(&mut w, MC_FULLSCREEN, 11 * S, 80 * S, true);
-        assert_eq!(actions, vec![(70 * S, Action::Switch(Backend::Duplication, Reason::FullscreenChanged))]);
+        run(&mut w, DESKTOP, 0, 5 * S, true);
+        let actions = run(&mut w, D3D_FULLSCREEN, 5 * S, 20 * S, true);
+        assert_eq!(
+            actions,
+            vec![(6 * S, Action::Refresh(Reason::FullscreenChanged)), (10 * S, Action::Refresh(Reason::Settled))]
+        );
     }
 
     #[test]
-    fn failed_duplication_stays_on_wgc_then_retries() {
+    fn recreated_opengl_fullscreen_window_keeps_duplication_session() {
         let mut w = CaptureWatch::new(0);
-        let first = w.check(0, MC_FULLSCREEN, ACTIVE).unwrap();
-        assert_eq!(first, Action::Switch(Backend::Duplication, Reason::FullscreenChanged));
-        w.applied(first, false, 0);
-        assert_eq!(w.backend(), Backend::Wgc);
-        for t in 1..60 {
-            w.frame_arrived(t * S);
-            assert_eq!(w.check(t * S, MC_FULLSCREEN, ACTIVE), None, "at {t}s");
-        }
+        run(&mut w, MC_FULLSCREEN, 0, 10 * S, true);
+        assert_eq!(w.backend(), Backend::Duplication);
+        // LWJGL2 replaces its fullscreen window: the duplication follows the monitor.
+        let replaced = Front { hwnd: 12, ..MC_FULLSCREEN };
+        assert!(run(&mut w, replaced, 10 * S, 30 * S, true).is_empty());
+        assert_eq!(w.backend(), Backend::Duplication);
+    }
+
+    #[test]
+    fn alt_tab_out_and_back_switches_once_each_way() {
+        let mut w = CaptureWatch::new(0);
+        run(&mut w, MC_FULLSCREEN, 0, 10 * S, true);
+        let out = run(&mut w, DESKTOP, 10 * S, 20 * S, true);
         assert_eq!(
-            w.check(60 * S, MC_FULLSCREEN, ACTIVE),
-            Some(Action::Switch(Backend::Duplication, Reason::FullscreenChanged))
+            out,
+            vec![
+                (11 * S, Action::Switch(Backend::Wgc, Reason::FullscreenChanged)),
+                (15 * S, Action::Refresh(Reason::Settled))
+            ]
         );
+        let back = run(&mut w, MC_FULLSCREEN, 20 * S, 40 * S, true);
+        assert_eq!(back, vec![(21 * S, Action::Switch(Backend::Duplication, Reason::FullscreenChanged))]);
+    }
+
+    #[test]
+    fn failed_duplication_retries_with_growing_backoff() {
+        let mut w = CaptureWatch::new(0);
+        let mut tries = Vec::new();
+        for t in 0..200 {
+            w.frame_arrived(t * S);
+            if let Some(action) = w.check(t * S, MC_FULLSCREEN, ACTIVE) {
+                assert_eq!(action, Action::Switch(Backend::Duplication, Reason::FullscreenChanged));
+                // Fails until 100 s.
+                w.applied(action, t >= 100, t * S);
+                tries.push(t);
+            }
+        }
+        assert_eq!(tries, vec![0, 2, 6, 14, 30, 62, 122]);
+        assert_eq!(w.backend(), Backend::Duplication);
+        // Success resets the backoff.
+        assert_eq!(w.duplication_retry, DUPLICATION_RETRY_MIN);
+    }
+
+    #[test]
+    fn duplication_is_reopened_release_first() {
+        assert_eq!(reopen_order(Backend::Duplication, Backend::Duplication), ReopenOrder::ReleaseOldFirst);
+        assert_eq!(reopen_order(Backend::Wgc, Backend::Duplication), ReopenOrder::OpenNewFirst);
+        assert_eq!(reopen_order(Backend::Duplication, Backend::Wgc), ReopenOrder::OpenNewFirst);
+        assert_eq!(reopen_order(Backend::Wgc, Backend::Wgc), ReopenOrder::OpenNewFirst);
+    }
+
+    #[test]
+    fn external_refresh_skips_duplication() {
+        assert!(external_refresh_needed(Backend::Wgc));
+        assert!(!external_refresh_needed(Backend::Duplication));
+    }
+
+    #[test]
+    fn wait_timeout_is_not_access_lost() {
+        assert_eq!(acquire_failure(HR_WAIT_TIMEOUT), AcquireFailure::NoNewFrame);
+        let access_lost = 0x887A_0026_u32 as i32;
+        assert_eq!(acquire_failure(access_lost), AcquireFailure::Lost);
+        let invalid_call = 0x887A_0001_u32 as i32;
+        assert_eq!(acquire_failure(invalid_call), AcquireFailure::Lost);
+    }
+
+    #[test]
+    fn single_loss_reopens_immediately_with_two_log_lines() {
+        let mut r = DuplicationRecovery::default();
+        let step = r.lost(100 * S);
+        assert_eq!(step, LostStep { note: Some(RecoveryNote::Lost), try_now: true });
+        assert_eq!(r.reopened(100 * S), Some(RecoveryNote::Reopened { after_ms: 0, attempts: 1 }));
+        for t in 101..200 {
+            assert_eq!(r.tick(t * S), None);
+        }
+        // Lost again much later: a new episode, reopened right away again.
+        assert_eq!(r.lost(300 * S), LostStep { note: Some(RecoveryNote::Lost), try_now: true });
+    }
+
+    /// The 0.1.8 log: the reopened duplication was lost again on every poll and reopened once a
+    /// second, 127 times in a row, with a log line each time.
+    #[test]
+    fn repeated_losses_back_off_and_log_little() {
+        let mut r = DuplicationRecovery::default();
+        let step = S / 144;
+        let (mut reopens, mut notes) = (0, 0);
+        let mut t = 0;
+        while t < 130 * S {
+            let lost = r.lost(t);
+            notes += usize::from(lost.note.is_some());
+            if lost.try_now {
+                reopens += 1;
+                notes += usize::from(r.reopened(t).is_some());
+            }
+            t += step;
+        }
+        assert!(reopens <= 2 + 130 / 5 + 5, "{reopens} reopens");
+        // Lost, Reopened, KeepsLosing, and a reminder per minute.
+        assert!(notes <= 5, "{notes} log lines");
+    }
+
+    #[test]
+    fn failing_reopens_keep_trying_with_backoff_and_quiet_log() {
+        let mut r = DuplicationRecovery::default();
+        let mut tries = Vec::new();
+        let mut notes = Vec::new();
+        let mut t = 0;
+        while t < 120 * S {
+            let lost = r.lost(t);
+            notes.extend(lost.note);
+            if lost.try_now {
+                tries.push(t);
+                notes.extend(r.failed(t));
+            }
+            t += S / 100;
+        }
+        // Never gives up (no fallback to WGC), never faster than the backoff allows.
+        assert!(tries.len() > 20 && tries.len() < 40, "{} tries", tries.len());
+        for pair in tries.windows(2).skip(5) {
+            assert!(pair[1] - pair[0] >= REOPEN_MAX);
+        }
+        assert!(r.waiting());
+        // Lost + first failure + one reminder per minute.
+        assert!(notes.len() <= 4, "{notes:?}");
+        assert_eq!(notes[0], RecoveryNote::Lost);
+        assert!(matches!(notes[1], RecoveryNote::ReopenFailing { attempts: 1, .. }));
+        // Then it works again.
+        let lost = r.lost(t + REOPEN_MAX);
+        assert!(lost.try_now);
+        assert!(matches!(r.reopened(t + REOPEN_MAX), Some(RecoveryNote::Reopened { .. })));
+        assert!(!r.waiting());
+    }
+
+    #[test]
+    fn flapping_episode_ends_with_one_summary() {
+        let mut r = DuplicationRecovery::default();
+        for i in 0..3 {
+            let t = i * S;
+            let lost = r.lost(t);
+            assert!(i == 0 || !lost.try_now || lost.note.is_none());
+            let t = t + REOPEN_MAX;
+            assert!(r.lost(t).try_now);
+            r.reopened(t);
+        }
+        let end = 2 * S + REOPEN_MAX + REOPEN_STABLE;
+        assert_eq!(r.tick(end - 1), None);
+        assert!(matches!(r.tick(end), Some(RecoveryNote::Recovered { losses: 3, .. })));
+        assert_eq!(r.tick(end + S), None);
     }
 }
