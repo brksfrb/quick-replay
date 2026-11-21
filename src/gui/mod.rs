@@ -10,6 +10,7 @@ mod settings;
 mod theme;
 mod thumbs;
 
+use crate::check_now::CheckNow;
 use crate::config::Config;
 use crate::ipc::{self, Command, Status};
 use crate::paths;
@@ -48,6 +49,7 @@ struct App {
     settings: SettingsPage,
     status: Option<Status>,
     status_at: Option<Instant>,
+    check_now: CheckNow,
     flash: Option<(String, Instant)>,
     monitors: Vec<monitors::Monitor>,
     logo: TextureHandle,
@@ -136,6 +138,7 @@ impl App {
             settings: SettingsPage::default(),
             status: None,
             status_at: None,
+            check_now: CheckNow::default(),
             flash: None,
             monitors: monitors::list(),
             logo,
@@ -150,6 +153,8 @@ impl App {
         let interval = if focused { STATUS_POLL_FOCUSED } else { STATUS_POLL_BACKGROUND };
         if self.status_at.is_none_or(|t| t.elapsed() >= interval) {
             self.status = ipc::query_status();
+            self.check_now
+                .poll(Instant::now(), |start_check| self.status.and_then(|_| ipc::query_update_status(start_check)));
             self.status_at = Some(Instant::now());
         }
         ctx.request_repaint_after(interval);
@@ -247,15 +252,17 @@ impl App {
             let full = Vec2::new(ui.available_width(), 32.0);
             match self.status {
                 None => {
-                    if ui
-                        .add_sized(
+                    let start = ui.add_enabled_ui(!matches!(self.check_now, CheckNow::Starting(_)), |ui| {
+                        ui.add_sized(
                             full,
                             egui::Button::new(RichText::new("Start QuickReplay").font(theme::semibold(13.5)))
                                 .fill(theme::ACCENT),
                         )
-                        .clicked()
-                    {
-                        start_service();
+                    });
+                    if start.inner.clicked() {
+                        if let Err(err) = start_service() {
+                            log::error!("could not start QuickReplay: {err}");
+                        }
                         self.status_at = None;
                     }
                 }
@@ -306,7 +313,7 @@ impl App {
                     PlayerAction::None => {}
                 }
             }
-            Page::Settings => match self.settings.ui(ui, &mut self.config, &self.monitors) {
+            Page::Settings => match self.settings.ui(ui, &mut self.config, &self.monitors, &self.check_now) {
                 SettingsAction::Quit => {
                     self.flush_config();
                     ipc::send_to_service(Command::Quit);
@@ -328,11 +335,17 @@ impl App {
                 }
                 SettingsAction::CheckUpdates => {
                     self.flush_config();
-                    if ipc::send_to_service(Command::CheckUpdates) {
+                    if self.check_now.click(
+                        Instant::now(),
+                        || ipc::send_to_service(Command::CheckUpdates),
+                        ipc::service_running,
+                        start_service,
+                    ) {
                         self.show_flash("Checking for updates…");
                     } else {
-                        self.show_flash("Start QuickReplay first (it runs the updates)");
+                        self.status_at = None;
                     }
+                    ui.ctx().request_repaint();
                 }
                 SettingsAction::None => {}
             },
@@ -397,14 +410,12 @@ fn nav_item(ui: &mut Ui, glyph: &str, label: &str, selected: bool) -> egui::Resp
     response
 }
 
-fn start_service() {
-    let spawned = std::process::Command::new(paths::current_exe())
+fn start_service() -> std::io::Result<()> {
+    std::process::Command::new(paths::current_exe())
         .arg("--autostart")
         .creation_flags(shell::CREATE_NO_WINDOW)
-        .spawn();
-    if let Err(err) = spawned {
-        log::error!("could not start QuickReplay: {err}");
-    }
+        .spawn()?;
+    Ok(())
 }
 
 impl eframe::App for App {

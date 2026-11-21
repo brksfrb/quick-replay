@@ -6,6 +6,7 @@ mod overlay;
 mod tray;
 
 use crate::capture::{Event, EventSink, Pipeline, PreservedReplay};
+use crate::check_now::UpdateStatus;
 use crate::config::Config;
 use crate::ipc::{self, Command, Status};
 use crate::safety::{self, wake_schedule, WakeSchedule};
@@ -124,7 +125,7 @@ struct Service {
     failure_notified: bool,
     /// An update that waits for the current recording to end.
     pending_update: Option<(String, PathBuf)>,
-    update_running: bool,
+    update_status: Option<UpdateStatus>,
     badge: Option<Overlay>,
     replay_hotkeys: Vec<(i32, u32)>,
     recording_since: Option<Instant>,
@@ -201,17 +202,18 @@ impl Service {
 
     /// Checks GitHub on a worker thread; the result comes back as an event.
     fn check_updates(&mut self, manual: bool) {
-        if self.update_running {
+        if self.update_status == Some(UpdateStatus::Checking) {
             return;
         }
         if paths::is_dev_build() || paths::is_isolated() {
+            self.update_status = Some(UpdateStatus::Disabled);
             if manual {
                 self.notify(Glyph::Warning, "Updates are off", "This is a development build");
             }
             return;
         }
         // With automatic updates off, scheduled checks still run but only offer the update.
-        self.update_running = true;
+        self.update_status = Some(UpdateStatus::Checking);
         let events = self.events.clone();
         let spawned = std::thread::Builder::new().name("update".into()).spawn(move || {
             let event = match crate::update::check() {
@@ -224,8 +226,12 @@ impl Service {
             };
             events.send(event);
         });
-        if spawned.is_err() {
-            self.update_running = false;
+        if let Err(err) = spawned {
+            self.update_status = Some(UpdateStatus::Failed);
+            log::warn!("could not start the update check: {err}");
+            if manual {
+                self.notify(Glyph::Warning, "Couldn't check for updates", "The update check could not start");
+            }
         }
     }
 
@@ -255,6 +261,9 @@ impl Service {
         match crate::update::apply(&path) {
             Ok(()) => self.quit(),
             Err(message) => {
+                if self.update_status == Some(UpdateStatus::Available) {
+                    self.update_status = Some(UpdateStatus::InstallFailed);
+                }
                 log::error!("update failed: {message}");
                 self.notify(Glyph::Warning, "Update failed", &message);
                 if self.buffer_enabled {
@@ -659,11 +668,11 @@ impl Service {
                 }
                 Event::SaveFailed(message) => self.notify(Glyph::Warning, "Couldn't save", &message),
                 Event::UpdateReady { version, path, manual } => {
-                    self.update_running = false;
+                    self.update_status = Some(UpdateStatus::Available);
                     self.update_ready(version, path, manual);
                 }
                 Event::UpdateNotFound { manual } => {
-                    self.update_running = false;
+                    self.update_status = Some(UpdateStatus::UpToDate);
                     if manual {
                         self.notify(
                             Glyph::Check,
@@ -673,7 +682,7 @@ impl Service {
                     }
                 }
                 Event::UpdateFailed { message, manual } => {
-                    self.update_running = false;
+                    self.update_status = Some(UpdateStatus::Failed);
                     log::warn!("update check failed: {message}");
                     if manual {
                         self.notify(Glyph::Warning, "Couldn't check for updates", &message);
@@ -884,6 +893,12 @@ impl Service {
                 }
             }
             ipc::WM_QR_STATUS => return Some(LRESULT(self.status().encode())),
+            ipc::WM_QR_UPDATE_STATUS => {
+                if wparam.0 != 0 {
+                    self.check_updates(true);
+                }
+                return Some(LRESULT(self.update_status.map_or(0, |status| status as isize)));
+            }
             ipc::WM_QR_EVENT => self.drain_events(),
             ipc::WM_QR_TOAST_CLICK => {
                 if let Some(toast) = &mut self.toast {
@@ -1108,7 +1123,7 @@ pub fn run(mode: StartMode) {
         restart_again: false,
         failure_notified: false,
         pending_update: None,
-        update_running: false,
+        update_status: mode.updated.then_some(UpdateStatus::Installed),
         badge: Overlay::new(instance, false),
         replay_hotkeys: Vec::new(),
         recording_since: None,

@@ -1,6 +1,7 @@
 //! How the window process and the tray service talk: window messages to the service's hidden
 //! window, plus a named mutex/event pair so only one window exists and a second start focuses it.
 
+use crate::check_now::UpdateStatus;
 use crate::win::wide;
 use std::os::windows::process::CommandExt;
 use windows::core::PCWSTR;
@@ -18,6 +19,7 @@ pub const WM_QR_STATUS: u32 = WM_APP + 2;
 pub const WM_QR_EVENT: u32 = WM_APP + 3;
 /// Internal: the notification card was clicked.
 pub const WM_QR_TOAST_CLICK: u32 = WM_APP + 4;
+pub const WM_QR_UPDATE_STATUS: u32 = WM_APP + 5;
 
 const SERVICE_CLASS: &str = "QuickReplay.Service";
 const SERVICE_MUTEX: &str = r"Local\QuickReplay.Service";
@@ -124,20 +126,29 @@ pub fn send_to_service(command: Command) -> bool {
 
 /// `None` when the service isn't running.
 pub fn query_status() -> Option<Status> {
+    query_service(WM_QR_STATUS, 0).map(Status::decode)
+}
+
+/// A start request also verifies that the service can handle the check.
+pub fn query_update_status(start_check: bool) -> Option<UpdateStatus> {
+    query_service(WM_QR_UPDATE_STATUS, usize::from(start_check)).and_then(UpdateStatus::decode)
+}
+
+fn query_service(message: u32, wparam: usize) -> Option<usize> {
     let hwnd = service_window()?;
     let mut result = 0usize;
     let ok = unsafe {
         SendMessageTimeoutW(
             hwnd,
-            WM_QR_STATUS,
-            WPARAM(0),
+            message,
+            WPARAM(wparam),
             LPARAM(0),
             SMTO_ABORTIFHUNG,
             STATUS_TIMEOUT_MS,
             Some(&mut result),
         )
     };
-    (ok.0 != 0).then(|| Status::decode(result))
+    (ok.0 != 0).then_some(result)
 }
 
 /// A named mutex held for the life of the process; `None` if another process already holds it.

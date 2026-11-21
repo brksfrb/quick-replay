@@ -5,6 +5,8 @@
 mod audio_device_policy;
 #[cfg(any(windows, test))]
 mod capture_policy;
+#[cfg(any(windows, test))]
+mod check_now;
 mod config;
 #[cfg(any(windows, test))]
 mod conversion_policy;

@@ -1,6 +1,7 @@
 //! The settings page. Every change is saved right away and the tray app picks it up.
 
 use super::theme::{self, icon, setting_row, toggle};
+use crate::check_now::CheckNow;
 use crate::config::{parse_hex_color, Audio, Codec, Config, Corner, Quality, ReplayHotkey, Resolution, Video};
 use crate::hotkey::Hotkey;
 use crate::win::audio_devices::{self, Endpoint};
@@ -119,7 +120,13 @@ impl SettingsPage {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut Ui, config: &mut Config, monitors: &[Monitor]) -> SettingsAction {
+    pub fn ui(
+        &mut self,
+        ui: &mut Ui,
+        config: &mut Config,
+        monitors: &[Monitor],
+        check_now: &CheckNow,
+    ) -> SettingsAction {
         let mut action = SettingsAction::None;
         if self.last_audio_refresh.is_none_or(|last| last.elapsed() >= AUDIO_DEVICE_REFRESH) {
             self.last_audio_refresh = Some(Instant::now());
@@ -143,7 +150,7 @@ impl SettingsPage {
             audio_section(ui, &mut config.audio, self.output_devices.as_deref(), self.microphone_devices.as_deref());
             notifications_section(ui, config);
             let sort = storage_section(ui, config);
-            action = general_section(ui, config);
+            action = general_section(ui, config, check_now);
             if matches!(action, SettingsAction::None) {
                 action = sort;
             }
@@ -540,7 +547,7 @@ fn storage_section(ui: &mut Ui, config: &mut Config) -> SettingsAction {
     }
 }
 
-fn general_section(ui: &mut Ui, config: &mut Config) -> SettingsAction {
+fn general_section(ui: &mut Ui, config: &mut Config, check_now: &CheckNow) -> SettingsAction {
     let mut action = SettingsAction::None;
     theme::card().show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -562,12 +569,16 @@ fn general_section(ui: &mut Ui, config: &mut Config) -> SettingsAction {
             "Update automatically",
             "New versions are downloaded, checked and installed in the background (never during a recording).",
             |ui| {
-                if theme::secondary_button(ui, None, "Check now").clicked() {
+                let button = ui.add_enabled_ui(!check_now.busy(), |ui| theme::secondary_button(ui, None, "Check now"));
+                if button.inner.clicked() {
                     action = SettingsAction::CheckUpdates;
                 }
                 toggle(ui, &mut config.general.auto_update)
             },
         );
+        if let Some(message) = check_now.message() {
+            ui.label(RichText::new(message).small().color(theme::TEXT));
+        }
         let location = if paths::is_portable() {
             format!("Portable mode · data in {}", paths::data_dir().display())
         } else if install::is_installed_copy() {
