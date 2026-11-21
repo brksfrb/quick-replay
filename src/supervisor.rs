@@ -19,9 +19,10 @@ pub fn run(args: &[String]) {
     };
     log::info!("crash supervisor running");
     let mut fast_failures = 0u32;
+    let mut first_start = true;
     loop {
         let started = Instant::now();
-        let mut child = match spawn(args) {
+        let mut child = match spawn(args, first_start) {
             Ok(child) => child,
             Err(err) => {
                 log::error!("could not start QuickReplay: {err}");
@@ -31,6 +32,7 @@ pub fn run(args: &[String]) {
                 continue;
             }
         };
+        first_start = false;
         let status = match child.wait() {
             Ok(status) => status,
             Err(err) => {
@@ -61,11 +63,13 @@ pub fn run(args: &[String]) {
     }
 }
 
-fn spawn(args: &[String]) -> std::io::Result<std::process::Child> {
+fn spawn(args: &[String], first_start: bool) -> std::io::Result<std::process::Child> {
     let mut command = Command::new(paths::current_exe());
     command.arg(CHILD_FLAG);
     for arg in args {
-        if arg != CHILD_FLAG {
+        if arg != CHILD_FLAG
+            && (first_start || !matches!(arg.as_str(), "--updated" | "--update-failed" | "--open-settings"))
+        {
             command.arg(arg);
         }
     }

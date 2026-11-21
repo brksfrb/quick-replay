@@ -10,6 +10,8 @@ use crate::check_now::UpdateStatus;
 use crate::config::Config;
 use crate::ipc::{self, Command, Status};
 use crate::safety::{self, wake_schedule, WakeSchedule};
+use crate::update::{self, AfterSwap, Pending};
+use crate::update_policy::{apply_on_restart, CheckRequest, ReadyAction, RestartPrompt};
 use crate::win::{clipboard, monitors, wide, ComGuard};
 use crate::{install, paths};
 use overlay::{Glyph, Overlay, Placement, Toast};
@@ -33,14 +35,14 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 pub struct StartMode {
     pub open_window: bool,
     pub first_run: bool,
-    /// Started by the updater: the previous version may still be shutting down.
     pub updated: bool,
+    pub update_failed: bool,
+    pub open_settings: bool,
 }
 
 /// What clicking the visible notification does.
 enum ToastAction {
     OpenVideo(PathBuf),
-    InstallUpdate { version: String, path: PathBuf },
 }
 
 const HOTKEY_RECORD: i32 = 100;
@@ -62,8 +64,6 @@ const RESUME_DELAY_MS: u32 = 5_000;
 /// First update check a minute after start (not during login rush), then every 6 hours.
 const FIRST_UPDATE_MS: u32 = 60_000;
 const UPDATE_INTERVAL_MS: u32 = 6 * 60 * 60 * 1000;
-/// How long a freshly updated copy waits for the previous version to shut down.
-const UPDATE_HANDOVER: Duration = Duration::from_secs(20);
 /// Shortly after the pipeline starts, hand back the memory only driver setup touched. Only once:
 /// trimming later would push the replay buffer out to the page file (disk writes).
 const FIRST_TRIM_MS: u32 = 5_000;
@@ -86,6 +86,7 @@ const MENU_OPEN: u32 = 1;
 const MENU_RECORD: u32 = 2;
 const MENU_BUFFER: u32 = 3;
 const MENU_QUIT: u32 = 4;
+const MENU_UPDATE: u32 = 5;
 const MENU_SAVE_BASE: u32 = 100;
 
 thread_local! {
@@ -123,8 +124,9 @@ struct Service {
     restart_in_progress: bool,
     restart_again: bool,
     failure_notified: bool,
-    /// An update that waits for the current recording to end.
-    pending_update: Option<(String, PathBuf)>,
+    pending_update: Option<Pending>,
+    update_check: CheckRequest,
+    update_prompt: RestartPrompt,
     update_status: Option<UpdateStatus>,
     badge: Option<Overlay>,
     replay_hotkeys: Vec<(i32, u32)>,
@@ -140,6 +142,8 @@ struct Service {
     /// The rolling checkpoint path still holds crash evidence we could not move aside.
     checkpoint_blocked: bool,
     taskbar_created: u32,
+    gui_shutdown: Option<ipc::GuiShutdown>,
+    shutting_down: bool,
 }
 
 fn modifiers(key: &crate::hotkey::Hotkey) -> HOT_KEY_MODIFIERS {
@@ -201,74 +205,117 @@ impl Service {
     }
 
     /// Checks GitHub on a worker thread; the result comes back as an event.
-    fn check_updates(&mut self, manual: bool) {
-        if self.update_status == Some(UpdateStatus::Checking) {
-            return;
-        }
+    fn check_updates(&mut self, explicit: bool) {
         if paths::is_dev_build() || paths::is_isolated() {
             self.update_status = Some(UpdateStatus::Disabled);
-            if manual {
-                self.notify(Glyph::Warning, "Updates are off", "This is a development build");
+            return;
+        }
+        if self.pending_update.is_some() {
+            if explicit {
+                self.offer_update(true);
             }
             return;
         }
-        // With automatic updates off, scheduled checks still run but only offer the update.
+        if !explicit && !self.config.general.auto_update && !update::has_staged_exe() {
+            return;
+        }
+        if !self.update_check.begin(explicit) {
+            return;
+        }
         self.update_status = Some(UpdateStatus::Checking);
         let events = self.events.clone();
         let spawned = std::thread::Builder::new().name("update".into()).spawn(move || {
-            let event = match crate::update::check() {
-                Ok(Some(release)) => match crate::update::download(&release) {
-                    Ok(path) => Event::UpdateReady { version: release.version, path, manual },
-                    Err(message) => Event::UpdateFailed { message, manual },
-                },
-                Ok(None) => Event::UpdateNotFound { manual },
-                Err(message) => Event::UpdateFailed { message, manual },
-            };
-            events.send(event);
+            events.send(Event::UpdateChecked(update::prepare()));
         });
         if let Err(err) = spawned {
+            self.update_check.finish();
             self.update_status = Some(UpdateStatus::Failed);
             log::warn!("could not start the update check: {err}");
-            if manual {
+            if explicit {
                 self.notify(Glyph::Warning, "Couldn't check for updates", "The update check could not start");
             }
         }
     }
 
-    fn update_ready(&mut self, version: String, path: PathBuf, manual: bool) {
-        if !manual && !self.config.general.auto_update {
-            self.notify(Glyph::Check, &format!("QuickReplay {version} is available"), "Click to update");
-            self.toast_action = Some(ToastAction::InstallUpdate { version, path });
-            return;
+    fn update_checked(&mut self, result: Result<Option<Pending>, String>) {
+        let explicit = self.update_check.finish();
+        match result {
+            Ok(Some(pending)) => {
+                self.update_status = Some(UpdateStatus::Available);
+                self.pending_update = Some(pending);
+                self.offer_update(explicit);
+            }
+            Ok(None) => {
+                self.update_status = Some(UpdateStatus::UpToDate);
+                if explicit {
+                    self.notify(
+                        Glyph::Check,
+                        "QuickReplay is up to date",
+                        &format!("Version {}", env!("CARGO_PKG_VERSION")),
+                    );
+                }
+            }
+            Err(message) => {
+                self.update_status = Some(UpdateStatus::Failed);
+                log::warn!("update check failed: {message}");
+                if explicit {
+                    self.notify(Glyph::Warning, "Couldn't check for updates", &message);
+                } else if update::has_staged_exe() {
+                    self.notify_update(
+                        "Couldn't verify the QuickReplay update",
+                        "Open Settings and select Check now to retry.",
+                    );
+                }
+            }
         }
-        self.install_update(version, path);
     }
 
-    /// Swaps in the new exe and restarts into it, unless a recording is running.
-    fn install_update(&mut self, version: String, path: PathBuf) {
-        if self.recording_since.is_some() {
-            self.notify(
-                Glyph::Check,
-                &format!("QuickReplay {version} is ready"),
-                "It installs when the recording ends",
-            );
-            self.pending_update = Some((version, path));
+    fn notify_update(&mut self, title: &str, message: &str) {
+        if !self.tray.notify(title, message) {
+            log::warn!("could not show tray notification: {title}");
+            self.notify(Glyph::Check, title, message);
+        }
+    }
+
+    fn notify_update_ready(&mut self) {
+        if let Some(pending) = &self.pending_update {
+            let title = format!("QuickReplay update v{} ready", pending.version);
+            self.notify_update(&title, "Open Settings to restart now.");
+        }
+    }
+
+    fn offer_update(&mut self, explicit: bool) {
+        if self.pending_update.is_none() {
             return;
         }
-        log::info!("installing QuickReplay {version}");
-        // Finish anything still being written before the exe is swapped.
-        self.stop_pipeline();
-        match crate::update::apply(&path) {
-            Ok(()) => self.quit(),
+        if explicit {
+            self.update_status = Some(UpdateStatus::Available);
+        }
+        let status = self.status();
+        let capture_active = status.recording || status.buffer_active || self.preserved.is_some();
+        match self.update_prompt.offer(explicit, capture_active) {
+            ReadyAction::Confirm => ipc::open_gui(),
+            ReadyAction::Restart => {
+                self.restart_for_update(AfterSwap::Settings);
+            }
+            ReadyAction::Notify => self.notify_update_ready(),
+        }
+    }
+
+    fn restart_for_update(&mut self, after: AfterSwap) -> bool {
+        self.update_prompt.dismiss();
+        let Some(pending) = &self.pending_update else { return false };
+        match update::start_helper(pending, after) {
+            Ok(()) => {
+                self.finish_quit();
+                true
+            }
             Err(message) => {
-                if self.update_status == Some(UpdateStatus::Available) {
-                    self.update_status = Some(UpdateStatus::InstallFailed);
-                }
-                log::error!("update failed: {message}");
+                log::error!("could not start the update to v{}: {message}", pending.version);
+                self.pending_update = update::pending();
+                self.update_status = Some(UpdateStatus::InstallFailed);
                 self.notify(Glyph::Warning, "Update failed", &message);
-                if self.buffer_enabled {
-                    self.start_pipeline();
-                }
+                false
             }
         }
     }
@@ -485,10 +532,6 @@ impl Service {
                     self.stop_pipeline();
                 }
             }
-            if let Some((version, path)) = self.pending_update.take() {
-                self.install_update(version, path);
-                return;
-            }
         } else {
             if !self.start_pipeline() {
                 return;
@@ -588,6 +631,9 @@ impl Service {
         items.push(MenuItem::new(MENU_RECORD, format!("{record_label}{record_key}")));
         items.push(MenuItem { checked: self.buffer_enabled, ..MenuItem::new(MENU_BUFFER, "Replay buffer") });
         items.push(MenuItem::new(MenuItem::SEPARATOR, ""));
+        if let Some(pending) = &self.pending_update {
+            items.push(MenuItem::new(MENU_UPDATE, format!("Update v{} ready · Restart now", pending.version)));
+        }
         items.push(MenuItem::new(MENU_QUIT, "Quit"));
         items
     }
@@ -598,6 +644,7 @@ impl Service {
             MENU_RECORD => self.toggle_recording(),
             MENU_BUFFER => self.toggle_buffer(),
             MENU_QUIT => self.quit(),
+            MENU_UPDATE => self.offer_update(true),
             id if id >= MENU_SAVE_BASE => {
                 if let Some(entry) = self.config.replay.hotkeys.get((id - MENU_SAVE_BASE) as usize) {
                     self.save_replay(entry.seconds);
@@ -644,7 +691,14 @@ impl Service {
             Command::ToggleRecording => self.toggle_recording(),
             Command::ToggleBuffer => self.toggle_buffer(),
             Command::Quit => self.quit(),
+            Command::QuitWithoutUpdate => self.finish_quit(),
             Command::CheckUpdates => self.check_updates(true),
+            Command::RestartForUpdate => self.offer_update(true),
+            Command::ConfirmUpdate if self.update_prompt.is_open() => {
+                self.restart_for_update(AfterSwap::Settings);
+            }
+            Command::ConfirmUpdate => {}
+            Command::DeferUpdate => self.update_prompt.dismiss(),
         }
     }
 
@@ -667,25 +721,10 @@ impl Service {
                     self.saved(&path, "Recording saved", format_duration(seconds));
                 }
                 Event::SaveFailed(message) => self.notify(Glyph::Warning, "Couldn't save", &message),
-                Event::UpdateReady { version, path, manual } => {
-                    self.update_status = Some(UpdateStatus::Available);
-                    self.update_ready(version, path, manual);
-                }
-                Event::UpdateNotFound { manual } => {
-                    self.update_status = Some(UpdateStatus::UpToDate);
-                    if manual {
-                        self.notify(
-                            Glyph::Check,
-                            "QuickReplay is up to date",
-                            &format!("Version {}", env!("CARGO_PKG_VERSION")),
-                        );
-                    }
-                }
-                Event::UpdateFailed { message, manual } => {
-                    self.update_status = Some(UpdateStatus::Failed);
-                    log::warn!("update check failed: {message}");
-                    if manual {
-                        self.notify(Glyph::Warning, "Couldn't check for updates", &message);
+                Event::UpdateChecked(result) => {
+                    self.update_checked(result);
+                    if self.shutting_down {
+                        break;
                     }
                 }
                 Event::PipelineStale { generation } => {
@@ -767,7 +806,10 @@ impl Service {
                 }
                 trim_working_set();
             }
-            TIMER_WATCHDOG => self.watchdog(),
+            TIMER_WATCHDOG => {
+                self.tray.ensure_registered();
+                self.watchdog();
+            }
             TIMER_CHECKPOINT => self.checkpoint_buffer(),
             _ => {}
         }
@@ -853,6 +895,20 @@ impl Service {
     }
 
     fn quit(&mut self) {
+        if apply_on_restart(self.config.general.auto_update, self.recording_since.is_some())
+            && !ipc::update_running(&paths::current_exe())
+            && self.restart_for_update(AfterSwap::Quit)
+        {
+            return;
+        }
+        self.finish_quit();
+    }
+
+    fn finish_quit(&mut self) {
+        self.shutting_down = true;
+        if let Some(shutdown) = &self.gui_shutdown {
+            shutdown.signal();
+        }
         if self.recording_since.take().is_some() {
             if let Some(pipeline) = &self.pipeline {
                 pipeline.stop_recording();
@@ -878,6 +934,9 @@ impl Service {
     }
 
     fn handle(&mut self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+        if self.shutting_down {
+            return None;
+        }
         match msg {
             WM_HOTKEY => {
                 let id = wparam.0 as i32;
@@ -899,6 +958,16 @@ impl Service {
                 }
                 return Some(LRESULT(self.update_status.map_or(0, |status| status as isize)));
             }
+            ipc::WM_QR_UPDATE_READY => {
+                let state = if self.pending_update.is_none() {
+                    0
+                } else if self.update_prompt.is_open() {
+                    2
+                } else {
+                    1
+                };
+                return Some(LRESULT(state));
+            }
             ipc::WM_QR_EVENT => self.drain_events(),
             ipc::WM_QR_TOAST_CLICK => {
                 if let Some(toast) = &mut self.toast {
@@ -906,7 +975,6 @@ impl Service {
                 }
                 match self.toast_action.take() {
                     Some(ToastAction::OpenVideo(video)) => ipc::open_gui_on(&video),
-                    Some(ToastAction::InstallUpdate { version, path }) => self.install_update(version, path),
                     None => {}
                 }
             }
@@ -921,7 +989,7 @@ impl Service {
                 // The lock screen is a separate desktop that can't be captured; start fresh after it.
                 self.schedule_wake_restart();
             }
-            WM_ENDSESSION if wparam.0 != 0 => self.quit(),
+            WM_ENDSESSION if wparam.0 != 0 => self.finish_quit(),
             m if m == self.taskbar_created && m != 0 => self.tray.add(),
             _ => return None,
         }
@@ -978,6 +1046,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     if msg == WM_TRAY {
         match lparam.0 as u32 & 0xFFFF {
             WM_LBUTTONUP => ipc::open_gui(),
+            windows::Win32::UI::Shell::NIN_BALLOONUSERCLICK => ipc::open_settings(),
             WM_RBUTTONUP | WM_CONTEXTMENU => show_tray_menu(hwnd),
             _ => {}
         }
@@ -1043,24 +1112,41 @@ fn load_config() -> Config {
 }
 
 pub fn run(mode: StartMode) {
-    let mut lock = ipc::InstanceLock::service();
-    if mode.updated {
-        let since = Instant::now();
-        while lock.is_none() && since.elapsed() < UPDATE_HANDOVER {
-            std::thread::sleep(Duration::from_millis(200));
-            lock = ipc::InstanceLock::service();
-        }
-    }
-    let Some(_lock) = lock else {
+    let Some(_lock) = ipc::InstanceLock::service() else {
         // Already running: starting the exe again just opens the window.
         ipc::open_gui();
         return;
     };
-    crate::update::cleanup();
+    let updates_enabled = !paths::is_dev_build() && !paths::is_isolated();
+    let pending_update = if updates_enabled { update::pending() } else { None };
+    let config = load_config();
+    let mut update_failed = mode.update_failed;
+    if !mode.update_failed && apply_on_restart(config.general.auto_update, false) {
+        if let Some(pending) = &pending_update {
+            let after = if mode.open_window || mode.open_settings || ipc::gui_running() {
+                AfterSwap::Settings
+            } else {
+                AfterSwap::Tray
+            };
+            match update::start_helper(pending, after) {
+                Ok(()) => return,
+                Err(err) => {
+                    log::error!("could not apply the pending update at startup: {err}");
+                    update_failed = true;
+                }
+            }
+        }
+    }
+    let gui_shutdown = match ipc::GuiShutdown::new() {
+        Ok(shutdown) => Some(shutdown),
+        Err(err) => {
+            log::warn!("could not create the window shutdown signal: {err}");
+            None
+        }
+    };
     crate::capture::encoder::start_graveyard();
     let _com = ComGuard::sta();
     log::info!("QuickReplay {} starting ({})", env!("CARGO_PKG_VERSION"), paths::current_exe().display());
-    let config = load_config();
     install::sync_autostart(config.general.start_with_windows);
 
     let instance: HINSTANCE = unsafe { GetModuleHandleW(None) }.map(|m| HINSTANCE(m.0)).unwrap_or_default();
@@ -1101,8 +1187,9 @@ pub fn run(mode: StartMode) {
             log::warn!("can't watch session lock/unlock: {err}");
         }
     }
-    let tray = Tray::new(hwnd, unsafe { GetDpiForSystem() });
+    let mut tray = Tray::new(hwnd, unsafe { GetDpiForSystem() });
     tray.add();
+    let updated = updates_enabled && update::updated_launch(mode.updated);
     let buffer_enabled = config.replay.enabled;
     let service = Service {
         hwnd,
@@ -1122,8 +1209,16 @@ pub fn run(mode: StartMode) {
         restart_in_progress: false,
         restart_again: false,
         failure_notified: false,
-        pending_update: None,
-        update_status: mode.updated.then_some(UpdateStatus::Installed),
+        update_status: if update_failed {
+            Some(UpdateStatus::InstallFailed)
+        } else if pending_update.is_some() {
+            Some(UpdateStatus::Available)
+        } else {
+            updated.then_some(UpdateStatus::Installed)
+        },
+        pending_update,
+        update_check: CheckRequest::default(),
+        update_prompt: RestartPrompt::default(),
         badge: Overlay::new(instance, false),
         replay_hotkeys: Vec::new(),
         recording_since: None,
@@ -1135,6 +1230,8 @@ pub fn run(mode: StartMode) {
         checkpoint_cancel: Arc::new(AtomicBool::new(false)),
         checkpoint_blocked: false,
         taskbar_created,
+        gui_shutdown,
+        shutting_down: false,
     };
     SERVICE.with(|cell| *cell.borrow_mut() = Some(service));
     SERVICE.with(|cell| {
@@ -1161,8 +1258,17 @@ pub fn run(mode: StartMode) {
                 s.notify_video("Replay recovered", "Saved before QuickReplay stopped", &path);
             }
             s.checkpoint_blocked = files::live_checkpoint_blocked();
-            if mode.updated {
-                s.notify(Glyph::Check, "QuickReplay updated", &format!("Now on version {}", env!("CARGO_PKG_VERSION")));
+            if updated {
+                s.notify_update(&format!("QuickReplay updated to v{}", env!("CARGO_PKG_VERSION")), "");
+                install::refresh_version();
+            }
+            if update_failed {
+                s.notify_update("Couldn't install the QuickReplay update", "Open Settings to retry.");
+            } else if s.pending_update.is_some() {
+                s.notify_update_ready();
+            } else if updates_enabled && update::has_staged_exe() {
+                // Left by a legacy build or an interrupted download. Verify it against GitHub.
+                s.check_updates(false);
             }
             if mode.first_run {
                 let key = s.config.replay.hotkeys.first().map(|h| (h.hotkey.to_string(), h.seconds));
@@ -1173,7 +1279,9 @@ pub fn run(mode: StartMode) {
             }
         }
     });
-    if mode.open_window {
+    if mode.open_settings {
+        ipc::open_settings();
+    } else if mode.open_window {
         ipc::open_gui();
     }
 

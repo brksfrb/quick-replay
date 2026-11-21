@@ -34,8 +34,14 @@ mod service;
 mod supervisor;
 #[cfg(windows)]
 mod update;
+#[cfg(any(windows, test))]
+mod update_files;
+#[cfg(any(windows, test))]
+mod update_policy;
 #[cfg(windows)]
 mod win;
+#[cfg(any(windows, test))]
+mod window_lifecycle;
 
 #[cfg(windows)]
 fn main() {
@@ -53,9 +59,19 @@ fn main() {
         return;
     }
 
+    if let Some(i) = args.iter().position(|arg| arg == "--apply-update") {
+        update::run_helper(&args[i + 1..]);
+        return;
+    }
+
     if has("--gui") {
         logger::init(&paths::log_path(), "gui");
-        gui::run();
+        let owner = args
+            .iter()
+            .position(|arg| arg == "--service-pid")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|pid| pid.parse().ok());
+        gui::run(owner);
         return;
     }
     logger::init(&paths::log_path(), "service");
@@ -68,6 +84,9 @@ fn main() {
         if !ipc::send_to_service(command) {
             log::warn!("{command:?} ignored: QuickReplay isn't running");
         }
+        return;
+    }
+    if !update::wait_for_handover(has("--updated") && !supervisor::is_child(&args)) {
         return;
     }
     let autostart = has("--autostart");
@@ -83,6 +102,8 @@ fn main() {
         open_window: !autostart,
         first_run: has("--installed"),
         updated: has("--updated"),
+        update_failed: has("--update-failed"),
+        open_settings: has("--open-settings"),
     });
 }
 

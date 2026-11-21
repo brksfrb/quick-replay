@@ -38,6 +38,7 @@ pub enum SettingsAction {
     Quit,
     Uninstall,
     CheckUpdates,
+    RestartForUpdate,
     SortExisting,
 }
 
@@ -126,6 +127,7 @@ impl SettingsPage {
         config: &mut Config,
         monitors: &[Monitor],
         check_now: &CheckNow,
+        ready_version: Option<&str>,
     ) -> SettingsAction {
         let mut action = SettingsAction::None;
         if self.last_audio_refresh.is_none_or(|last| last.elapsed() >= AUDIO_DEVICE_REFRESH) {
@@ -140,8 +142,19 @@ impl SettingsPage {
             apply_capture(config, target, key);
         }
         ui.heading("Settings");
-        ui.label(RichText::new("Changes apply right away.").color(theme::TEXT_WEAK));
+        ui.label(RichText::new(format!("QuickReplay v{}", env!("CARGO_PKG_VERSION"))).color(theme::TEXT_WEAK));
         ui.add_space(16.0);
+        if let Some(version) = ready_version {
+            theme::card().show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("Update v{version} ready")).strong());
+                    if theme::primary_button(ui, None, "Restart now").clicked() {
+                        action = SettingsAction::RestartForUpdate;
+                    }
+                });
+            });
+            ui.add_space(14.0);
+        }
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.set_max_width(780.0);
             self.replay_section(ui, config, monitors);
@@ -150,7 +163,10 @@ impl SettingsPage {
             audio_section(ui, &mut config.audio, self.output_devices.as_deref(), self.microphone_devices.as_deref());
             notifications_section(ui, config);
             let sort = storage_section(ui, config);
-            action = general_section(ui, config, check_now);
+            let general = general_section(ui, config, check_now);
+            if !matches!(general, SettingsAction::None) {
+                action = general;
+            }
             if matches!(action, SettingsAction::None) {
                 action = sort;
             }
@@ -567,7 +583,7 @@ fn general_section(ui: &mut Ui, config: &mut Config, check_now: &CheckNow) -> Se
         setting_row(
             ui,
             "Update automatically",
-            "New versions are downloaded, checked and installed in the background (never during a recording).",
+            "Download updates in the background and install them when QuickReplay restarts.",
             |ui| {
                 let button = ui.add_enabled_ui(!check_now.busy(), |ui| theme::secondary_button(ui, None, "Check now"));
                 if button.inner.clicked() {
@@ -598,12 +614,7 @@ fn general_section(ui: &mut Ui, config: &mut Config, check_now: &CheckNow) -> Se
             }
         });
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!("QuickReplay {}", env!("CARGO_PKG_VERSION"))).small().color(theme::TEXT_WEAK),
-            );
-            ui.hyperlink_to(RichText::new("Source on GitHub").small(), env!("CARGO_PKG_REPOSITORY"));
-        });
+        ui.hyperlink_to(RichText::new("Source on GitHub").small(), env!("CARGO_PKG_REPOSITORY"));
     });
     action
 }

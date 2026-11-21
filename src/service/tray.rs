@@ -8,7 +8,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos, PostMessageW,
@@ -54,6 +55,7 @@ pub struct Tray {
     recording: Option<HICON>,
     tooltip: String,
     is_recording: bool,
+    registered: bool,
 }
 
 pub struct MenuItem {
@@ -77,7 +79,7 @@ impl Tray {
         let size = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, dpi) }.max(16) as u32;
         let normal = icon_from_rgba(size, &crate::icon::render_icon(size, false));
         let recording = icon_from_rgba(size, &crate::icon::render_icon(size, true));
-        Tray { hwnd, normal, recording, tooltip: crate::paths::APP_NAME.into(), is_recording: false }
+        Tray { hwnd, normal, recording, tooltip: crate::paths::APP_NAME.into(), is_recording: false, registered: false }
     }
 
     fn data(&self) -> NOTIFYICONDATAW {
@@ -97,12 +99,31 @@ impl Tray {
     }
 
     /// Adds the icon; also used again after Explorer restarts.
-    pub fn add(&self) {
+    pub fn add(&mut self) {
         let data = self.data();
-        unsafe {
+        self.registered = unsafe {
             let _ = Shell_NotifyIconW(NIM_DELETE, &data);
-            let _ = Shell_NotifyIconW(NIM_ADD, &data);
+            Shell_NotifyIconW(NIM_ADD, &data).as_bool()
+        };
+    }
+
+    pub fn ensure_registered(&mut self) {
+        if !self.registered {
+            self.add();
         }
+    }
+
+    pub fn notify(&self, title: &str, message: &str) -> bool {
+        let mut data = self.data();
+        data.uFlags = NIF_INFO;
+        data.dwInfoFlags = NIIF_INFO;
+        for (slot, unit) in data.szInfoTitle.iter_mut().take(63).zip(title.encode_utf16()) {
+            *slot = unit;
+        }
+        for (slot, unit) in data.szInfo.iter_mut().take(255).zip(message.encode_utf16()) {
+            *slot = unit;
+        }
+        unsafe { Shell_NotifyIconW(NIM_MODIFY, &data).as_bool() }
     }
 
     pub fn update(&mut self, recording: bool, tooltip: &str) {
@@ -112,8 +133,9 @@ impl Tray {
         self.is_recording = recording;
         self.tooltip = tooltip.to_string();
         let data = self.data();
-        unsafe {
-            let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+        if self.registered && !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data).as_bool() } {
+            self.registered = false;
+            log::warn!("QuickReplay lost its tray icon; it will try to add it again");
         }
     }
 }

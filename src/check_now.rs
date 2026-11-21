@@ -88,6 +88,12 @@ impl CheckNow {
         let (start_check, since) = match *self {
             Self::Starting(since) => (true, since),
             Self::Checking(since) => (false, since),
+            Self::Idle => {
+                if let Some(status @ (UpdateStatus::Installed | UpdateStatus::InstallFailed)) = request(false) {
+                    *self = Self::Finished(status);
+                }
+                return;
+            }
             _ => return,
         };
         *self = match request(start_check) {
@@ -207,6 +213,16 @@ mod tests {
         check.poll(now + SERVICE_TIMEOUT, |_| None);
         assert_eq!(check.message(), Some("Lost contact with QuickReplay while checking for updates."));
         assert!(!check.busy());
+    }
+
+    #[test]
+    fn the_first_window_shows_the_result_of_an_update_restart() {
+        let mut check = CheckNow::default();
+        check.poll(Instant::now(), |start| {
+            assert!(!start);
+            Some(UpdateStatus::Installed)
+        });
+        assert_eq!(check.message(), Some("QuickReplay updated successfully."));
     }
 
     #[test]

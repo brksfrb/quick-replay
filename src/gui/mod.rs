@@ -1,5 +1,4 @@
-//! The QuickReplay window: library, player and settings. A separate process that only runs while
-//! the window is open, so the tray app stays tiny the rest of the time.
+//! The QuickReplay window. Its separate process follows the lifetime of the tray service.
 
 #[cfg(debug_assertions)]
 mod devshot;
@@ -12,9 +11,10 @@ mod thumbs;
 
 use crate::check_now::CheckNow;
 use crate::config::Config;
-use crate::ipc::{self, Command, Status};
+use crate::ipc::{self, Command, OpenRequest, ServiceLink, Status};
 use crate::paths;
 use crate::win::{monitors, shell, ComGuard};
+use crate::window_lifecycle::{window_action, WindowAction};
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Sense, TextureHandle, Ui, Vec2, ViewportCommand};
 use library::{Library, LibraryAction};
 use player::{Player, PlayerAction};
@@ -24,11 +24,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use theme::icon;
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
 
 const STATUS_POLL_FOCUSED: Duration = Duration::from_secs(1);
-const STATUS_POLL_BACKGROUND: Duration = Duration::from_secs(4);
+const STATUS_POLL_BACKGROUND: Duration = Duration::from_secs(2);
 const SAVE_DELAY: Duration = Duration::from_millis(400);
 const FLASH_TIME: Duration = Duration::from_millis(2600);
 const SIDEBAR_WIDTH: f32 = 236.0;
@@ -50,6 +50,10 @@ struct App {
     status: Option<Status>,
     status_at: Option<Instant>,
     check_now: CheckNow,
+    ready_update: Option<(String, bool)>,
+    service_link: Option<Arc<ServiceLink>>,
+    closing: bool,
+    quit_pending: Option<Instant>,
     flash: Option<(String, Instant)>,
     monitors: Vec<monitors::Monitor>,
     logo: TextureHandle,
@@ -59,7 +63,13 @@ struct App {
     devshot: Option<devshot::DevShot>,
 }
 
-pub fn run() {
+pub fn run(owner: Option<u32>) {
+    let service_link = owner.map(ServiceLink::connect);
+    let service_link = match service_link {
+        Some(Ok(link)) if !link.ended() => Some(Arc::new(link)),
+        Some(_) => return,
+        None => None,
+    };
     let Some(_lock) = ipc::InstanceLock::gui() else {
         ipc::open_gui();
         return;
@@ -91,7 +101,7 @@ pub fn run() {
             if let Some(event) = focus_event {
                 watch_focus_requests(cc.egui_ctx.clone(), event, focus_requested.clone());
             }
-            Ok(Box::new(App::new(cc.egui_ctx.clone(), focus_requested)))
+            Ok(Box::new(App::new(cc.egui_ctx.clone(), focus_requested, service_link)))
         }),
     );
     if let Err(err) = result {
@@ -101,17 +111,44 @@ pub fn run() {
 
 /// Another start of the window (tray click, second launch) signals this event: come to the front.
 fn watch_focus_requests(ctx: egui::Context, raw: isize, requested: Arc<AtomicBool>) {
-    let _ = std::thread::Builder::new().name("focus".into()).spawn(move || loop {
-        unsafe { WaitForSingleObject(HANDLE(raw as *mut _), INFINITE) };
-        requested.store(true, Ordering::Relaxed);
-        ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
-        ctx.send_viewport_cmd(ViewportCommand::Focus);
-        ctx.request_repaint();
+    let result = std::thread::Builder::new().name("focus".into()).spawn(move || {
+        while unsafe { WaitForSingleObject(HANDLE(raw as *mut _), INFINITE) } == WAIT_OBJECT_0 {
+            requested.store(true, Ordering::Relaxed);
+            ctx.request_repaint();
+        }
     });
+    if let Err(err) = result {
+        log::warn!("could not start the window focus watcher: {err}");
+    }
+}
+
+fn watch_service(ctx: egui::Context, link: Arc<ServiceLink>) {
+    let result = std::thread::Builder::new().name("service-lifetime".into()).spawn(move || {
+        if link.wait_for_end() {
+            ctx.request_repaint();
+            // A stuck native dialog or driver must not leave a window behind after the tray quits.
+            std::thread::sleep(Duration::from_secs(10));
+            log::warn!("the QuickReplay window did not close after the service stopped");
+            std::process::exit(0);
+        }
+    });
+    if let Err(err) = result {
+        log::warn!("could not start the window's service watcher: {err}");
+    }
+}
+
+fn requested_page(request: OpenRequest) -> Page {
+    match request {
+        OpenRequest::Settings => Page::Settings,
+        OpenRequest::Video(video) => Page::Player(Box::new(Player::open(video))),
+    }
 }
 
 impl App {
-    fn new(ctx: egui::Context, focus_requested: Arc<AtomicBool>) -> App {
+    fn new(ctx: egui::Context, focus_requested: Arc<AtomicBool>, service_link: Option<Arc<ServiceLink>>) -> App {
+        if let Some(link) = &service_link {
+            watch_service(ctx.clone(), link.clone());
+        }
         let config = Config::load(&paths::config_path());
         let library = Library::new(ctx.clone(), paths::video_dir(&config));
         let size = 64;
@@ -119,7 +156,7 @@ impl App {
             egui::ColorImage::from_rgba_unmultiplied([size, size], &crate::icon::render_icon(size as u32, false));
         let logo = ctx.load_texture("logo", logo_image, egui::TextureOptions::LINEAR);
         // Opened from a clicked notification: go straight to that video.
-        let requested = ipc::take_open_request().map(|video| Page::Player(Box::new(Player::open(video))));
+        let requested = ipc::take_open_request().map(requested_page);
         #[cfg(debug_assertions)]
         let page = match devshot::DevShot::page().as_deref() {
             Some("settings") => Page::Settings,
@@ -139,6 +176,10 @@ impl App {
             status: None,
             status_at: None,
             check_now: CheckNow::default(),
+            ready_update: None,
+            service_link,
+            closing: false,
+            quit_pending: None,
             flash: None,
             monitors: monitors::list(),
             logo,
@@ -152,12 +193,78 @@ impl App {
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
         let interval = if focused { STATUS_POLL_FOCUSED } else { STATUS_POLL_BACKGROUND };
         if self.status_at.is_none_or(|t| t.elapsed() >= interval) {
+            if self.service_link.is_none() {
+                if let Some(link) = ipc::service_pid().and_then(|pid| ServiceLink::connect(pid).ok()) {
+                    let link = Arc::new(link);
+                    watch_service(ctx.clone(), link.clone());
+                    self.service_link = Some(link);
+                }
+            }
             self.status = ipc::query_status();
-            self.check_now
-                .poll(Instant::now(), |start_check| self.status.and_then(|_| ipc::query_update_status(start_check)));
+            self.check_now.poll(Instant::now(), ipc::query_update_status);
+            self.ready_update = ipc::query_update_ready()
+                .and_then(|confirm| crate::update::ready_version().map(|version| (version, confirm)));
             self.status_at = Some(Instant::now());
         }
         ctx.request_repaint_after(interval);
+    }
+
+    fn close(&mut self, ctx: &egui::Context) {
+        self.closing = true;
+        self.flush_config();
+        ctx.send_viewport_cmd(ViewportCommand::Close);
+    }
+
+    fn quit(&mut self, ctx: &egui::Context) {
+        self.flush_config();
+        if ipc::send_to_service(Command::Quit) {
+            self.quit_pending = None;
+            if self.service_link.is_none() {
+                self.close(ctx);
+            }
+        } else if !ipc::service_running() && !ipc::supervisor_running() {
+            self.close(ctx);
+        } else {
+            let since = self.quit_pending.get_or_insert_with(Instant::now);
+            if since.elapsed() >= Duration::from_secs(15) {
+                self.quit_pending = None;
+                log::warn!("the QuickReplay service did not accept the window's Quit request");
+                self.show_flash("Couldn't quit QuickReplay. Try again.");
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+        }
+    }
+
+    fn send_update_command(&mut self, ctx: &egui::Context, command: Command) {
+        self.flush_config();
+        if !ipc::send_to_service(command) {
+            self.show_flash("Couldn't contact QuickReplay. Try again.");
+        }
+        self.status_at = None;
+        ctx.request_repaint();
+    }
+
+    fn update_prompt(&mut self, ctx: &egui::Context) {
+        if !self.ready_update.as_ref().is_some_and(|(_, confirm)| *confirm) {
+            return;
+        }
+        let modal = egui::Modal::new(egui::Id::new("update-restart")).show(ctx, |ui| {
+            ui.heading("Update ready: restart now?");
+            ui.label("The current replay buffer will be cleared. Any active recording will be saved.");
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if theme::secondary_button(ui, None, "Later").clicked() {
+                    self.send_update_command(ctx, Command::DeferUpdate);
+                }
+                if theme::primary_button(ui, None, "Restart now").clicked() {
+                    self.send_update_command(ctx, Command::ConfirmUpdate);
+                }
+            });
+        });
+        if modal.should_close() {
+            self.send_update_command(ctx, Command::DeferUpdate);
+        }
     }
 
     /// Saves settings shortly after the last change and tells the tray app to reload them.
@@ -226,7 +333,10 @@ impl App {
             ui.set_width(ui.available_width());
             let replay_key = self.config.replay.hotkeys.first().copied();
             let (dot, title, hint) = match self.status {
-                None => (theme::TEXT_WEAK, "Not running".to_string(), "Start it to capture replays.".to_string()),
+                None if self.service_link.is_some() => {
+                    (theme::TEXT_WEAK, "Running".into(), "Waiting for capture status".into())
+                }
+                None => (theme::TEXT_WEAK, "Not running".into(), "Start it to capture replays.".into()),
                 Some(s) if s.recording => (
                     theme::ACCENT,
                     format!("Recording · {}", theme::format_time(f64::from(s.recording_secs))),
@@ -251,7 +361,7 @@ impl App {
             ui.add_space(6.0);
             let full = Vec2::new(ui.available_width(), 32.0);
             match self.status {
-                None => {
+                None if self.service_link.is_none() => {
                     let start = ui.add_enabled_ui(!matches!(self.check_now, CheckNow::Starting(_)), |ui| {
                         ui.add_sized(
                             full,
@@ -266,6 +376,7 @@ impl App {
                         self.status_at = None;
                     }
                 }
+                None => {}
                 Some(s) => {
                     let save = egui::Button::new(
                         RichText::new(format!("{}  Save replay", icon::SAVE))
@@ -313,16 +424,19 @@ impl App {
                     PlayerAction::None => {}
                 }
             }
-            Page::Settings => match self.settings.ui(ui, &mut self.config, &self.monitors, &self.check_now) {
-                SettingsAction::Quit => {
-                    self.flush_config();
-                    ipc::send_to_service(Command::Quit);
-                    ui.ctx().send_viewport_cmd(ViewportCommand::Close);
-                }
+            Page::Settings => match self.settings.ui(
+                ui,
+                &mut self.config,
+                &self.monitors,
+                &self.check_now,
+                self.ready_update.as_ref().map(|(version, _)| version.as_str()),
+            ) {
+                SettingsAction::Quit => self.quit(ui.ctx()),
+                SettingsAction::RestartForUpdate => self.send_update_command(ui.ctx(), Command::RestartForUpdate),
                 SettingsAction::Uninstall => {
                     self.flush_config();
                     let _ = std::process::Command::new(paths::current_exe()).arg("--uninstall").spawn();
-                    ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+                    self.close(ui.ctx());
                 }
                 SettingsAction::SortExisting => {
                     let moved = crate::organize::sort_into_folders(&paths::video_dir(&self.config));
@@ -341,10 +455,9 @@ impl App {
                         ipc::service_running,
                         start_service,
                     ) {
-                        self.show_flash("Checking for updates…");
-                    } else {
-                        self.status_at = None;
+                        self.check_now = CheckNow::Checking(Instant::now());
                     }
+                    self.status_at = None;
                     ui.ctx().request_repaint();
                 }
                 SettingsAction::None => {}
@@ -419,15 +532,48 @@ fn start_service() -> std::io::Result<()> {
 }
 
 impl eframe::App for App {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.closing {
+            return;
+        }
+        let running = self.service_link.as_ref().map(|link| !link.ended());
+        match window_action(running, ctx.input(|input| input.viewport().close_requested())) {
+            WindowAction::Close => {
+                self.status = None;
+                self.close(ctx);
+                return;
+            }
+            WindowAction::Hide => {
+                self.flush_config();
+                if let Page::Player(player) = &mut self.page {
+                    player.pause();
+                }
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+            }
+            WindowAction::Keep => {}
+        }
+        if self.focus_requested.swap(false, Ordering::Relaxed) {
+            if let Some(request) = ipc::take_open_request() {
+                self.library.mark_dirty();
+                self.page = requested_page(request);
+            }
+            self.status_at = None;
+            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
+        }
+        self.poll_status(ctx);
+        if self.quit_pending.is_some() {
+            self.quit(ctx);
+        }
+        self.autosave(ctx);
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.poll_status(&ctx);
-        self.autosave(&ctx);
-        if self.focus_requested.swap(false, Ordering::Relaxed) {
-            if let Some(video) = ipc::take_open_request() {
-                self.library.mark_dirty();
-                self.page = Page::Player(Box::new(Player::open(video)));
-            }
+        if self.closing {
+            return;
         }
         self.library.refresh(&ctx);
         egui::Panel::left("sidebar")
@@ -439,6 +585,7 @@ impl eframe::App for App {
         egui::CentralPanel::no_frame()
             .frame(egui::Frame::new().fill(theme::BG).inner_margin(Margin::symmetric(28, 24)))
             .show(ui, |ui| self.main(ui));
+        self.update_prompt(&ctx);
         self.draw_flash(&ctx);
         #[cfg(debug_assertions)]
         if let Some(shot) = &mut self.devshot {

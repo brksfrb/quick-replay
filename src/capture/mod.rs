@@ -84,19 +84,7 @@ pub enum Event {
         seconds: f64,
     },
     SaveFailed(String),
-    /// A newer version was downloaded and verified. `manual`: the user asked for the check.
-    UpdateReady {
-        version: String,
-        path: PathBuf,
-        manual: bool,
-    },
-    UpdateNotFound {
-        manual: bool,
-    },
-    UpdateFailed {
-        message: String,
-        manual: bool,
-    },
+    UpdateChecked(Result<Option<crate::update::Pending>, String>),
     /// The replay buffer was written out because the encoder came back with different parameters.
     BufferRecovered {
         path: PathBuf,

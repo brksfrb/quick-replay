@@ -4,11 +4,15 @@
 //! shortcut and an "Installed apps" entry, then starts the installed copy. Running a newer download
 //! later updates the installed copy the same way. Portable mode and dev builds never install.
 
-use crate::paths;
 use crate::win::{registry, shell};
+use crate::{ipc, paths, update};
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
+use windows::core::w;
+use windows::Win32::UI::Controls::{
+    TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOG_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNO,
 };
@@ -16,7 +20,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\QuickReplay";
 const SHORTCUT_NAME: &str = "QuickReplay.lnk";
-const OLD_EXE_NAME: &str = "QuickReplay.old.exe";
 const NEW_EXE_NAME: &str = "QuickReplay.new.exe";
 const SERVICE_EXIT_WAIT: Duration = Duration::from_secs(5);
 
@@ -38,9 +41,26 @@ pub fn install_if_needed() -> bool {
         return false;
     }
     if is_installed_copy() {
-        let _ = std::fs::remove_file(paths::install_dir().join(OLD_EXE_NAME));
         register();
         return false;
+    }
+    let target = paths::installed_exe();
+    if target.is_file() && !same_contents(&paths::current_exe(), &target) {
+        let capture_active =
+            ipc::query_status().map_or_else(ipc::service_running, |status| status.recording || status.buffer_active);
+        if capture_active && !confirm_replacement() {
+            return true;
+        }
+        if let Err(err) = update::install_download(&target) {
+            log::error!("could not update the installed copy: {err}");
+            shell::message_box(&format!("QuickReplay couldn't install the update.\n\n{err}"), MB_OK | MB_ICONERROR);
+            if !ipc::service_running() {
+                if let Err(err) = std::process::Command::new(&target).args(["--autostart", "--update-failed"]).spawn() {
+                    log::error!("could not restart the installed copy: {err}");
+                }
+            }
+        }
+        return true;
     }
     match install() {
         Ok(()) => {
@@ -60,8 +80,33 @@ pub fn install_if_needed() -> bool {
     }
 }
 
+fn confirm_replacement() -> bool {
+    const RESTART: i32 = 100;
+    const LATER: i32 = 101;
+    let buttons = [
+        TASKDIALOG_BUTTON { nButtonID: RESTART, pszButtonText: w!("Restart now") },
+        TASKDIALOG_BUTTON { nButtonID: LATER, pszButtonText: w!("Later") },
+    ];
+    let dialog = TASKDIALOGCONFIG {
+        cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+        dwFlags: TDF_ALLOW_DIALOG_CANCELLATION,
+        pszWindowTitle: w!("QuickReplay"),
+        pszMainInstruction: w!("Update ready: restart now?"),
+        pszContent: w!("The current replay buffer will be cleared. Any active recording will be saved."),
+        cButtons: buttons.len() as u32,
+        pButtons: buttons.as_ptr(),
+        nDefaultButton: LATER,
+        ..Default::default()
+    };
+    let mut choice = LATER;
+    if let Err(err) = unsafe { TaskDialogIndirect(&dialog, Some(&mut choice), None, None) } {
+        log::warn!("could not display the update restart prompt: {err}");
+    }
+    choice == RESTART
+}
+
 fn wait_for_service_exit() {
-    crate::ipc::send_to_service(crate::ipc::Command::Quit);
+    ipc::send_to_service(ipc::Command::QuitWithoutUpdate);
     let start = Instant::now();
     while crate::ipc::service_running() && start.elapsed() < SERVICE_EXIT_WAIT {
         std::thread::sleep(Duration::from_millis(100));
@@ -83,21 +128,10 @@ fn install() -> std::io::Result<()> {
     if same_contents(&paths::current_exe(), &target) {
         return Ok(());
     }
-    wait_for_service_exit();
     std::fs::create_dir_all(&dir)?;
-    // Copy next to the target first, so a failed copy never leaves no installed exe at all.
     let staged = dir.join(NEW_EXE_NAME);
     std::fs::copy(paths::current_exe(), &staged)?;
-    let old = dir.join(OLD_EXE_NAME);
-    if target.exists() {
-        // A running exe can't be overwritten, but it can be renamed out of the way.
-        let _ = std::fs::remove_file(&old);
-        std::fs::rename(&target, &old)?;
-    }
-    if let Err(err) = std::fs::rename(&staged, &target) {
-        let _ = std::fs::rename(&old, &target);
-        return Err(err);
-    }
+    crate::persist::replace_file(&staged, &target)?;
     log::info!("installed to {}", target.display());
     Ok(())
 }
@@ -127,6 +161,12 @@ fn register() {
 }
 
 /// Adds or removes the "start with Windows" entry, pointing at the running exe.
+pub fn refresh_version() {
+    if is_installed_copy() {
+        register();
+    }
+}
+
 pub fn sync_autostart(enabled: bool) {
     if paths::is_dev_build() || paths::is_isolated() {
         return;

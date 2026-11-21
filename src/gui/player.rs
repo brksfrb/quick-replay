@@ -219,6 +219,12 @@ impl Player {
         self.trim = Some((start, at.min(self.duration()).max(low)));
     }
 
+    pub fn pause(&mut self) {
+        if let Some(engine) = &mut self.engine {
+            engine.pause();
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut Ui) -> PlayerAction {
         let mut action = self.handle_keys(ui);
         if let Some(rx) = &self.export {
