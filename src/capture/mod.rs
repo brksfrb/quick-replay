@@ -15,7 +15,7 @@ mod timeline;
 mod video;
 mod writer;
 
-use crate::config::{Codec, Config};
+use crate::config::{AudioDevices, Codec, Config};
 use crate::paths;
 use crate::safety::{self, Encoding};
 use buffer::{Clip, ReplayBuffer};
@@ -149,6 +149,7 @@ pub struct Shared {
     buffer: Mutex<Option<ReplayBuffer>>,
     video_format: Mutex<Option<Arc<VideoFormat>>>,
     audio_entry: Option<Arc<Vec<u8>>>,
+    audio_devices: Mutex<AudioDevices>,
     recorder: Mutex<Recorder>,
     keyframe_request: AtomicBool,
     /// Ask the video thread for a fresh screen capture session (the encoder and buffer stay).
@@ -412,6 +413,7 @@ impl Pipeline {
             buffer: Mutex::new(buffer),
             video_format: Mutex::new(format),
             audio_entry,
+            audio_devices: Mutex::new(config.audio.devices.clone()),
             recorder: Mutex::new(Recorder::Idle),
             keyframe_request: AtomicBool::new(false),
             refresh_capture: AtomicBool::new(false),
@@ -451,6 +453,10 @@ impl Pipeline {
             CaptureInfo { width: video.width, height: video.height, codec: video.codec, encoder: video.encoder, audio };
         shared.flush_unsaved();
         Ok(Pipeline { shared, stop, threads, info })
+    }
+
+    pub fn set_audio_devices(&self, devices: &AudioDevices) {
+        lock(&self.shared.audio_devices).clone_from(devices);
     }
 
     pub fn set_buffer_seconds(&self, seconds: Option<u32>) {

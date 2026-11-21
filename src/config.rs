@@ -307,6 +307,16 @@ pub struct Audio {
     pub microphone: bool,
     pub microphone_volume: u32,
     pub bitrate_kbps: u32,
+    #[serde(flatten)]
+    pub devices: AudioDevices,
+}
+
+/// Endpoint IDs are stable across renames. An unset ID follows the Windows default.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AudioDevices {
+    pub system_device_id: Option<String>,
+    pub microphone_device_id: Option<String>,
 }
 
 impl Default for Audio {
@@ -318,6 +328,7 @@ impl Default for Audio {
             microphone: false,
             microphone_volume: 100,
             bitrate_kbps: 160,
+            devices: AudioDevices::default(),
         }
     }
 }
@@ -406,7 +417,9 @@ impl Config {
 
     /// True when a change needs the capture pipeline to restart.
     pub fn capture_differs(&self, other: &Config) -> bool {
-        self.video != other.video || self.audio != other.audio || self.replay.enabled != other.replay.enabled
+        // Endpoint changes are applied in place by the audio thread.
+        let audio = Audio { devices: other.audio.devices.clone(), ..self.audio.clone() };
+        self.video != other.video || audio != other.audio || self.replay.enabled != other.replay.enabled
     }
 }
 
@@ -428,6 +441,29 @@ mod tests {
         assert_eq!(config.video.fps, 30);
         assert_eq!(config.replay, Replay::default());
         assert!(config.general.restart_on_crash);
+    }
+
+    #[test]
+    fn legacy_audio_config_follows_windows_defaults() {
+        let config: Config = toml::from_str("[audio]\nsystem = true\nmicrophone = true\n").unwrap();
+        assert_eq!(config.audio.devices, AudioDevices::default());
+        assert!(config.audio.microphone);
+    }
+
+    #[test]
+    fn audio_endpoint_ids_round_trip_without_restarting_capture() {
+        let default = Config::default();
+        let mut config = default.clone();
+        config.audio.devices = AudioDevices {
+            system_device_id: Some("{0.0.0.00000000}.{render-id}".into()),
+            microphone_device_id: Some("{0.0.1.00000000}.{capture-id}".into()),
+        };
+        let text = toml::to_string_pretty(&config).unwrap();
+        let restored: Config = toml::from_str(&text).unwrap();
+        assert_eq!(restored, config);
+        assert!(!default.capture_differs(&restored));
+        config.audio.bitrate_kbps = 192;
+        assert!(default.capture_differs(&config));
     }
 
     #[test]

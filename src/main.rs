@@ -2,6 +2,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 #[cfg(any(windows, test))]
+mod audio_device_policy;
+#[cfg(any(windows, test))]
 mod capture_policy;
 mod config;
 #[cfg(any(windows, test))]

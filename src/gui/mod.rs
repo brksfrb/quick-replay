@@ -206,6 +206,7 @@ impl App {
         }
         if nav_item(ui, icon::SETTINGS, "Settings", matches!(self.page, Page::Settings)).clicked() {
             self.monitors = monitors::list();
+            self.settings.refresh_audio_devices();
             self.page = Page::Settings;
         }
     }

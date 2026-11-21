@@ -1,5 +1,6 @@
 //! Small safe wrappers over the Win32 APIs used across the app.
 
+pub mod audio_devices;
 pub mod clipboard;
 pub mod monitors;
 pub mod registry;

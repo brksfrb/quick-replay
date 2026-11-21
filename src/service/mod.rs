@@ -608,6 +608,10 @@ impl Service {
         if replay_toggled {
             self.buffer_enabled = self.config.replay.enabled;
         }
+        if let Some(pipeline) = &self.pipeline {
+            // A restart for another setting may be deferred until the recording finishes.
+            pipeline.set_audio_devices(&self.config.audio.devices);
+        }
         if capture_changed {
             self.restart_pipeline();
         } else if let Some(pipeline) = &self.pipeline {

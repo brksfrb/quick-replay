@@ -3,10 +3,13 @@
 use super::theme::{self, icon, setting_row, toggle};
 use crate::config::{parse_hex_color, Audio, Codec, Config, Corner, Quality, ReplayHotkey, Resolution, Video};
 use crate::hotkey::Hotkey;
+use crate::win::audio_devices::{self, Endpoint};
 use crate::win::monitors::Monitor;
 use crate::win::shell;
 use crate::{install, paths};
 use eframe::egui::{self, ComboBox, RichText, Slider, Ui};
+use std::time::{Duration, Instant};
+use windows::Win32::Media::Audio::{eCapture, eRender};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 
 const REPLAY_LENGTHS: [u32; 14] = [5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 300, 600, 900, 1200];
@@ -14,6 +17,7 @@ const DELETE_AFTER_DAYS: [u32; 6] = [0, 7, 14, 30, 60, 90];
 const FOLDER_LIMITS_GB: [u32; 7] = [0, 5, 10, 25, 50, 100, 250];
 const VK_ESCAPE: u16 = 0x1B;
 const VK_BACK: u16 = 0x08;
+const AUDIO_DEVICE_REFRESH: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Target {
@@ -39,6 +43,9 @@ pub enum SettingsAction {
 #[derive(Default)]
 pub struct SettingsPage {
     capture: Option<KeyCapture>,
+    last_audio_refresh: Option<Instant>,
+    output_devices: Option<Vec<Endpoint>>,
+    microphone_devices: Option<Vec<Endpoint>>,
 }
 
 fn key_down(vk: u16) -> bool {
@@ -73,6 +80,10 @@ fn fps_label(fps: u32) -> String {
 }
 
 impl SettingsPage {
+    pub fn refresh_audio_devices(&mut self) {
+        self.last_audio_refresh = None;
+    }
+
     /// The finished capture: a key, or `None` when cleared with Backspace. Esc cancels.
     fn poll_capture(&mut self, ctx: &egui::Context) -> Option<(Target, Option<Hotkey>)> {
         let capture = self.capture.as_mut()?;
@@ -110,6 +121,14 @@ impl SettingsPage {
 
     pub fn ui(&mut self, ui: &mut Ui, config: &mut Config, monitors: &[Monitor]) -> SettingsAction {
         let mut action = SettingsAction::None;
+        if self.last_audio_refresh.is_none_or(|last| last.elapsed() >= AUDIO_DEVICE_REFRESH) {
+            self.last_audio_refresh = Some(Instant::now());
+            let enumerator = audio_devices::enumerator().ok();
+            self.output_devices = enumerator.as_ref().and_then(|e| audio_devices::active_endpoints(e, eRender).ok());
+            self.microphone_devices =
+                enumerator.as_ref().and_then(|e| audio_devices::active_endpoints(e, eCapture).ok());
+        }
+        ui.ctx().request_repaint_after(AUDIO_DEVICE_REFRESH);
         if let Some((target, key)) = self.poll_capture(ui.ctx()) {
             apply_capture(config, target, key);
         }
@@ -121,7 +140,7 @@ impl SettingsPage {
             self.replay_section(ui, config, monitors);
             self.recording_section(ui, config);
             video_section(ui, &mut config.video, monitors);
-            audio_section(ui, &mut config.audio);
+            audio_section(ui, &mut config.audio, self.output_devices.as_deref(), self.microphone_devices.as_deref());
             notifications_section(ui, config);
             let sort = storage_section(ui, config);
             action = general_section(ui, config);
@@ -338,7 +357,36 @@ fn volume_slider(ui: &mut Ui, value: &mut u32) {
     ui.add(Slider::new(value, 0..=200).suffix("%"));
 }
 
-fn audio_section(ui: &mut Ui, audio: &mut Audio) {
+fn audio_device_picker(ui: &mut Ui, title: &str, selected_id: &mut Option<String>, endpoints: Option<&[Endpoint]>) {
+    const DEFAULT: &str = "Windows default";
+    let selected_name = selected_id.as_deref().and_then(|id| endpoints?.iter().find(|device| device.id == id));
+    let (label, description) = match (selected_id.is_some(), selected_name, endpoints) {
+        (_, _, None) => (if selected_id.is_some() { "Saved device" } else { DEFAULT }, "Couldn't list audio devices."),
+        (_, Some(device), _) => (device.name.as_str(), ""),
+        (false, None, _) => (DEFAULT, ""),
+        (true, None, _) => ("Selected device unavailable", "Uses Windows default until the selected device returns."),
+    };
+    setting_row(ui, title, description, |ui| {
+        ComboBox::from_id_salt(title)
+            .width(248.0)
+            .truncate()
+            .selected_text(label)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(selected_id.is_none(), DEFAULT).clicked() {
+                    *selected_id = None;
+                }
+                for device in endpoints.unwrap_or_default() {
+                    if ui.selectable_label(selected_id.as_ref() == Some(&device.id), &device.name).clicked() {
+                        *selected_id = Some(device.id.clone());
+                    }
+                }
+            })
+            .response
+            .on_hover_text(label);
+    });
+}
+
+fn audio_section(ui: &mut Ui, audio: &mut Audio, outputs: Option<&[Endpoint]>, microphones: Option<&[Endpoint]>) {
     theme::card().show(ui, |ui| {
         ui.set_width(ui.available_width());
         theme::section_title(ui, icon::VOLUME, "Sound");
@@ -346,14 +394,18 @@ fn audio_section(ui: &mut Ui, audio: &mut Audio) {
             toggle(ui, &mut audio.enabled)
         });
         if audio.enabled {
-            setting_row(ui, "System sound", "Everything you hear: games, voice chat, music.", |ui| {
+            setting_row(ui, "System sound", "Records sound playing through the selected output.", |ui| {
                 toggle(ui, &mut audio.system)
             });
             if audio.system {
+                audio_device_picker(ui, "System audio output", &mut audio.devices.system_device_id, outputs);
                 setting_row(ui, "System volume", "", |ui| volume_slider(ui, &mut audio.system_volume));
             }
-            setting_row(ui, "Microphone", "Your default microphone, mixed in.", |ui| toggle(ui, &mut audio.microphone));
+            setting_row(ui, "Microphone", "Mixes in audio from the selected microphone.", |ui| {
+                toggle(ui, &mut audio.microphone)
+            });
             if audio.microphone {
+                audio_device_picker(ui, "Microphone input", &mut audio.devices.microphone_device_id, microphones);
                 setting_row(ui, "Microphone volume", "", |ui| volume_slider(ui, &mut audio.microphone_volume));
             }
             setting_row(ui, "Audio quality", "", |ui| {
